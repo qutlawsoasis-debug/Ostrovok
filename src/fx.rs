@@ -32,6 +32,8 @@ pub struct Params {
     pub thick: f32,
     /// ход световой полосы 0…1 (вне этого промежутка её нет)
     pub sheen: f32,
+    /// яркость светлой линии по всему ободку: у открытой панели она сильнее, чтобы панель не терялась на тёмном фоне
+    pub rim: f32,
 }
 
 pub struct Fx {
@@ -62,6 +64,7 @@ uniform float u_dim;
 uniform vec4 u_glow;
 uniform float u_thick;
 uniform float u_sheen;
+uniform float u_rim;
 out vec4 o;
 
 float sdBox(vec2 p, vec2 b, float r) {
@@ -141,7 +144,7 @@ void main() {
     col += (vec3(0.55) + 0.45 * u_glow.rgb * u_glow.a) * 0.20 * pow(away, 1.2) * smoothstep(0.74, 1.0, t);
     // блик на скруглении со стороны света и тонкая светлая линия по ободку
     col += vec3(1.0) * 0.05 * pow(ndh, 9.0);
-    col += vec3(1.0) * smoothstep(2.0, 0.0, -d) * (0.07 + 0.24 * toward * toward);
+    col += vec3(1.0) * smoothstep(2.0, 0.0, -d) * (u_rim + 0.24 * toward * toward);
     col += vec3(1.0) * 0.08 * pow(1.0 - N.z, 2.5);
     col += u_glow.rgb * u_glow.a * pow(t, 3.0) * 0.5;
 
@@ -217,6 +220,7 @@ impl Fx {
             gl.uniform_4_f32(loc("u_glow").as_ref(), p.glow[0], p.glow[1], p.glow[2], p.glow[3]);
             gl.uniform_1_f32(loc("u_thick").as_ref(), p.thick);
             gl.uniform_1_f32(loc("u_sheen").as_ref(), p.sheen);
+            gl.uniform_1_f32(loc("u_rim").as_ref(), p.rim);
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, tex);
             gl.uniform_1_i32(loc("u_tex").as_ref(), 0);

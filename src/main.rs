@@ -4504,7 +4504,11 @@ impl eframe::App for App {
                         light: [light_at.x, light_at.y],
                         cap: self.lens_draw.map_or([0.0; 4], |c| [c.left(), c.top(), c.right(), c.bottom()]),
                         has_tex: self.lens_draw.is_some(),
-                        tint: theme().glass.map(|c| c as f32 / 255.0),
+                        // у открытой панели стекло светлее самого тёмного фона: на чёрном окне она остаётся видна
+                        tint: {
+                            let lift = self.mode != Mode::Pill && self.lens_draw.is_some();
+                            theme().glass.map(|c| if lift { c as f32 / 255.0 * 2.3 + 0.04 } else { c as f32 / 255.0 })
+                        },
                         // со снимком фона — доля затемнения; без него (остров виден на записи) — плотность корпуса:
                         // сквозь него просвечивает сам экран
                         dim: {
@@ -4513,7 +4517,7 @@ impl eframe::App for App {
                             match (self.lens_draw.is_some(), self.mode == Mode::Pill) {
                                 (true, true) => 0.62 - 0.45 * t,
                                 // открытая панель плотнее пилюли: на ней текст, он не должен теряться на фоне
-                                (true, false) => 0.88 - 0.30 * t,
+                                (true, false) => 0.95 - 0.15 * t,
                                 (false, true) => 1.0 - 0.45 * t,
                                 // без снимка фона размытия нет вовсе, поэтому панель почти непрозрачная
                                 (false, false) => 1.0 - 0.04 * t,
@@ -4522,6 +4526,7 @@ impl eframe::App for App {
                         glow,
                         thick: (rect.width().min(rect.height()) / 2.0 * 0.92).clamp(4.0, 17.0),
                         sheen: self.sheen_at.elapsed().as_secs_f32() / 0.7,
+                        rim: if self.mode == Mode::Pill { 0.07 } else { 0.20 },
                     };
                     let tex_id = self.lens_tex.as_ref().map(|t| t.id());
                     let _ = (light, dim);
