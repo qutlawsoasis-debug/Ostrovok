@@ -203,7 +203,6 @@ enum Tab {
     Home,
     Music,
     Control,
-    Shots,
     Remind,
     Qr,
     Shelf,
@@ -687,7 +686,6 @@ impl App {
                     app.jv_view = 1;
                     Tab::Jarvis
                 }
-                "shots" => Tab::Shots,
                 "control" => Tab::Control,
                 "music" => Tab::Music,
                 "remind" => Tab::Remind,
@@ -1419,20 +1417,6 @@ impl App {
                         };
                         let h = full.size().y;
                         p.with_clip_rect(area.intersect(rect)).galley(pos2(x - shift, cy - h / 2.0), full, FG);
-                        if over > 0.0 {
-                            // края не обрываются, а уходят в стекло
-                            let dark = Color32::from_rgba_unmultiplied(14, 14, 24, 235);
-                            for (edge, inner) in [(area.left(), area.left() + 16.0), (area.right(), area.right() - 16.0)] {
-                                let mut mesh = egui::Mesh::default();
-                                mesh.colored_vertex(pos2(edge, cy - 10.0), dark);
-                                mesh.colored_vertex(pos2(edge, cy + 10.0), dark);
-                                mesh.colored_vertex(pos2(inner, cy - 10.0), Color32::TRANSPARENT);
-                                mesh.colored_vertex(pos2(inner, cy + 10.0), Color32::TRANSPARENT);
-                                mesh.add_triangle(0, 1, 2);
-                                mesh.add_triangle(1, 2, 3);
-                                p.add(egui::Shape::mesh(mesh));
-                            }
-                        }
                     }
                     x += w + 10.0;
                 }
@@ -1457,7 +1441,7 @@ impl App {
         const GROUPS: [(&str, &str, &[(Tab, &str)]); 6] = [
             ("\u{E80F}", "Обзор", &[(Tab::Home, "Сводка"), (Tab::Music, "Музыка"), (Tab::Weather, "Погода"), (Tab::Calendar, "Календарь")]),
             ("\u{E7F4}", "Система", &[(Tab::Control, "Управление"), (Tab::Sound, "Звук"), (Tab::System, "Монитор")]),
-            ("\u{E90F}", "Инструменты", &[(Tab::Shots, "Действия"), (Tab::Timer, "Таймер"), (Tab::Remind, "Напоминания"), (Tab::Qr, "QR-код")]),
+            ("\u{E90F}", "Инструменты", &[(Tab::Timer, "Таймер"), (Tab::Remind, "Напоминания"), (Tab::Qr, "QR-код")]),
             ("\u{E70B}", "Записи", &[(Tab::Clip, "Буфер"), (Tab::Notes, "Заметки"), (Tab::Shelf, "Полка")]),
             ("\u{E8BD}", "ИИ", &[(Tab::Ai, "ИИ"), (Tab::Jarvis, "Джарвис")]),
             ("\u{E713}", "Настройки", &[(Tab::Settings, "Настройки")]),
@@ -1530,7 +1514,6 @@ impl App {
         let ui = &mut content;
         match self.tab {
             Tab::Home => self.ui_home(ui, ctx),
-            Tab::Shots => self.ui_shots(ui, ctx),
             Tab::Control => self.ui_control(ui),
             Tab::Music => self.ui_music(ui),
             Tab::Remind => self.ui_remind(ui),
@@ -1546,61 +1529,6 @@ impl App {
             Tab::Clip => self.ui_clip(ui),
             Tab::Notes => self.ui_notes(ui),
             Tab::Settings => self.ui_settings(ui, ctx),
-        }
-    }
-
-    /// Инструменты → Действия.
-    fn ui_shots(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let items = [
-            ("Снимок области", "выделите часть экрана — снимок попадёт в буфер"),
-            ("Снимок всего экрана", "файл в «Изображения\\Островок» и копия в буфере"),
-            ("Текст с экрана", "выделите область — текст скопируется"),
-            ("QR-код", "из текста или ссылки в буфере"),
-            ("Пипетка", "цвет точки под курсором, через 3 секунды"),
-            ("Чистый текст", "убрать оформление у текста в буфере"),
-        ];
-        let mut act = 0;
-        ui.columns(2, |c| {
-            for (i, (title, hint)) in items.into_iter().enumerate() {
-                let col = &mut c[i % 2];
-                let (r, resp) = col.allocate_exact_size(vec2(col.available_width(), 52.0), Sense::click());
-                let hov = col.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
-                let p = col.painter().with_clip_rect(r);
-                glass_chip(&p, r, 13.0, 0.5 + 0.5 * hov);
-                p.text(r.min + vec2(15.0, 9.0), Align2::LEFT_TOP, title, semi(13.5), FG);
-                p.text(r.min + vec2(15.0, 29.0), Align2::LEFT_TOP, hint, FontId::proportional(11.5), DIM);
-                if resp.clicked() {
-                    act = i + 1;
-                }
-            }
-        });
-        match act {
-            1 => {
-                sys::open("ms-screenclip:");
-                self.mode = Mode::Pill;
-                self.notify("Выделите область — снимок попадёт в буфер");
-            }
-            2 => {
-                self.mode = Mode::Pill;
-                self.shot = Some(6);
-            }
-            3 => self.ocr_from_snip(ctx),
-            4 => {
-                self.qr_text = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()).unwrap_or_default().chars().take(400).collect();
-                self.tab = Tab::Qr;
-            }
-            5 => {
-                self.mode = Mode::Pill;
-                self.pick_at = Some(Instant::now() + Duration::from_secs(3));
-            }
-            6 => match self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
-                Some(text) if !text.is_empty() => {
-                    self.set_clipboard(&text);
-                    self.notify("Оформление убрано — в буфере чистый текст");
-                }
-                _ => self.notify("В буфере нет текста"),
-            },
-            _ => {}
         }
     }
 
@@ -2022,7 +1950,16 @@ impl App {
         let step = row.width() / ACTIONS.len() as f32;
         for (i, (id, glyph, label, col)) in ACTIONS.iter().enumerate() {
             let r = Rect::from_min_size(pos2(row.left() + step * i as f32, row.top()), vec2(step, row.height()));
-            let resp = ui.interact(r, ui.id().with(("act", *id)), Sense::click());
+            let resp = ui.interact(r, ui.id().with(("act", *id)), Sense::click()).on_hover_text(match *id {
+                "region" => "Выделите часть экрана — снимок попадёт в буфер",
+                "full" => "Снимок всего экрана: файл в «Изображения\\Островок» и копия в буфере",
+                "ocr" => "Выделите область — текст с неё скопируется",
+                "qr" => "QR-код из текста или ссылки в буфере",
+                "picker" => "Цвет точки под курсором, через 3 секунды",
+                "cleantext" => "Убрать оформление у текста в буфере",
+                "remind" => "Добавить напоминание",
+                _ => "Строка поиска и команд",
+            });
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
             let down = ui.ctx().animate_bool_with_time(resp.id.with("down"), resp.is_pointer_button_down_on(), 0.06);
             let at = pos2(r.center().x, r.top() + 21.0 - 2.0 * hov + 2.0 * down);
@@ -2260,88 +2197,93 @@ impl App {
             self.bin = sys::recycle_bin();
             self.light_theme = sys::light_theme();
         }
-        let tile = |ui: &mut egui::Ui, title: &str, hint: &str, hot: bool| -> bool {
-            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 50.0), Sense::click());
-            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
-            let p = ui.painter().with_clip_rect(r);
-            glass_chip(&p, r, 13.0, 0.5 + 0.5 * hov + if hot { 0.5 } else { 0.0 });
-            p.text(r.min + vec2(14.0, 8.0), Align2::LEFT_TOP, title, semi(13.5), if hot { accent() } else { FG });
-            p.text(r.min + vec2(14.0, 28.0), Align2::LEFT_TOP, hint, FontId::proportional(11.5), DIM);
-            resp.clicked()
-        };
         let armed = self.confirm.filter(|c| c.1 > Instant::now()).map(|c| c.0);
         let mut act = "";
+        let p = ui.painter().clone();
+        let red = Color32::from_rgb(0xFF, 0x6B, 0x6B);
 
-        // сеть и оформление
-        let theme_hint = match self.light_theme {
-            Some(true) => "сейчас светлая",
-            Some(false) => "сейчас тёмная",
-            None => "переключить",
-        };
-        ui.columns(4, |c| {
-            for (i, (id, title, hint)) in [("wifi", "Wi-Fi", "открыть настройки"), ("bt", "Bluetooth", "открыть настройки"), ("vpn", "VPN", "открыть настройки"), ("theme", "Тема Windows", theme_hint)]
-                .into_iter()
-                .enumerate()
-            {
-                if tile(&mut c[i], title, hint, false) {
-                    act = id;
-                }
-            }
-        });
-
-        // мелкие удобства
+        // ── круглые переключатели одной строкой: включённые залиты цветом темы
         let pinned = self.last_fg != 0 && sys::is_topmost(self.last_fg);
-        let win_title: String = if self.last_fg == 0 { "сначала откройте окно".into() } else { sys::window_title(self.last_fg).chars().take(22).collect() };
-        let bin_hint = if self.bin.0 == 0 {
-            "пусто".to_string()
-        } else if armed == Some("bin") {
-            "нажмите ещё раз".to_string()
-        } else {
-            format!("{} объектов · {:.0} МБ", self.bin.0, self.bin.1 as f64 / 1048576.0)
-        };
-        let mic_hint = match self.mic {
-            Some(true) => "выключен",
-            Some(false) => "включён",
-            None => "не найден",
-        };
-        ui.columns(4, |c| {
-            for (i, (id, title, hint, hot)) in [
-                ("awake", "Не засыпать", if self.awake { "экран не погаснет" } else { "обычный режим" }, self.awake),
-                ("mic", "Микрофон", mic_hint, self.mic == Some(true)),
-                ("pin", "Окно поверх всех", win_title.as_str(), pinned),
-                ("bin", "Корзина", bin_hint.as_str(), armed == Some("bin")),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                if tile(&mut c[i], title, hint, hot) {
-                    act = id;
+        let win_title: String = if self.last_fg == 0 { "нет окна".into() } else { sys::window_title(self.last_fg).chars().take(13).collect() };
+        let bin_armed = armed == Some("bin");
+        let bin_state = if self.bin.0 == 0 { "пусто".to_string() } else if bin_armed { "ещё раз".to_string() } else { format!("{} · {:.0} МБ", self.bin.0, self.bin.1 as f64 / 1048576.0) };
+        let toggles: [(&str, &str, &str, String, bool); 8] = [
+            ("wifi", "\u{E701}", "Wi-Fi", "настройки".into(), false),
+            ("bt", "\u{E702}", "Bluetooth", "настройки".into(), false),
+            ("vpn", "\u{E705}", "VPN", "настройки".into(), false),
+            ("theme", "\u{E706}", "Светлая тема", if self.light_theme == Some(true) { "включена" } else { "выключена" }.into(), self.light_theme == Some(true)),
+            ("awake", "\u{E7E8}", "Не засыпать", if self.awake { "включено" } else { "выключено" }.into(), self.awake),
+            (
+                "mic",
+                "\u{E720}",
+                "Микрофон",
+                match self.mic {
+                    Some(true) => "выключен",
+                    Some(false) => "включён",
+                    None => "не найден",
                 }
+                .into(),
+                self.mic == Some(false),
+            ),
+            ("pin", "\u{E718}", "Поверх всех", win_title, pinned),
+            ("bin", "\u{E74D}", "Корзина", bin_state, bin_armed),
+        ];
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 88.0), Sense::hover());
+        let step = row.width() / toggles.len() as f32;
+        for (i, (id, glyph, title, state, on)) in toggles.iter().enumerate() {
+            let r = Rect::from_min_size(pos2(row.left() + step * i as f32, row.top()), vec2(step, row.height()));
+            let resp = ui.interact(r, ui.id().with(("ctl", *id)), Sense::click());
+            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+            let down = ui.ctx().animate_bool_with_time(resp.id.with("down"), resp.is_pointer_button_down_on(), 0.06);
+            let lit = ui.ctx().animate_bool_with_time(resp.id.with("on"), *on, 0.16);
+            let c = pos2(r.center().x, r.top() + 27.0 - 1.5 * hov + 1.5 * down);
+            let rad = 22.0 + 1.5 * hov - 1.5 * down;
+            let tone = if *id == "bin" { red } else { accent() };
+            p.circle_filled(c, rad, rgba(255, 255, 255, (20.0 + 22.0 * hov) as u8));
+            if lit > 0.0 {
+                p.circle_filled(c, rad, Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), (lit * 225.0) as u8));
             }
-        });
+            p.circle_stroke(c, rad, Stroke::new(1.0_f32, rgba(255, 255, 255, 34)));
+            p.text(c, Align2::CENTER_CENTER, *glyph, FontId::proportional(17.0), mix(FG, Color32::from_rgb(16, 14, 28), lit));
+            p.text(pos2(r.center().x, r.top() + 62.0), Align2::CENTER_CENTER, *title, semi(11.5), FG);
+            p.with_clip_rect(r).text(pos2(r.center().x, r.top() + 78.0), Align2::CENTER_CENTER, state, FontId::proportional(10.5), mix(DIM, tone, lit));
+            if resp.clicked() {
+                act = id;
+            }
+        }
 
-        // питание
-        ui.columns(4, |c| {
-            for (i, (id, title)) in [("lock", "Блокировка"), ("sleep", "Сон"), ("restart", "Перезагрузка"), ("off", "Выключение")].into_iter().enumerate() {
-                let hot = armed == Some(id);
-                let hint = if id == "lock" { "заблокировать экран" } else if hot { "нажмите ещё раз" } else { "нужно два нажатия" };
-                if tile(&mut c[i], title, hint, hot) {
-                    act = id;
-                }
+        // ── нижняя строка: папки слева, питание одной капсулой справа
+        ui.add_space(6.0);
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
+        let cap = Rect::from_min_max(pos2(row.right() - 4.0 * 42.0 - 8.0, row.top()), row.max);
+        glass_chip(&p, cap, 20.0, 0.55);
+        for (k, (id, glyph, name)) in [("lock", "\u{E72E}", "Блокировка"), ("sleep", "\u{E708}", "Сон"), ("restart", "\u{E777}", "Перезагрузка"), ("off", "\u{E7E8}", "Выключение")].into_iter().enumerate() {
+            let hit = Rect::from_center_size(pos2(cap.left() + 25.0 + k as f32 * 42.0, cap.center().y), vec2(38.0, 34.0));
+            let hot = armed == Some(id);
+            let tip = if hot { format!("{name}: нажмите ещё раз") } else if id == "lock" { name.to_string() } else { format!("{name} — нужно два нажатия") };
+            let resp = ui.interact(hit, ui.id().with(("pw", id)), Sense::click()).on_hover_text(tip);
+            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
+            if hot {
+                p.circle_filled(hit.center(), 15.0, red);
+            } else if hov > 0.0 {
+                p.circle_filled(hit.center(), 15.0, rgba(255, 255, 255, (34.0 * hov) as u8));
             }
-        });
-
-        // быстрые папки
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Папки").color(DIM));
-            let home = std::env::var("USERPROFILE").unwrap_or_default();
-            for (name, dir) in [("Загрузки", "Downloads"), ("Документы", "Documents"), ("Рабочий стол", "Desktop"), ("Изображения", "Pictures")] {
-                if jelly(ui, name).clicked() {
-                    sys::open(&format!("{home}\\{dir}"));
-                    self.mode = Mode::Pill;
-                }
+            p.text(hit.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(15.0), FG);
+            if resp.clicked() {
+                act = id;
             }
-        });
+        }
+        let mut folders = ui.new_child(
+            egui::UiBuilder::new().max_rect(Rect::from_min_max(row.min, pos2(cap.left() - 10.0, row.bottom()))).layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        folders.label(RichText::new("Папки").color(DIM));
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        for (name, dir) in [("Загрузки", "Downloads"), ("Документы", "Documents"), ("Рабочий стол", "Desktop"), ("Изображения", "Pictures")] {
+            if jelly(&mut folders, name).clicked() {
+                sys::open(&format!("{home}\\{dir}"));
+                self.mode = Mode::Pill;
+            }
+        }
 
         let arm = |me: &mut Self, id: &'static str| me.confirm = Some((id, Instant::now() + Duration::from_secs(4)));
         match act {
@@ -4201,10 +4143,9 @@ impl App {
         let saved = if matches!(self.tab, Tab::Ai | Tab::Settings) { 0.0 } else { 24.0 };
         -saved + match self.tab {
             Tab::Home => 370.0,
-            Tab::Control => 338.0,
+            Tab::Control => 238.0,
             Tab::Sound => 170.0 + ((self.mixer.len().clamp(1, 8) + 1) / 2) as f32 * 46.0,
             Tab::Music => 388.0,
-            Tab::Shots => 286.0,
             Tab::Remind => 320.0,
             Tab::Qr => 350.0,
             Tab::Shelf => 340.0,
