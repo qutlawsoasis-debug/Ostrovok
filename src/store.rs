@@ -45,6 +45,9 @@ pub struct Settings {
     /// не показывать в пилюле громкость и смену раскладки
     #[serde(default)]
     pub no_hud: bool,
+    /// прозрачность стекла, 1…100; 0 — не задана (тогда 60)
+    #[serde(default)]
+    pub clear: u8,
     /// не обновляться с GitHub самостоятельно
     #[serde(default)]
     pub no_update: bool,

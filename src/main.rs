@@ -466,6 +466,9 @@ struct App {
     /// громкость и раскладка из потока наблюдения и то, что уже показано
     watch: Arc<Mutex<sys::Watch>>,
     watch_seen: Option<sys::Watch>,
+    clear_saved: u8,
+    /// размеры файлов на полке: None — файла нет, u64::MAX — папка
+    shelf_meta: std::collections::HashMap<String, Option<u64>>,
     mem_hot: u8,
     mem_alert_at: Option<Instant>,
     kill_arm: Option<(String, Instant)>,
@@ -681,6 +684,8 @@ impl App {
                 sys::spawn_watch(move || c.request_repaint())
             },
             watch_seen: None,
+            clear_saved: 0,
+            shelf_meta: Default::default(),
             mem_hot: 0,
             mem_alert_at: None,
             kill_arm: None,
@@ -695,6 +700,9 @@ impl App {
             if std::env::var_os("OSTROVOK_TOAST").is_some() {
                 app.show_toast("\u{E896}", [0x3A, 0x9B, 0xFF], "Загрузка завершена", "otchet-za-noyabr.pdf", 30, false);
             }
+        }
+        if test_mode() && std::env::var_os("OSTROVOK_SHELF").is_some() {
+            app.cfg.shelf = ["C:\\Windows\\explorer.exe", "C:\\Windows\\System32\\notepad.exe", "C:\\Windows\\win.ini", "C:\\Windows\\Fonts", "C:\\нет\\такого.txt"].map(String::from).to_vec();
         }
         if let Ok(t) = std::env::var("OSTROVOK_HINT") {
             app.hint = smart_hint(&t);
@@ -1767,10 +1775,14 @@ impl App {
         }
     }
 
-    /// Записи → Полка файлов.
+    /// Записи → Полка: файлы значками, как на рабочем столе. Щелчок открывает, правый щелчок — папку файла.
     fn ui_shelf(&mut self, ui: &mut egui::Ui) {
+        if self.cfg.shelf.is_empty() {
+            empty_state(ui, "\u{E8B7}", "Полка пуста", "Перетащите файл на остров — он останется под рукой");
+            return;
+        }
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Перетащите файл на остров — он останется здесь под рукой. Щелчок открывает файл.").color(DIM));
+            ui.label(RichText::new("Щелчок открывает файл, правый щелчок — его папку.").color(DIM));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if jelly(ui, "Очистить").clicked() {
                     self.cfg.shelf.clear();
@@ -1780,34 +1792,64 @@ impl App {
         });
         let (mut open, mut remove) = (None, None);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            if self.cfg.shelf.is_empty() {
-                empty_state(ui, "\u{E8B7}", "Полка пуста", "Перетащите файл на остров — он останется под рукой");
-            }
-            for (i, path) in self.cfg.shelf.iter().enumerate() {
-                let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
-                let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
-                glass_chip(ui.painter(), row, 10.0, 0.45 + 0.5 * hov);
-                let file = std::path::Path::new(path);
-                let name = file.file_name().and_then(|n| n.to_str()).unwrap_or(path);
-                let folder = file.parent().and_then(|d| d.to_str()).unwrap_or("");
-                let p = ui.painter().with_clip_rect(row.shrink2(vec2(40.0, 0.0)).translate(vec2(-20.0, 0.0)));
-                let end = p.text(pos2(row.left() + 14.0, row.center().y), Align2::LEFT_CENTER, name, semi(13.0), FG).right();
-                p.text(pos2(end + 12.0, row.center().y), Align2::LEFT_CENTER, folder, FontId::proportional(11.5), DIM);
-                let x = Rect::from_center_size(pos2(row.right() - 20.0, row.center().y), vec2(26.0, 26.0));
-                let del = ui.interact(x, ui.id().with(("del-shelf", i)), Sense::click());
-                ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(12.0), if del.hovered() { FG } else { DIM });
-                if del.clicked() {
-                    remove = Some(i);
-                } else if resp.clicked() {
-                    open = Some(path.clone());
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                for (i, path) in self.cfg.shelf.iter().enumerate() {
+                    let (cell, resp) = ui.allocate_exact_size(vec2(104.0, 96.0), Sense::click());
+                    let file = std::path::Path::new(path);
+                    let name = file.file_name().and_then(|n| n.to_str()).unwrap_or(path);
+                    let resp = resp.on_hover_text(path);
+                    let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
+                    let down = ui.ctx().animate_bool_with_time(resp.id.with("down"), resp.is_pointer_button_down_on(), 0.06);
+                    if hov > 0.0 {
+                        ui.painter().rect_filled(cell, Rounding::same(14.0), rgba(255, 255, 255, (20.0 * hov) as u8));
+                    }
+                    // размер файла узнаём один раз; None — файла уже нет на месте
+                    let size = *self.shelf_meta.entry(path.clone()).or_insert_with(|| std::fs::metadata(path).ok().map(|m| if m.is_dir() { u64::MAX } else { m.len() }));
+                    let icon = self.app_icons.entry(path.clone()).or_insert_with(|| {
+                        sys::icon_rgba(path).map(|(w, h, px)| ui.ctx().load_texture(format!("shelf-{i}"), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR))
+                    });
+                    let side = 36.0 + 3.0 * hov - 3.0 * down;
+                    let icon_r = Rect::from_center_size(pos2(cell.center().x, cell.top() + 30.0), vec2(side, side));
+                    match icon {
+                        Some(tex) if size.is_some() => rounded_image(ui.painter(), tex, icon_r, 0.0),
+                        _ => {
+                            ui.painter().text(icon_r.center(), Align2::CENTER_CENTER, "\u{E7C3}", FontId::proportional(26.0), DIM);
+                        }
+                    }
+                    let short: String = if name.chars().count() > 15 { name.chars().take(14).collect::<String>() + "…" } else { name.to_string() };
+                    ui.painter().text(pos2(cell.center().x, cell.top() + 62.0), Align2::CENTER_CENTER, short, semi(11.5), if size.is_some() { FG } else { DIM });
+                    let info = match size {
+                        None => "файл не найден".to_string(),
+                        Some(u64::MAX) => "папка".to_string(),
+                        Some(b) if b >= 1 << 30 => format!("{:.1} ГБ", b as f64 / (1u64 << 30) as f64).replace('.', ","),
+                        Some(b) if b >= 1 << 20 => format!("{:.1} МБ", b as f64 / (1u64 << 20) as f64).replace('.', ","),
+                        Some(b) => format!("{} КБ", (b / 1024).max(1)),
+                    };
+                    ui.painter().text(pos2(cell.center().x, cell.top() + 79.0), Align2::CENTER_CENTER, info, FontId::proportional(10.5), DIM);
+                    // крестик в углу появляется под курсором
+                    let x = Rect::from_center_size(pos2(cell.right() - 14.0, cell.top() + 14.0), vec2(22.0, 22.0));
+                    let del = ui.interact(x, ui.id().with(("del-shelf", i)), Sense::click());
+                    if hov > 0.0 || del.hovered() {
+                        ui.painter().circle_filled(x.center(), 9.0, rgba(255, 255, 255, if del.hovered() { 60 } else { 26 }));
+                        ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(9.5), FG);
+                    }
+                    if del.clicked() {
+                        remove = Some(i);
+                    } else if resp.clicked() {
+                        open = Some(path.clone());
+                    } else if resp.secondary_clicked() {
+                        open = file.parent().and_then(|d| d.to_str()).map(str::to_string);
+                    }
                 }
-            }
+            });
         });
         if let Some(path) = open {
             sys::open(&path);
         }
         if let Some(i) = remove {
-            self.cfg.shelf.remove(i);
+            let path = self.cfg.shelf.remove(i);
+            self.shelf_meta.remove(&path);
             self.cfg.save();
         }
     }
@@ -2884,118 +2926,178 @@ impl App {
         });
     }
 
+    /// Настройки в две колонки: слева вид и данные, справа — поведение переключателями.
     fn ui_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.label(RichText::new("Город для погоды").color(DIM));
-        ui.horizontal(|ui| {
-            let r = ui.add(egui::TextEdit::singleline(&mut self.city_edit).margin(egui::Margin::symmetric(9.0, 7.0)).hint_text(RichText::new("Например, Казань").color(DIM)).desired_width(260.0));
-            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if jelly(ui, "Сохранить").clicked() || enter {
-                self.save_city(ctx);
-            }
-        });
-        ui.label(RichText::new("Название города отправляется на open-meteo.com. Пустое поле отключает погоду.").color(DIM).size(11.5));
-        ui.add_space(2.0);
-        let key_state = if self.api_key().is_empty() { "не задан" } else { "задан" };
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Ключ Claude API для ИИ").color(DIM));
-            ui.add(egui::TextEdit::singleline(&mut self.key_edit).margin(egui::Margin::symmetric(9.0, 7.0)).password(true).hint_text(RichText::new(key_state).color(DIM)).desired_width(170.0));
-            if jelly(ui, "Сохранить ключ").clicked() {
-                self.save_key();
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Тема").color(DIM));
-            let cur = THEME.load(Ordering::Relaxed);
-            for (i, t) in THEMES.iter().enumerate() {
-                let (r, resp) = ui.allocate_exact_size(vec2(88.0, 28.0), Sense::click());
-                let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
-                glass_chip(ui.painter(), r, 10.0, if i == cur { 1.0 } else { 0.4 + 0.4 * hov });
-                let c = Color32::from_rgb(t.accent[0], t.accent[1], t.accent[2]);
-                // кружок показывает и акцент, и оттенок стекла
-                let dot = pos2(r.left() + 16.0, r.center().y);
-                ui.painter().circle_filled(dot, 7.5, Color32::from_rgb(t.glass[0] * 3, t.glass[1] * 3, t.glass[2] * 3));
-                ui.painter().circle_filled(dot, 4.5, c);
-                ui.painter().text(pos2(r.left() + 30.0, r.center().y), Align2::LEFT_CENTER, t.name, semi(12.5), if i == cur { c } else { FG });
-                if resp.clicked() {
-                    THEME.store(i, Ordering::Relaxed);
-                    self.cfg.theme = i as u8;
+        let head = |ui: &mut egui::Ui, text: &str| {
+            ui.label(RichText::new(text).font(semi(11.5)).color(DIM));
+        };
+        let mut check_update = false;
+        ui.columns(2, |c| {
+            // ── слева: вид
+            let ui = &mut c[0];
+            ui.set_max_width(ui.available_width() - 10.0);
+            head(ui, "ТЕМА");
+            ui.horizontal(|ui| {
+                let cur = THEME.load(Ordering::Relaxed);
+                for (i, t) in THEMES.iter().enumerate() {
+                    let (r, resp) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
+                    let resp = resp.on_hover_text(t.name);
+                    let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
+                    let sel = ui.ctx().animate_bool_with_time(resp.id.with("sel"), i == cur, 0.14);
+                    let col = Color32::from_rgb(t.accent[0], t.accent[1], t.accent[2]);
+                    // кружок показывает и акцент, и оттенок стекла
+                    ui.painter().circle_filled(r.center(), 11.0 + hov, Color32::from_rgb(t.glass[0] * 3, t.glass[1] * 3, t.glass[2] * 3));
+                    ui.painter().circle_filled(r.center(), 7.0 + hov, col);
+                    if sel > 0.0 {
+                        ui.painter().circle_stroke(r.center(), 13.5, Stroke::new(1.6_f32, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (sel * 255.0) as u8)));
+                    }
+                    if resp.clicked() {
+                        THEME.store(i, Ordering::Relaxed);
+                        self.cfg.theme = i as u8;
+                        self.cfg.save();
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new(theme().name).font(semi(13.0)).color(accent()));
+            });
+            ui.add_space(4.0);
+            head(ui, "ПЕРСОНАЖ");
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                for (i, name) in ["Глазки", "Робот", "Кот", "Призрак", "Слайм"].into_iter().enumerate() {
+                    let on = self.cfg.character == i as u8;
+                    let width = ui.painter().layout_no_wrap(name.to_string(), semi(12.5), FG).size().x + 20.0;
+                    let (r, resp) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
+                    let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
+                    glass_chip(ui.painter(), r, 10.0, if on { 1.1 } else { 0.4 + 0.4 * hov });
+                    ui.painter().text(r.center(), Align2::CENTER_CENTER, name, semi(12.5), if on { accent() } else { FG });
+                    if resp.clicked() {
+                        self.cfg.character = i as u8;
+                        self.cfg.save();
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                head(ui, "ПРОЗРАЧНОСТЬ");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(format!("{}%", self.clearness())).size(11.5).color(DIM));
+                });
+            });
+            {
+                let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
+                let mut v = self.clearness() as f32 / 100.0;
+                if slim_slider(ui, ui.id().with("clear"), r.shrink2(vec2(4.0, 2.0)), &mut v, accent(), false) {
+                    self.cfg.clear = ((v * 100.0).round() as u8).clamp(1, 100);
+                }
+                // сохраняем, когда ползунок отпустили
+                if ui.input(|i| i.pointer.any_released()) && self.cfg.clear != self.clear_saved {
+                    self.clear_saved = self.cfg.clear;
                     self.cfg.save();
                 }
             }
-        });
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Персонаж").color(DIM));
-            for (i, name) in ["Глазки", "Робот", "Кот", "Призрак", "Слайм"].into_iter().enumerate() {
-                let label = if self.cfg.character == i as u8 { format!("●  {name}") } else { name.to_string() };
-                if jelly(ui, label).clicked() {
-                    self.cfg.character = i as u8;
-                    self.cfg.save();
+            ui.add_space(4.0);
+            head(ui, "ГОРОД ДЛЯ ПОГОДЫ");
+            ui.horizontal(|ui| {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.city_edit)
+                        .margin(egui::Margin::symmetric(9.0, 7.0))
+                        .hint_text(RichText::new("Например, Казань").color(DIM))
+                        .desired_width(ui.available_width() - 134.0),
+                );
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if jelly(ui, "Сохранить").on_hover_text("Название города отправляется на open-meteo.com. Пустое поле отключает погоду.").clicked() || enter {
+                    self.save_city(ctx);
                 }
+            });
+            ui.add_space(2.0);
+            head(ui, "КЛЮЧ CLAUDE API ДЛЯ ИИ");
+            let key_state = if self.api_key().is_empty() { "не задан" } else { "задан" };
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.key_edit)
+                        .margin(egui::Margin::symmetric(9.0, 7.0))
+                        .password(true)
+                        .hint_text(RichText::new(key_state).color(DIM))
+                        .desired_width(ui.available_width() - 134.0),
+                );
+                if jelly(ui, "Сохранить").clicked() {
+                    self.save_key();
+                }
+            });
+
+            // ── справа: поведение
+            let ui = &mut c[1];
+            head(ui, "ПОВЕДЕНИЕ");
+            if switch_row(ui, &mut self.cfg.lyrics, "Текст песен", "название трека уходит на lrclib.net") {
+                self.cfg.save();
+                self.lyrics_key.clear();
+                self.lyrics.clear();
             }
-        });
-        if ui.checkbox(&mut self.cfg.lyrics, "Показывать текст песен (исполнитель и название трека отправляются на lrclib.net)").changed() {
-            self.cfg.save();
-            self.lyrics_key.clear();
-            self.lyrics.clear();
-        }
-        if ui.checkbox(&mut self.cfg.mirror, "Показывать на острове уведомления мессенджеров (Windows спросит разрешение)").changed() {
-            self.cfg.save();
-            self.live.mirror.store(self.cfg.mirror, Ordering::Relaxed);
-        }
-        if self.cfg.mirror {
-            let state = match self.live.access.load(Ordering::Relaxed) {
-                1 => "Доступ к уведомлениям есть.",
-                2 => "Windows не дала доступ: Параметры → Конфиденциальность → Уведомления.",
-                3 => "На этой системе чтение уведомлений недоступно.",
-                _ => "Жду ответа Windows…",
+            let mirror_hint = if !self.cfg.mirror {
+                "Windows спросит разрешение"
+            } else {
+                match self.live.access.load(Ordering::Relaxed) {
+                    1 => "доступ к уведомлениям есть",
+                    2 => "Windows не дала доступ к уведомлениям",
+                    3 => "на этой системе недоступно",
+                    _ => "жду ответа Windows…",
+                }
             };
-            ui.label(RichText::new(state).color(DIM).size(11.5));
-        }
-        if ui.checkbox(&mut self.cfg.capture_visible, "Показывать остров на демонстрации и записи экрана (стекло станет непрозрачным)").changed() {
-            self.cfg.save();
-        }
-        ui.label(RichText::new("Во время звонка в Discord остров виден на демонстрации сам, без этой галочки.").color(DIM).size(11.5));
-        if ui.checkbox(&mut self.autostart, "Запускать вместе с Windows").changed() {
-            store::set_autostart(self.autostart);
-        }
-        let mut hud = !self.cfg.no_hud;
-        if ui.checkbox(&mut hud, "Показывать в пилюле громкость и смену раскладки").changed() {
-            self.cfg.no_hud = !hud;
-            self.cfg.save();
-        }
-        ui.horizontal(|ui| {
+            if switch_row(ui, &mut self.cfg.mirror, "Уведомления мессенджеров", mirror_hint) {
+                self.cfg.save();
+                self.live.mirror.store(self.cfg.mirror, Ordering::Relaxed);
+            }
+            if switch_row(ui, &mut self.cfg.capture_visible, "Виден на записи экрана", "стекло перестанет размывать фон; в звонке Discord виден и так") {
+                self.cfg.save();
+            }
+            let mut hud = !self.cfg.no_hud;
+            if switch_row(ui, &mut hud, "Громкость и раскладка в пилюле", "") {
+                self.cfg.no_hud = !hud;
+                self.cfg.save();
+            }
+            if switch_row(ui, &mut self.autostart, "Запуск вместе с Windows", "") {
+                store::set_autostart(self.autostart);
+            }
+            let state = self.upd.lock().unwrap().clone();
+            let note = match &state {
+                update::State::Checking => "проверяю…".to_string(),
+                update::State::Fresh => "установлена последняя версия".to_string(),
+                update::State::Ready(v, _) => format!("версия {v} скачана, поставится сама"),
+                update::State::Failed(e) => e.clone(),
+                update::State::Idle => "с GitHub, раз в минуту".to_string(),
+            };
             let mut auto = !self.cfg.no_update;
-            if ui.checkbox(&mut auto, "Обновляться с GitHub автоматически").changed() {
+            if switch_row(ui, &mut auto, "Обновляться автоматически", &note) {
                 self.cfg.no_update = !auto;
                 self.cfg.save();
             }
-            let state = self.upd.lock().unwrap().clone();
-            let busy = matches!(state, update::State::Checking);
-            if jelly(ui, if busy { "Проверяю…" } else { "Проверить сейчас" }).clicked() && !busy {
-                if matches!(state, update::State::Fresh | update::State::Failed(_)) {
-                    *self.upd.lock().unwrap() = update::State::Idle;
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                if jelly(ui, "Проверить обновления").clicked() && !matches!(state, update::State::Checking) {
+                    check_update = true;
                 }
-                let c = ui.ctx().clone();
-                update::spawn(self.upd.clone(), move || c.request_repaint());
-            }
-            let note = match state {
-                update::State::Fresh => "установлена последняя версия".to_string(),
-                update::State::Ready(v, _) => format!("версия {v} скачана, поставится сама"),
-                update::State::Failed(e) => e,
-                _ => String::new(),
-            };
-            ui.label(RichText::new(note).color(DIM).size(11.5));
+                ui.label(RichText::new(format!("версия {}", env!("CARGO_PKG_VERSION"))).color(DIM));
+            });
         });
-        ui.add_space(2.0);
-        ui.label(RichText::new(format!("Поиск открывается по {}. Щелчок по глазкам меняет эмоцию.", self.hotkey_name)).color(DIM));
+        if check_update {
+            *self.upd.lock().unwrap() = update::State::Idle;
+            let c = ui.ctx().clone();
+            update::spawn(self.upd.clone(), move || c.request_repaint());
+        }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if jelly(ui, "Закрыть Островок").clicked() {
                 store::save_notes(&self.notes);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            ui.label(RichText::new(format!("версия {}", env!("CARGO_PKG_VERSION"))).color(DIM));
+            ui.label(RichText::new(format!("Поиск открывается по {}. Щелчок по персонажу меняет его настроение.", self.hotkey_name)).color(DIM).size(11.5));
         });
+    }
+
+    /// Прозрачность стекла в процентах (в настройках 0 значит «не трогали»).
+    fn clearness(&self) -> u8 {
+        if self.cfg.clear == 0 { 60 } else { self.cfg.clear }
     }
 
     fn api_key(&self) -> String {
@@ -3968,11 +4070,15 @@ impl eframe::App for App {
                         tint: theme().glass.map(|c| c as f32 / 255.0),
                         // со снимком фона — доля затемнения; без него (остров виден на записи) — плотность корпуса:
                         // сквозь него просвечивает сам экран
-                        dim: match (self.lens_draw.is_some(), self.mode == Mode::Pill) {
-                            (true, true) => 0.32,
-                            (true, false) => 0.52,
-                            (false, true) => 0.62,
-                            (false, false) => 0.80,
+                        dim: {
+                            // t — прозрачность из настроек, 0…1
+                            let t = self.clearness() as f32 / 100.0;
+                            match (self.lens_draw.is_some(), self.mode == Mode::Pill) {
+                                (true, true) => 0.62 - 0.45 * t,
+                                (true, false) => 0.80 - 0.45 * t,
+                                (false, true) => 1.0 - 0.60 * t,
+                                (false, false) => 1.0 - 0.33 * t,
+                            }
                         },
                         glow,
                         thick: (rect.width().min(rect.height()) / 2.0 * 0.92).clamp(4.0, 17.0),
@@ -4361,7 +4467,7 @@ impl App {
             Tab::Clip => 340.0,
             Tab::Notes => 340.0,
             Tab::System => if self.stats.battery.is_some() { 416.0 } else { 394.0 },
-            Tab::Settings => 618.0,
+            Tab::Settings => 436.0,
         }
     }
 
@@ -4706,6 +4812,36 @@ fn spectrum(p: &egui::Painter, area: Rect, bars: &[f32], color: Color32, alpha: 
         let a = (255.0 * alpha * (0.45 + 0.55 * v)).min(255.0) as u8;
         p.rect_filled(r, Rounding { nw: w / 2.0, ne: w / 2.0, sw: 0.0, se: 0.0 }, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a));
     }
+}
+
+/// Строка настройки с переключателем справа; щёлкать можно по всей строке. Возвращает true, если переключили.
+fn switch_row(ui: &mut egui::Ui, on: &mut bool, title: &str, hint: &str) -> bool {
+    let h = if hint.is_empty() { 30.0 } else { 40.0 };
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+    }
+    let k = ui.ctx().animate_bool_with_time(resp.id.with("on"), *on, 0.14);
+    let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
+    let p = ui.painter();
+    if hov > 0.0 {
+        p.rect_filled(r.expand2(vec2(6.0, 0.0)), Rounding::same(9.0), rgba(255, 255, 255, (12.0 * hov) as u8));
+    }
+    let text = p.with_clip_rect(Rect::from_min_max(r.min, pos2(r.right() - 48.0, r.bottom())));
+    if hint.is_empty() {
+        text.text(pos2(r.left(), r.center().y), Align2::LEFT_CENTER, title, FontId::proportional(13.0), FG);
+    } else {
+        text.text(pos2(r.left(), r.top() + 12.0), Align2::LEFT_CENTER, title, FontId::proportional(13.0), FG);
+        text.text(pos2(r.left(), r.top() + 29.0), Align2::LEFT_CENTER, hint, FontId::proportional(11.0), DIM);
+    }
+    let track = Rect::from_min_size(pos2(r.right() - 38.0, r.center().y - 10.0), vec2(36.0, 20.0));
+    let a = accent();
+    p.rect_filled(track, Rounding::same(10.0), rgba(255, 255, 255, 38));
+    if k > 0.0 {
+        p.rect_filled(track, Rounding::same(10.0), Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), (k * 255.0) as u8));
+    }
+    p.circle_filled(pos2(track.left() + 10.0 + 16.0 * k, track.center().y), 7.5, Color32::WHITE);
+    resp.clicked()
 }
 
 /// Смешение двух непрозрачных цветов.
