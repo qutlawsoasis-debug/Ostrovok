@@ -21,6 +21,9 @@ pub struct Req {
     pub rr: f64,
     /// та же область в координатах поля острова (точки) — возвращается вместе с кадром
     pub cap: [f32; 4],
+    /// сила размытия фона в пикселях: пилюле хватает лёгкого, открытой панели нужно матовое стекло,
+    /// иначе текст и картинки под ней спорят с её содержимым
+    pub soft: usize,
 }
 
 pub struct Frame {
@@ -42,7 +45,8 @@ pub fn spawn(ctx: eframe::egui::Context) -> (mpsc::Sender<Req>, mpsc::Receiver<F
             }
             let Some(mut px) = crate::sys::grab_bgrx(req.x, req.y, req.w, req.h) else { continue };
             let (w, h) = (req.w as usize, req.h as usize);
-            blur(&mut px, &mut scratch, w, h, 3, 2);
+            let soft = req.soft.clamp(1, (w.min(h) / 3).max(1));
+            blur(&mut px, &mut scratch, w, h, soft, if soft > 4 { 3 } else { 2 });
             let mut out = refract(&px, w, h, req.ix, req.iy, req.iw, req.ih, req.rr);
             for c in out.chunks_exact_mut(4) {
                 c.swap(0, 2); // BGRX -> RGBA

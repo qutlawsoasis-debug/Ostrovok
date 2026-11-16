@@ -4108,6 +4108,7 @@ impl eframe::App for App {
                     ih: (layout_v.height() * ppp) as f64,
                     rr: (radius * ppp) as f64,
                     cap: [cap.left(), cap.top(), cap.right(), cap.bottom()],
+                    soft: if self.mode == Mode::Pill { 3 } else { (13.0 * ppp) as usize },
                 });
             }
         }
@@ -4215,9 +4216,11 @@ impl eframe::App for App {
                             let t = self.clearness() as f32 / 100.0;
                             match (self.lens_draw.is_some(), self.mode == Mode::Pill) {
                                 (true, true) => 0.62 - 0.45 * t,
-                                (true, false) => 0.80 - 0.45 * t,
-                                (false, true) => 1.0 - 0.60 * t,
-                                (false, false) => 1.0 - 0.33 * t,
+                                // открытая панель плотнее пилюли: на ней текст, он не должен теряться на фоне
+                                (true, false) => 0.88 - 0.30 * t,
+                                (false, true) => 1.0 - 0.45 * t,
+                                // без снимка фона размытия нет вовсе, поэтому панель почти непрозрачная
+                                (false, false) => 1.0 - 0.04 * t,
                             }
                         },
                         glow,
