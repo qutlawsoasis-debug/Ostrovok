@@ -455,8 +455,9 @@ pub fn pixel_at_cursor() -> Option<String> {
     }
 }
 
-/// Следит за папкой «Загрузки» и сообщает имя каждого нового готового файла.
-pub fn spawn_downloads(report: impl Fn(String) + Send + 'static) {
+/// Следит за папкой «Загрузки»: сообщает имя каждого нового готового файла, а пока что-то качается —
+/// пишет в progress, сколько байт уже скачано и с какой скоростью.
+pub fn spawn_downloads(report: impl Fn(String) + Send + 'static, progress: Arc<std::sync::Mutex<Option<(u64, f32)>>>) {
     std::thread::spawn(move || {
         let Ok(home) = std::env::var("USERPROFILE") else { return };
         let dir = Path::new(&home).join("Downloads");
@@ -469,9 +470,35 @@ pub fn spawn_downloads(report: impl Fn(String) + Send + 'static) {
             let l = n.to_lowercase();
             [".crdownload", ".tmp", ".part", ".download", ".opdownload"].iter().any(|s| l.ends_with(s)) || l.starts_with("~") || l == "desktop.ini"
         };
+        // недокачанные файлы браузеров: по их росту видно ход загрузки
+        let partial = || -> u64 {
+            std::fs::read_dir(&dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| {
+                            let l = e.file_name().to_string_lossy().to_lowercase();
+                            [".crdownload", ".part", ".opdownload", ".download"].iter().any(|s| l.ends_with(s))
+                        })
+                        .filter_map(|e| e.metadata().ok())
+                        .map(|m| m.len())
+                        .sum()
+                })
+                .unwrap_or(0)
+        };
         let mut seen = list();
+        let (mut last, mut quiet, mut tick) = (partial(), 0u32, 0u32);
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(3));
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let size = partial();
+            let speed = size.saturating_sub(last) as f32;
+            last = size;
+            // загрузка считается идущей, пока файл растёт; три секунды без роста — пауза или конец
+            quiet = if speed > 0.0 { 0 } else { quiet + 1 };
+            *progress.lock().unwrap() = (size > 0 && quiet < 3).then_some((size, speed));
+            tick += 1;
+            if tick % 3 != 0 {
+                continue;
+            }
             let now = list();
             for name in now.difference(&seen) {
                 if !unfinished(name) {

@@ -6,7 +6,7 @@
 
 use eframe::glow::{self, HasContext};
 
-pub const MAX_BLOBS: usize = 4;
+pub const MAX_BLOBS: usize = 5;
 
 #[derive(Clone, Copy)]
 pub struct Params {
@@ -49,8 +49,8 @@ void main() { gl_Position = vec4(v[gl_VertexID], 0.0, 1.0); }
 const FS: &str = r#"#version 330
 uniform vec2 u_org;        // левый край и верх области в пикселях кадра (верх — от нижнего края)
 uniform float u_ppp;
-uniform vec4 u_blob[4];
-uniform float u_rad[4];
+uniform vec4 u_blob[5];
+uniform float u_rad[5];
 uniform int u_n;
 uniform float u_k;
 uniform float u_time;
@@ -80,7 +80,7 @@ float smin(float a, float b, float k) {
 
 float map(vec2 p) {
     float d = 1e5;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         if (i >= u_n) break;
         float di = sdBox(p - u_blob[i].xy, u_blob[i].zw, u_rad[i]);
         d = (i == 0) ? di : smin(d, di, u_k);

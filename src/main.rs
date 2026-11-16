@@ -355,6 +355,11 @@ struct App {
     bub_timer: Spr,
     bub_call: Spr,
     bub_clip: Spr,
+    bub_dl: Spr,
+    /// последняя подпись капли загрузки — чтобы она не пустела, пока капля втягивается
+    dl_text: String,
+    /// идущая загрузка: сколько байт скачано и скорость, байт в секунду
+    dl: Arc<Mutex<Option<(u64, f32)>>>,
     hint: Option<Hint>,
     hint_until: Instant,
     clip_skip: bool,
@@ -534,12 +539,19 @@ impl App {
             });
         }
 
+        let dl: Arc<Mutex<Option<(u64, f32)>>> = Default::default();
+        if std::env::var_os("OSTROVOK_DL").is_some() {
+            *dl.lock().unwrap() = Some((36 << 20, 2.4 * 1048576.0));
+        }
         if !test_mode() {
             let (tx, ctx) = (tx.clone(), ctx.clone());
-            sys::spawn_downloads(move |name| {
-                let _ = tx.send(Msg::Download(name));
-                ctx.request_repaint();
-            });
+            sys::spawn_downloads(
+                move |name| {
+                    let _ = tx.send(Msg::Download(name));
+                    ctx.request_repaint();
+                },
+                dl.clone(),
+            );
         }
         let (lens_tx, lens_rx) = glass::spawn(ctx.clone());
         let fx = cc.gl.as_ref().and_then(|gl| fx::Fx::new(gl)).map(Arc::new);
@@ -618,6 +630,9 @@ impl App {
             bub_timer: Spr::new(0.0, 230.0, 17.0, 0.004),
             bub_call: Spr::new(0.0, 230.0, 17.0, 0.004),
             bub_clip: Spr::new(0.0, 230.0, 17.0, 0.004),
+            bub_dl: Spr::new(0.0, 230.0, 17.0, 0.004),
+            dl: dl.clone(),
+            dl_text: String::new(),
             hint: None,
             hint_until: Instant::now(),
             clip_skip: false,
@@ -4409,6 +4424,9 @@ impl eframe::App for App {
         self.bub_call.step(dt);
         self.bub_clip.target = if side && self.hint.is_some() && now < self.hint_until { 1.0 } else { 0.0 };
         self.bub_clip.step(dt);
+        let dl_now = *self.dl.lock().unwrap();
+        self.bub_dl.target = if side && dl_now.is_some() { 1.0 } else { 0.0 };
+        self.bub_dl.step(dt);
         self.ripple *= (-dt * 2.3).exp();
         if self.ripple < 0.03 {
             self.ripple = 0.0;
@@ -4471,7 +4489,7 @@ impl eframe::App for App {
         let dripping = !flask && self.mode == Mode::Pill && self.media_now.as_ref().is_some_and(|m| m.playing);
         let glowing_music = self.album.is_some() && self.media_now.as_ref().is_some_and(|m| m.playing);
         let glowing = self.glow.is_some_and(|g| g.1.elapsed().as_secs_f32() < 1.3);
-        let moving = !self.reach.settled() || self.reach.v > 0.01 || !self.lean_s.settled() || !self.jelly.settled() || self.ripple > 0.0 || dripping || glowing || glowing_music || self.sound.active() || sloshing || !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || self.sheen_at.elapsed().as_secs_f32() < 0.75;
+        let moving = !self.reach.settled() || self.reach.v > 0.01 || !self.lean_s.settled() || !self.jelly.settled() || self.ripple > 0.0 || dripping || glowing || glowing_music || self.sound.active() || sloshing || !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || !self.bub_dl.settled() || self.sheen_at.elapsed().as_secs_f32() < 0.75;
         let animating = animating || moving;
         let scaled = rect_v.size() * self.jelly.v;
         let rect_v = Rect::from_min_size(pos2(WIN_W / 2.0 - scaled.x / 2.0 + self.lean_s.v, TOP + self.drop_y), scaled);
@@ -4494,7 +4512,18 @@ impl eframe::App for App {
             let call_text = clock(self.call_since.map_or(0, |s| s.elapsed().as_secs()));
             let mut edge = rect_v.right();
             let hint_text = self.hint.as_ref().map(|h| h.label.clone()).unwrap_or_default();
-            for (kind, sv, text) in [(0u8, self.bub_timer.v, timer_text), (1u8, self.bub_call.v, call_text), (2u8, self.bub_clip.v, hint_text)] {
+            let dl_text = match dl_now {
+                Some((bytes, speed)) => {
+                    let size = if bytes >= 1 << 30 { format!("{:.1} ГБ", bytes as f64 / (1u64 << 30) as f64) } else { format!("{} МБ", (bytes >> 20).max(1)) };
+                    let rate = if speed >= 1048576.0 { format!("{:.1} МБ/с", speed / 1048576.0) } else { format!("{:.0} КБ/с", speed / 1024.0) };
+                    format!("{size} · {rate}").replace('.', ",")
+                }
+                None => std::mem::take(&mut self.dl_text),
+            };
+            if dl_now.is_some() {
+                self.dl_text = dl_text.clone();
+            }
+            for (kind, sv, text) in [(0u8, self.bub_timer.v, timer_text), (1u8, self.bub_call.v, call_text), (2u8, self.bub_clip.v, hint_text), (3u8, self.bub_dl.v, dl_text)] {
                 if sv > 0.02 {
                     let w = 44.0 + ctx.fonts(|f| f.layout_no_wrap(text.clone(), semi(13.0), FG).size().x);
                     let r = Rect::from_min_size(pos2(edge - w + (w + 9.0) * sv.min(1.15), rect_v.center().y - 15.0), vec2(w, 30.0));
@@ -4808,7 +4837,7 @@ impl eframe::App for App {
                         }
                     }
                     // содержимое капель проявляется, когда капля уже отделилась
-                    let (mut open_timer, mut run_hint) = (false, false);
+                    let (mut open_timer, mut run_hint, mut open_dl) = (false, false, false);
                     for (i, (r, sv, kind, text)) in self.bubbles.iter().enumerate() {
                         let a = ((sv - 0.55) / 0.45).clamp(0.0, 1.0);
                         if a <= 0.0 {
@@ -4817,6 +4846,7 @@ impl eframe::App for App {
                         let (glyph, color) = match (*kind, &self.hint) {
                             (0, _) => ("\u{E916}", Color32::from_rgb(0xFF, 0xB3, 0x40)),
                             (2, Some(h)) => (h.glyph, Color32::from_rgb(h.color[0], h.color[1], h.color[2])),
+                            (3, _) => ("\u{E896}", Color32::from_rgb(0x5A, 0xAB, 0xFF)),
                             _ => ("\u{E720}", Color32::from_rgb(0x9A, 0xA3, 0xFF)),
                         };
                         let fade = |c: Color32| rgba(c.r(), c.g(), c.b(), (a * 255.0) as u8);
@@ -4826,9 +4856,16 @@ impl eframe::App for App {
                             if *kind == 0 {
                                 open_timer = true;
                             } else {
-                                run_hint = true;
+                                if *kind == 3 {
+                                    open_dl = true;
+                                } else {
+                                    run_hint = true;
+                                }
                             }
                         }
+                    }
+                    if open_dl {
+                        sys::open(&format!("{}\\Downloads", std::env::var("USERPROFILE").unwrap_or_default()));
                     }
                     if run_hint {
                         if let Some(h) = self.hint.clone() {
