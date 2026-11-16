@@ -217,6 +217,7 @@ enum Tab {
     Timer,
     Clip,
     Notes,
+    Todo,
     Calendar,
     System,
     Sound,
@@ -467,6 +468,9 @@ struct App {
     watch: Arc<Mutex<sys::Watch>>,
     watch_seen: Option<sys::Watch>,
     clear_saved: u8,
+    todo_edit: String,
+    /// режим «Фокус»: идёт ли перерыв и сколько кругов работы пройдено
+    focus: Option<(bool, u32)>,
     /// размеры файлов на полке: None — файла нет, u64::MAX — папка
     shelf_meta: std::collections::HashMap<String, Option<u64>>,
     mem_hot: u8,
@@ -685,6 +689,8 @@ impl App {
             },
             watch_seen: None,
             clear_saved: 0,
+            todo_edit: String::new(),
+            focus: None,
             shelf_meta: Default::default(),
             mem_hot: 0,
             mem_alert_at: None,
@@ -700,6 +706,9 @@ impl App {
             if std::env::var_os("OSTROVOK_TOAST").is_some() {
                 app.show_toast("\u{E896}", [0x3A, 0x9B, 0xFF], "Загрузка завершена", "otchet-za-noyabr.pdf", 30, false);
             }
+        }
+        if test_mode() && std::env::var_os("OSTROVOK_TODO").is_some() {
+            app.cfg.todos = [("Купить хлеб и молоко", false), ("Ответить Мирону", false), ("Оплатить интернет", true), ("Записаться к врачу", false)].map(|(t, done)| store::Todo { text: t.to_string(), done }).to_vec();
         }
         if test_mode() && std::env::var_os("OSTROVOK_SHELF").is_some() {
             app.cfg.shelf = ["C:\\Windows\\explorer.exe", "C:\\Windows\\System32\\notepad.exe", "C:\\Windows\\win.ini", "C:\\Windows\\Fonts", "C:\\нет\\такого.txt"].map(String::from).to_vec();
@@ -747,6 +756,7 @@ impl App {
                     Tab::Clip
                 }
                 "notes" => Tab::Notes,
+                "todo" => Tab::Todo,
                 "system" => Tab::System,
                 "sound" => Tab::Sound,
                 "settings" => Tab::Settings,
@@ -1213,7 +1223,20 @@ impl App {
         if self.timer_end.is_some_and(|end| now >= end) {
             self.timer_end = None;
             sys::beep();
-            self.show_toast("\u{E916}", [0x30, 0xD1, 0x58], "Таймер завершён", "Время вышло", 8, false);
+            match self.focus {
+                // работа кончилась — перерыв; перерыв кончился — снова работа
+                Some((false, rounds)) => {
+                    self.focus = Some((true, rounds + 1));
+                    self.start_timer(5.0);
+                    self.show_toast("\u{E916}", [0x30, 0xD1, 0x58], "Перерыв 5 минут", &format!("круг {} пройден — отдохните", rounds + 1), 6, false);
+                }
+                Some((true, rounds)) => {
+                    self.focus = Some((false, rounds));
+                    self.start_timer(25.0);
+                    self.show_toast("\u{E916}", [0xFF, 0xB3, 0x40], "Фокус 25 минут", "перерыв окончен — за работу", 6, false);
+                }
+                None => self.show_toast("\u{E916}", [0x30, 0xD1, 0x58], "Таймер завершён", "Время вышло", 8, false),
+            }
             self.emotion = Emotion::Surprised;
             self.emotion_until = now + Duration::from_secs(4);
         }
@@ -1563,7 +1586,7 @@ impl App {
             ("\u{E80F}", "Обзор", &[(Tab::Home, "Сводка"), (Tab::Music, "Музыка"), (Tab::Weather, "Погода"), (Tab::Calendar, "Календарь")]),
             ("\u{E7F4}", "Система", &[(Tab::Control, "Управление"), (Tab::Sound, "Звук"), (Tab::System, "Монитор")]),
             ("\u{E90F}", "Инструменты", &[(Tab::Timer, "Таймер"), (Tab::Remind, "Напоминания"), (Tab::Qr, "QR-код")]),
-            ("\u{E70B}", "Записи", &[(Tab::Clip, "Буфер"), (Tab::Notes, "Заметки"), (Tab::Shelf, "Полка")]),
+            ("\u{E70B}", "Записи", &[(Tab::Clip, "Буфер"), (Tab::Todo, "Дела"), (Tab::Notes, "Заметки"), (Tab::Shelf, "Полка")]),
             ("\u{E8BD}", "ИИ", &[(Tab::Ai, "ИИ"), (Tab::Jarvis, "Джарвис")]),
             ("\u{E713}", "Настройки", &[(Tab::Settings, "Настройки")]),
         ];
@@ -1649,6 +1672,7 @@ impl App {
             Tab::Timer => self.ui_timer(ui),
             Tab::Clip => self.ui_clip(ui),
             Tab::Notes => self.ui_notes(ui),
+            Tab::Todo => self.ui_todo(ui),
             Tab::Settings => self.ui_settings(ui, ctx),
         }
     }
@@ -1776,6 +1800,100 @@ impl App {
     }
 
     /// Записи → Полка: файлы значками, как на рабочем столе. Щелчок открывает, правый щелчок — папку файла.
+    /// Записи → Дела: короткий список с галочками. Сделанное зачёркивается и уходит вниз.
+    fn ui_todo(&mut self, ui: &mut egui::Ui) {
+        let mut add = false;
+        ui.horizontal(|ui| {
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.todo_edit)
+                    .margin(egui::Margin::symmetric(9.0, 7.0))
+                    .hint_text(RichText::new("Что нужно сделать").color(DIM))
+                    .desired_width(ui.available_width() - 112.0),
+            );
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            add = jelly(ui, "Добавить").clicked() || enter;
+            if enter {
+                r.request_focus();
+            }
+        });
+        if add {
+            let text = self.todo_edit.trim().to_string();
+            if !text.is_empty() {
+                self.cfg.todos.insert(0, store::Todo { text, done: false });
+                self.cfg.todos.truncate(60);
+                self.todo_edit.clear();
+                self.cfg.save();
+            }
+        }
+        if self.cfg.todos.is_empty() {
+            empty_state(ui, "\u{E73E}", "Дел нет", "Впишите дело выше и нажмите Enter");
+            return;
+        }
+        let left = self.cfg.todos.iter().filter(|t| !t.done).count();
+        let done = self.cfg.todos.len() - left;
+        let mut clear_done = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(if left == 0 { "Всё сделано".to_string() } else { format!("Осталось: {left}") }).color(DIM));
+            if done > 0 {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    clear_done = jelly(ui, "Убрать сделанные").clicked();
+                });
+            }
+        });
+        let (mut toggle, mut remove) = (None, None);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            // сначала несделанные, потом сделанные; внутри — в порядке добавления
+            let order: Vec<usize> = (0..self.cfg.todos.len()).filter(|i| !self.cfg.todos[*i].done).chain((0..self.cfg.todos.len()).filter(|i| self.cfg.todos[*i].done)).collect();
+            for i in order {
+                let item = &self.cfg.todos[i];
+                let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 6.0, 34.0), Sense::click());
+                let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
+                let k = ui.ctx().animate_bool_with_time(ui.id().with(("todo-done", &item.text)), item.done, 0.16);
+                let p = ui.painter();
+                if hov > 0.0 {
+                    p.rect_filled(row, Rounding::same(10.0), rgba(255, 255, 255, (14.0 * hov) as u8));
+                }
+                let c = pos2(row.left() + 18.0, row.center().y);
+                let a = accent();
+                p.circle_stroke(c, 8.5, Stroke::new(1.5_f32, mix(DIM, a, k.max(hov * 0.6))));
+                if k > 0.0 {
+                    p.circle_filled(c, 8.5 * k, a);
+                    p.text(c, Align2::CENTER_CENTER, "\u{E73E}", FontId::proportional(9.5), Color32::from_rgba_unmultiplied(16, 14, 28, (k * 255.0) as u8));
+                }
+                let text = p
+                    .with_clip_rect(Rect::from_min_max(pos2(row.left() + 36.0, row.top()), pos2(row.right() - 34.0, row.bottom())))
+                    .text(pos2(row.left() + 36.0, row.center().y), Align2::LEFT_CENTER, &item.text, FontId::proportional(13.5), mix(FG, DIM, k));
+                if k > 0.0 {
+                    let end = text.left() + text.width().min(row.right() - 34.0 - text.left()) * k;
+                    p.line_segment([pos2(text.left(), row.center().y + 1.0), pos2(end, row.center().y + 1.0)], Stroke::new(1.2_f32, DIM));
+                }
+                let x = Rect::from_center_size(pos2(row.right() - 16.0, row.center().y), vec2(24.0, 24.0));
+                let del = ui.interact(x, ui.id().with(("todo-del", i)), Sense::click());
+                if hov > 0.0 || del.hovered() {
+                    ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(11.0), if del.hovered() { FG } else { DIM });
+                }
+                if del.clicked() {
+                    remove = Some(i);
+                } else if resp.clicked() {
+                    toggle = Some(i);
+                }
+            }
+        });
+        if let Some(i) = toggle {
+            self.cfg.todos[i].done = !self.cfg.todos[i].done;
+            self.cfg.save();
+        }
+        if let Some(i) = remove {
+            self.cfg.todos.remove(i);
+            self.cfg.save();
+        }
+        if clear_done {
+            self.cfg.todos.retain(|t| !t.done);
+            self.cfg.save();
+        }
+    }
+
     fn ui_shelf(&mut self, ui: &mut egui::Ui) {
         if self.cfg.shelf.is_empty() {
             empty_state(ui, "\u{E8B7}", "Полка пуста", "Перетащите файл на остров — он останется под рукой");
@@ -1917,18 +2035,21 @@ impl App {
             // ближайшее дело: таймер или напоминание
             let stamp = t.timestamp();
             let next = self.cfg.reminders.iter().filter(|r| r.at > stamp).min_by_key(|r| r.at);
+            let todo_left = self.cfg.todos.iter().filter(|t| !t.done).count();
             let (line, color) = if let Some(end) = self.timer_end {
                 (format!("\u{E916}  таймер {}", fmt_left(end)), Color32::from_rgb(0xFF, 0xB3, 0x40))
             } else if let Some(r) = next {
                 let mins = (r.at - stamp) / 60;
                 let when = if mins < 60 { format!("через {} мин", mins.max(1)) } else if mins < 1440 { format!("через {} ч", mins / 60) } else { format!("через {} д", mins / 1440) };
                 (format!("\u{E823}  {when} · {}", r.text), accent())
+            } else if todo_left > 0 {
+                (format!("\u{E73E}  дел в списке: {todo_left}"), accent())
             } else {
                 ("\u{E823}  дел на сегодня нет".to_string(), DIM)
             };
             p.with_clip_rect(now_r.shrink2(vec2(12.0, 0.0))).text(now_r.min + vec2(17.0, 75.0), Align2::LEFT_TOP, line, FontId::proportional(11.5), color);
             if resp.clicked() {
-                self.tab = if self.timer_end.is_some() { Tab::Timer } else if next.is_some() { Tab::Remind } else { Tab::Calendar };
+                self.tab = if self.timer_end.is_some() { Tab::Timer } else if next.is_some() { Tab::Remind } else if todo_left > 0 { Tab::Todo } else { Tab::Calendar };
             }
         }
 
@@ -2752,7 +2873,12 @@ impl App {
         let live = self.timer_end.is_some();
         ring(&p, c, 66.0, 7.0, frac, Color32::from_rgb(0xFF, 0xB3, 0x40));
         p.text(c - vec2(0.0, 5.0), Align2::CENTER_CENTER, text, light(30.0), if live { FG } else { DIM });
-        p.text(c + vec2(0.0, 24.0), Align2::CENTER_CENTER, if live { "осталось" } else { "таймер" }, FontId::proportional(11.5), DIM);
+        p.text(c + vec2(0.0, 24.0), Align2::CENTER_CENTER, match (live, self.focus) {
+                (true, Some((true, _))) => "перерыв",
+                (true, Some((false, _))) => "фокус",
+                (true, None) => "осталось",
+                _ => "таймер",
+            }, FontId::proportional(11.5), DIM);
 
         let mut side = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(pos2(area.left() + 178.0, area.top() + 4.0), area.max)));
         let ui = &mut side;
@@ -2774,9 +2900,23 @@ impl App {
             }
             if live && jelly(ui, "Стоп").clicked() {
                 self.timer_end = None;
+                self.focus = None;
+            }
+            let label = match self.focus {
+                Some((_, rounds)) => format!("Фокус: круг {}", rounds + 1),
+                None => "Фокус 25/5".to_string(),
+            };
+            if jelly(ui, label).on_hover_text("25 минут работы, 5 минут перерыва — по кругу, пока не остановите").clicked() {
+                if self.focus.take().is_some() {
+                    self.timer_end = None;
+                } else {
+                    self.focus = Some((false, 0));
+                    self.start_timer(25.0);
+                }
             }
         });
         if let Some(m) = start {
+            self.focus = None;
             self.start_timer(m);
         }
         ui.add_space(6.0);
@@ -4466,6 +4606,7 @@ impl App {
             Tab::Calendar => 360.0,
             Tab::Clip => 340.0,
             Tab::Notes => 340.0,
+            Tab::Todo => 340.0,
             Tab::System => if self.stats.battery.is_some() { 416.0 } else { 394.0 },
             Tab::Settings => 436.0,
         }

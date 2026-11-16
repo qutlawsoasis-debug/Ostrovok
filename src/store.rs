@@ -45,6 +45,9 @@ pub struct Settings {
     /// не показывать в пилюле громкость и смену раскладки
     #[serde(default)]
     pub no_hud: bool,
+    /// список дел
+    #[serde(default)]
+    pub todos: Vec<Todo>,
     /// прозрачность стекла, 1…100; 0 — не задана (тогда 60)
     #[serde(default)]
     pub clear: u8,
@@ -95,6 +98,13 @@ pub struct Settings {
 pub struct PinnedApp {
     pub name: String,
     pub path: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Todo {
+    pub text: String,
+    #[serde(default)]
+    pub done: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
