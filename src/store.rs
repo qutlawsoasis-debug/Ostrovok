@@ -139,13 +139,24 @@ impl Settings {
     }
 }
 
-pub fn load_notes() -> String {
-    std::fs::read_to_string(dir().join("notes.txt")).unwrap_or_default()
+/// Разделитель заметок в файле: служебный знак «конец записи» на отдельной строке.
+/// Файл со старой единственной заметкой читается как одна заметка.
+const NOTE_SEP: &str = "\n\u{1E}\n";
+
+pub fn load_notes() -> Vec<String> {
+    let text = std::fs::read_to_string(dir().join("notes.txt")).unwrap_or_default();
+    let list: Vec<String> = text.split(NOTE_SEP).map(str::to_string).filter(|n| !n.trim().is_empty()).collect();
+    if list.is_empty() { vec![String::new()] } else { list }
 }
 
-pub fn save_notes(text: &str) {
+pub fn save_notes(notes: &[String]) {
+    // проверочный запуск не должен менять настоящие заметки
+    if std::env::var_os("OSTROVOK_TEST").is_some() {
+        return;
+    }
     let _ = std::fs::create_dir_all(dir());
-    let _ = std::fs::write(dir().join("notes.txt"), text);
+    let kept: Vec<&str> = notes.iter().map(String::as_str).filter(|n| !n.trim().is_empty()).collect();
+    let _ = std::fs::write(dir().join("notes.txt"), kept.join(NOTE_SEP));
 }
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";

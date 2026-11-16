@@ -289,10 +289,15 @@ impl App {
                 if t.is_empty() {
                     return "Ошибка: пустая заметка".into();
                 }
-                if !self.notes.is_empty() && !self.notes.ends_with('\n') {
-                    self.notes.push('\n');
+                // Джарвис дописывает в первую заметку
+                if self.notes.is_empty() {
+                    self.notes.push(String::new());
                 }
-                self.notes.push_str(&t);
+                let first = &mut self.notes[0];
+                if !first.is_empty() && !first.ends_with('\n') {
+                    first.push('\n');
+                }
+                first.push_str(&t);
                 self.notes_dirty = Some(Instant::now());
                 "Записал в заметки".into()
             }

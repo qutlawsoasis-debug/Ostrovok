@@ -317,7 +317,10 @@ struct App {
     city_edit: String,
     autostart: bool,
 
-    notes: String,
+    notes: Vec<String>,
+    /// какая заметка открыта и что ищут в списке
+    note_sel: usize,
+    note_query: String,
     notes_dirty: Option<Instant>,
 
     clipboard: Option<arboard::Clipboard>,
@@ -578,6 +581,8 @@ impl App {
             cfg,
             autostart: store::autostart_enabled(),
             notes: store::load_notes(),
+            note_sel: 0,
+            note_query: String::new(),
             notes_dirty: None,
             clipboard: arboard::Clipboard::new().ok(),
             clips: Vec::new(),
@@ -768,6 +773,11 @@ impl App {
                     }
                     Tab::Shot
                 }
+                "notes" => {
+                    // для снимков: образцы заметок (в проверочном запуске они не сохраняются)
+                    app.notes = ["Покупки\nхлеб, молоко, сыр\nкорм коту", "Идеи для острова\nгромкость по приложениям колесом\nвиджет курса валют", "Пароль от вайфая у соседей\nспросить в субботу", "Сервер\nперезагружать по вторникам"].map(String::from).to_vec();
+                    Tab::Notes
+                }
                 "jarvis" => Tab::Jarvis,
                 "jarvis-settings" => {
                     app.jv_view = 1;
@@ -793,7 +803,6 @@ impl App {
                     app.clips = ["https://github.com/qutlawsoasis-debug/Ostrovok", "#7C5CFF", "128 * 4 + 16", "Купить хлеб и молоко по дороге домой", r"C:\Windows\System32", "hello@example.org"].map(String::from).to_vec();
                     Tab::Clip
                 }
-                "notes" => Tab::Notes,
                 "todo" => Tab::Todo,
                 "system" => Tab::System,
                 "sound" => Tab::Sound,
@@ -3229,11 +3238,65 @@ impl App {
         self.hint_until = Instant::now();
     }
 
+    /// Записи → Заметки: слева список (название — первая строка), справа текст выбранной.
     fn ui_notes(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        if self.notes.is_empty() {
+            self.notes.push(String::new());
+        }
+        self.note_sel = self.note_sel.min(self.notes.len() - 1);
+        let q = self.note_query.trim().to_lowercase();
+        let (mut pick, mut add, mut del) = (None, false, false);
+        let full = ui.available_rect_before_wrap();
+        let left = Rect::from_min_size(full.min, vec2(204.0, full.height()));
+        let right = Rect::from_min_max(pos2(left.right() + 12.0, full.top()), full.max);
+        ui.allocate_rect(full, Sense::hover());
+
+        // ----- список
+        let mut lu = ui.new_child(egui::UiBuilder::new().max_rect(left));
+        lu.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.note_query)
+                    .margin(egui::Margin::symmetric(9.0, 7.0))
+                    .hint_text(RichText::new("Поиск").color(DIM))
+                    .desired_width(left.width() - 56.0),
+            );
+            add = jelly(ui, "+").on_hover_text("Новая заметка").clicked();
+        });
+        egui::ScrollArea::vertical().id_salt("notes-list").auto_shrink([false, false]).show(&mut lu, |ui| {
+            let mut shown = 0;
+            for (i, n) in self.notes.iter().enumerate() {
+                if !q.is_empty() && !n.to_lowercase().contains(&q) {
+                    continue;
+                }
+                shown += 1;
+                let mut lines = n.lines().map(str::trim).filter(|l| !l.is_empty());
+                let title = lines.next().unwrap_or("Новая заметка").to_string();
+                let more = lines.next().unwrap_or("").to_string();
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::click());
+                let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
+                let on = i == self.note_sel;
+                glass_chip(ui.painter(), r, 11.0, if on { 1.0 } else { 0.3 + 0.4 * hov });
+                let p = ui.painter().with_clip_rect(r.shrink2(vec2(10.0, 0.0)));
+                p.text(pos2(r.left() + 12.0, r.top() + 14.0), Align2::LEFT_CENTER, title, semi(13.0), if on { accent() } else { FG });
+                p.text(pos2(r.left() + 12.0, r.top() + 31.0), Align2::LEFT_CENTER, if more.is_empty() { "без продолжения".to_string() } else { more }, FontId::proportional(11.5), DIM);
+                if resp.clicked() {
+                    pick = Some(i);
+                }
+                ui.add_space(3.0);
+            }
+            if shown == 0 {
+                ui.add_space(20.0);
+                ui.vertical_centered(|ui| ui.label(RichText::new("Ничего не найдено").color(DIM)));
+            }
+        });
+
+        // ----- текст
+        let mut ru = ui.new_child(egui::UiBuilder::new().max_rect(right));
+        let sel = self.note_sel;
+        egui::ScrollArea::vertical().id_salt("notes-text").max_height(right.height() - 30.0).auto_shrink([false, false]).show(&mut ru, |ui| {
             let r = ui.add(
-                egui::TextEdit::multiline(&mut self.notes)
-                    .hint_text(RichText::new("Заметки сохраняются сами").color(DIM))
+                egui::TextEdit::multiline(&mut self.notes[sel])
+                    .hint_text(RichText::new("Первая строка станет названием. Заметки сохраняются сами").color(DIM))
                     .desired_width(f32::INFINITY)
                     .desired_rows(11)
                     .margin(egui::Margin::symmetric(10.0, 8.0)),
@@ -3242,6 +3305,42 @@ impl App {
                 self.notes_dirty = Some(Instant::now());
             }
         });
+        ru.horizontal(|ui| {
+            let n = self.notes[sel].chars().count();
+            ui.label(RichText::new(format!("{} из {} · {n} симв.", sel + 1, self.notes.len())).color(DIM).size(11.5));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                del = ui.add_enabled(self.notes.len() > 1 || n > 0, egui::Button::new("Удалить")).clicked();
+                if jelly(ui, "Копировать").clicked() {
+                    let text = self.notes[sel].clone();
+                    self.set_clipboard(&text);
+                    self.notify("Заметка скопирована");
+                }
+            });
+        });
+
+        if let Some(i) = pick {
+            self.note_sel = i;
+        }
+        if add {
+            // пустую заметку второй раз не создаём — просто открываем её
+            match self.notes.iter().position(|n| n.trim().is_empty()) {
+                Some(i) => self.note_sel = i,
+                None => {
+                    self.notes.insert(0, String::new());
+                    self.note_sel = 0;
+                }
+            }
+            self.note_query.clear();
+        }
+        if del {
+            self.notes.remove(sel);
+            if self.notes.is_empty() {
+                self.notes.push(String::new());
+            }
+            self.note_sel = sel.min(self.notes.len() - 1);
+            self.notes_dirty = Some(Instant::now());
+            self.notify("Заметка удалена");
+        }
     }
 
     /// Настройки в две колонки: слева вид и данные, справа — поведение переключателями.
