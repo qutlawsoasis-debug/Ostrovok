@@ -8,6 +8,7 @@ mod glass;
 mod jarvis;
 mod jarvis_ui;
 mod setup;
+mod sound;
 mod live;
 mod media;
 mod store;
@@ -314,6 +315,12 @@ struct App {
     bin: (i64, i64),
     light_theme: Option<bool>,
     mixer: Vec<sys::AppVol>,
+    /// живой звук компьютера: источник и сглаженные столбики эквалайзера
+    sound: sound::Sound,
+    bars: [f32; sound::BANDS],
+    beat: f32,
+    /// какие программы сейчас звучат — для подписи, когда плеер молчит
+    sounding: (String, Instant),
     mixer_at: Instant,
     sheen_at: Instant,
     hover_was: bool,
@@ -517,6 +524,10 @@ impl App {
             timer_total: 60.0,
             ctl_at: now,
             mixer: Vec::new(),
+            sound: sound::Sound::spawn(),
+            bars: [0.0; sound::BANDS],
+            beat: 0.0,
+            sounding: (String::new(), now),
             mixer_at: now.checked_sub(Duration::from_secs(5)).unwrap_or(now),
             sheen_at: now,
             hover_was: false,
@@ -863,6 +874,12 @@ impl App {
 
     /// Фоновые дела: сообщения потоков, буфер обмена, таймер, погода, заметки.
     fn pump(&mut self, ctx: &egui::Context, now: Instant) {
+        // столбики эквалайзера догоняют звук плавно, без дрожания
+        let snd = self.sound.frame();
+        for (b, t) in self.bars.iter_mut().zip(snd.bands) {
+            *b += (t - *b) * if t > *b { 0.6 } else { 0.25 };
+        }
+        self.beat += (snd.bass - self.beat) * 0.4;
         // постоянное прослушивание включается и выключается по настройке
         if !test_mode() && self.cfg.jarvis_listen != self.ears.watching() {
             if self.cfg.jarvis_listen {
@@ -1097,7 +1114,7 @@ impl App {
             let secs = since.elapsed().as_secs();
             v.push(Seg::Text(format!("\u{E720} {:02}:{:02}", secs / 60, secs % 60), Color32::from_rgb(0x8E, 0x98, 0xFF)));
         }
-        if playing {
+        if playing || self.sound.active() {
             v.push(Seg::Eq);
         } else if let Some(w) = &self.weather {
             let (icon, _) = weather::describe(w.code);
@@ -1111,7 +1128,7 @@ impl App {
         for s in segs {
             w += match s {
                 Seg::Thumb => 20.0,
-                Seg::Eq => 16.0,
+                Seg::Eq => 24.0,
                 Seg::Text(t, _) => ctx.fonts(|f| f.layout_no_wrap(t.clone(), semi(13.5), FG).size().x),
             } + 10.0;
         }
@@ -1263,12 +1280,20 @@ impl App {
                     x += 30.0;
                 }
                 Seg::Eq => {
-                    for i in 0..3 {
-                        let h = 4.0 + 9.0 * (0.5 + 0.5 * ((time * (5.0 + i as f64 * 1.7) + i as f64 * 1.3).sin() as f32));
-                        let bx = x + i as f32 * 5.0;
-                        p.rect_filled(Rect::from_min_max(pos2(bx, cy + 7.0 - h), pos2(bx + 3.0, cy + 7.0)), Rounding::same(1.5), self.album.map_or(ACCENT, |c| Color32::from_rgb(c[0], c[1], c[2])));
+                    let color = self.album.map_or(ACCENT, |c| Color32::from_rgb(c[0], c[1], c[2]));
+                    let live = self.sound.active();
+                    for i in 0..5 {
+                        // пять столбиков: каждый — среднее по трём соседним полосам настоящего звука
+                        let h = if live {
+                            let k = i * 3;
+                            3.0 + 13.0 * ((self.bars[k] + self.bars[k + 1] + self.bars[k + 2]) / 3.0).powf(1.4)
+                        } else {
+                            4.0 + 9.0 * (0.5 + 0.5 * ((time * (5.0 + i as f64 * 1.7) + i as f64 * 1.3).sin() as f32))
+                        };
+                        let bx = x + i as f32 * 4.5;
+                        p.rect_filled(Rect::from_min_max(pos2(bx, cy + 8.0 - h), pos2(bx + 3.0, cy + 8.0)), Rounding::same(1.5), color);
                     }
-                    x += 26.0;
+                    x += 34.0;
                 }
                 Seg::Text(t, c) => {
                     let r = p.text(pos2(x, cy), Align2::LEFT_CENTER, t, semi(13.5), *c);
@@ -1724,8 +1749,14 @@ impl App {
                 }
             }
             None => {
-                p.text(pos2(x, music_r.top() + 30.0), Align2::LEFT_TOP, "Ничего не играет", semi(14.0), FG);
-                p.text(pos2(x, music_r.top() + 51.0), Align2::LEFT_TOP, "Включите музыку в плеере", FontId::proportional(12.0), DIM);
+                if self.sound.active() {
+                    p.text(pos2(x, music_r.top() + 16.0), Align2::LEFT_TOP, "Играет звук", semi(14.0), FG);
+                    let strip = Rect::from_min_max(pos2(x, music_r.top() + 38.0), pos2(music_r.right() - 16.0, music_r.bottom() - 14.0));
+                    spectrum(&p, strip, &self.bars, ACCENT, 0.8, 1.0);
+                } else {
+                    p.text(pos2(x, music_r.top() + 30.0), Align2::LEFT_TOP, "Ничего не играет", semi(14.0), FG);
+                    p.text(pos2(x, music_r.top() + 51.0), Align2::LEFT_TOP, "Включите музыку в плеере", FontId::proportional(12.0), DIM);
+                }
             }
         }
 
@@ -1948,6 +1979,24 @@ impl App {
     fn ui_music(&mut self, ui: &mut egui::Ui) {
         let accent = self.album.map_or(ACCENT, |c| Color32::from_rgb(c[0], c[1], c[2]));
         let Some(m) = self.media_now.clone() else {
+            if self.sound.active() {
+                // кто звучит — спрашиваем у Windows не чаще раза в полторы секунды
+                if self.sounding.1.elapsed() > Duration::from_millis(1500) {
+                    let names: Vec<String> = sys::app_volumes().into_iter().filter(|a| a.active && !a.muted).map(|a| a.name).take(3).collect();
+                    self.sounding = (names.join(", "), Instant::now());
+                }
+                ui.add_space(26.0);
+                let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 170.0), Sense::hover());
+                let p = ui.painter().clone();
+                glass_chip(&p, area, 20.0, 0.4);
+                spectrum(&p.with_clip_rect(area), area.shrink2(vec2(18.0, 0.0)), &self.bars, accent, 0.85, 0.72);
+                ui.add_space(12.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new(if self.sounding.0.is_empty() { "Играет звук компьютера".to_string() } else { format!("Звучит: {}", self.sounding.0) }).font(semi(16.5)));
+                    ui.label(RichText::new("Плеер не сообщил название трека, поэтому остров показывает сам звук.").color(DIM));
+                });
+                return;
+            }
             ui.add_space(70.0);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("\u{E8D6}").size(34.0).color(DIM));
@@ -2012,6 +2061,7 @@ impl App {
         ui.add_space(6.0);
         let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 132.0), Sense::hover());
         glass_chip(&p, area, 18.0, 0.4);
+        spectrum(&p.with_clip_rect(area), area.shrink2(vec2(14.0, 0.0)), &self.bars, accent, 0.26, 0.62);
         let lines = p.with_clip_rect(area.shrink(8.0));
         if !self.cfg.lyrics {
             lines.text(area.center() - vec2(0.0, 16.0), Align2::CENTER_CENTER, "Текст песни выключен", semi(14.0), FG);
@@ -3098,7 +3148,7 @@ impl eframe::App for App {
         let dripping = !flask && self.mode == Mode::Pill && self.media_now.as_ref().is_some_and(|m| m.playing);
         let glowing_music = self.album.is_some() && self.media_now.as_ref().is_some_and(|m| m.playing);
         let glowing = self.glow.is_some_and(|g| g.1.elapsed().as_secs_f32() < 1.3);
-        let moving = !self.reach.settled() || self.reach.v > 0.01 || !self.lean_s.settled() || !self.jelly.settled() || self.ripple > 0.0 || dripping || glowing || glowing_music || sloshing || !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || self.sheen_at.elapsed().as_secs_f32() < 0.75;
+        let moving = !self.reach.settled() || self.reach.v > 0.01 || !self.lean_s.settled() || !self.jelly.settled() || self.ripple > 0.0 || dripping || glowing || glowing_music || self.sound.active() || sloshing || !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || self.sheen_at.elapsed().as_secs_f32() < 0.75;
         let animating = animating || moving;
         let scaled = rect_v.size() * self.jelly.v;
         let rect_v = Rect::from_min_size(pos2(WIN_W / 2.0 - scaled.x / 2.0 + self.lean_s.v, TOP), scaled);
@@ -3288,7 +3338,7 @@ impl eframe::App for App {
                     let unit = |c: [u8; 3], a: f32| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, a];
                     let glow = match (self.glow, self.album.filter(|_| playing_now)) {
                         (Some((c, at)), _) if at.elapsed().as_secs_f32() < 1.3 => unit([c.r(), c.g(), c.b()], 0.9 * (1.0 - at.elapsed().as_secs_f32() / 1.3).powi(3)),
-                        (_, Some(c)) => unit(c, 0.30 + 0.12 * (self.drip_phase * 0.7).sin()),
+                        (_, Some(c)) => unit(c, 0.30 + 0.12 * (self.drip_phase * 0.7).sin() + 0.28 * self.beat),
                         _ => [0.0; 4],
                     };
                     let light_at = cursor_win.unwrap_or(rect.center() + vec2(-200.0, -300.0));
@@ -3473,7 +3523,7 @@ impl App {
         p.add(shadow.as_shape(rect, round));
         if let (Some(c), true) = (self.album, self.media_now.as_ref().is_some_and(|m| m.playing)) {
             let breathe = 0.5 + 0.5 * (self.drip_phase * 0.7).sin();
-            let aura = egui::epaint::Shadow { offset: vec2(0.0, 2.0), blur: 24.0 + 6.0 * breathe, spread: 0.0, color: rgba(c[0], c[1], c[2], (70.0 + 50.0 * breathe) as u8) };
+            let aura = egui::epaint::Shadow { offset: vec2(0.0, 2.0), blur: 24.0 + 6.0 * breathe + 12.0 * self.beat, spread: 0.0, color: rgba(c[0], c[1], c[2], (70.0 + 50.0 * breathe + 70.0 * self.beat).min(255.0) as u8) };
             p.add(aura.as_shape(rect, round));
         }
         if let Some((color, at)) = self.glow {
@@ -3999,6 +4049,21 @@ fn empty_state(ui: &mut egui::Ui, glyph: &str, title: &str, hint: &str) {
     ui.add_space(14.0);
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 120.0), Sense::hover());
     empty_at(ui.painter(), r.center(), glyph, title, hint);
+}
+
+/// Эквалайзер: столбики от нижнего края области. alpha — яркость, fill — какую долю высоты занимает самый громкий.
+fn spectrum(p: &egui::Painter, area: Rect, bars: &[f32], color: Color32, alpha: f32, fill: f32) {
+    let n = bars.len() as f32;
+    let step = area.width() / n;
+    let w = (step * 0.62).max(2.0);
+    for (i, v) in bars.iter().enumerate() {
+        let h = (3.0 + (area.height() * fill - 3.0) * v.powf(1.3)).min(area.height());
+        let x = area.left() + step * (i as f32 + 0.5) - w / 2.0;
+        let r = Rect::from_min_max(pos2(x, area.bottom() - h), pos2(x + w, area.bottom()));
+        // громкие столбики ярче тихих
+        let a = (255.0 * alpha * (0.45 + 0.55 * v)).min(255.0) as u8;
+        p.rect_filled(r, Rounding { nw: w / 2.0, ne: w / 2.0, sw: 0.0, se: 0.0 }, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a));
+    }
 }
 
 /// Смешение двух непрозрачных цветов.
