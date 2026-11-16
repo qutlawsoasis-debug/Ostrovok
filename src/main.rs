@@ -2342,7 +2342,7 @@ impl App {
         }
     }
 
-    /// Система → Звук: общая громкость, микрофон и отдельный ползунок для каждой программы со звуком.
+    /// Система → Звук: слева ручка общей громкости и микрофон, справа — программы со своими ползунками.
     fn ui_sound(&mut self, ui: &mut egui::Ui) {
         if self.mixer_at.elapsed() > Duration::from_millis(900) && !ui.input(|i| i.pointer.any_down()) {
             self.mixer_at = Instant::now();
@@ -2350,46 +2350,71 @@ impl App {
             self.mic = sys::mic_muted();
             self.mixer = sys::app_volumes();
         }
-        let (card, _) = ui.allocate_exact_size(vec2(ui.available_width(), 58.0), Sense::hover());
-        glass_chip(ui.painter(), card, 16.0, 0.7);
-        let right = card.right() - 150.0;
+        let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 190.0), Sense::hover());
+        let p = ui.painter().clone();
+        let red = Color32::from_rgb(0xFF, 0x6B, 0x6B);
+
+        // ── ручка громкости: тянуть по кругу, колесо — по два процента, щелчок — без звука
+        let c = pos2(area.left() + 84.0, area.top() + 76.0);
         match self.vol {
             Some((level, muted)) => {
-                let disc = Rect::from_center_size(pos2(card.left() + 30.0, card.center().y), vec2(36.0, 36.0));
-                let resp = ui.interact(disc, ui.id().with("master-mute"), Sense::click()).on_hover_text(if muted { "Включить звук" } else { "Выключить звук" });
-                let (top, bottom) = if muted { ([120, 120, 134], [70, 70, 84]) } else { ([185, 164, 255], [112, 92, 214]) };
-                icon_disc(ui.painter(), disc.center(), 17.0, top, bottom, if muted { "\u{E74F}" } else { "\u{E767}" }, 15.0);
-                if resp.clicked() {
+                let resp = ui
+                    .interact(Rect::from_center_size(c, vec2(152.0, 152.0)), ui.id().with("knob"), Sense::click_and_drag())
+                    .on_hover_text(if muted { "Щелчок — включить звук" } else { "Тяните по кругу или крутите колесо; щелчок — без звука" });
+                let mut v = level;
+                if resp.dragged() {
+                    if let Some(pt) = resp.interact_pointer_pos() {
+                        let d = pt - c;
+                        if d.length() > 14.0 {
+                            let mut f = d.x.atan2(-d.y) / std::f32::consts::TAU;
+                            if f < 0.0 {
+                                f += 1.0;
+                            }
+                            // через верхнюю точку ручка не перескакивает с нуля на сто и обратно
+                            v = if (f - level).abs() < 0.5 { f } else if level > 0.5 { 1.0 } else { 0.0 };
+                        }
+                    }
+                } else if resp.clicked() {
                     sys::set_mute(!muted);
                     self.vol = Some((level, !muted));
+                } else if resp.hovered() {
+                    let wheel = ui.input(|i| i.raw_scroll_delta.y);
+                    if wheel != 0.0 {
+                        v = (level + wheel.signum() * 0.02).clamp(0.0, 1.0);
+                    }
                 }
-                ui.painter().text(pos2(card.left() + 58.0, card.top() + 19.0), Align2::LEFT_CENTER, "Общая громкость", semi(13.5), FG);
-                ui.painter().text(pos2(right, card.top() + 19.0), Align2::RIGHT_CENTER, format!("{:.0}%", level * 100.0), semi(13.0), if muted { DIM } else { FG });
-                let mut v = level;
-                let track = Rect::from_min_max(pos2(card.left() + 58.0, card.top() + 35.0), pos2(right, card.top() + 47.0));
-                if slim_slider(ui, ui.id().with("master"), track, &mut v, accent(), muted) {
+                if (v - level).abs() > 0.002 {
                     sys::set_volume(v);
                     self.vol = Some((v, muted));
                 }
+                let hot = ui.ctx().animate_bool_with_time(resp.id.with("hot"), resp.hovered() || resp.dragged(), 0.12);
+                let tone = if muted { Color32::from_rgb(120, 120, 134) } else { accent() };
+                ring(&p, c, 62.0, 8.0 + 2.0 * hot, v, tone);
+                let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * v;
+                p.circle_filled(c + vec2(a.cos(), a.sin()) * 62.0, 6.0 + 2.0 * hot, Color32::WHITE);
+                p.text(c - vec2(0.0, 6.0), Align2::CENTER_CENTER, format!("{:.0}", v * 100.0), light(34.0), if muted { DIM } else { FG });
+                p.text(c + vec2(0.0, 24.0), Align2::CENTER_CENTER, if muted { "без звука" } else { "громкость" }, FontId::proportional(11.5), if muted { red } else { DIM });
             }
             None => {
-                ui.painter().text(pos2(card.left() + 18.0, card.center().y), Align2::LEFT_CENTER, "Устройство вывода не найдено", semi(13.5), DIM);
+                ring(&p, c, 62.0, 8.0, 0.0, DIM);
+                p.text(c, Align2::CENTER_CENTER, "нет звука", FontId::proportional(12.0), DIM);
             }
         }
-        // микрофон: одна кнопка, красная когда выключен
+        // ── микрофон под ручкой: строка без рамки
         {
-            let r = Rect::from_min_max(pos2(card.right() - 136.0, card.top() + 9.0), card.max - vec2(9.0, 9.0));
+            let r = Rect::from_center_size(pos2(c.x, area.bottom() - 14.0), vec2(156.0, 28.0));
             let resp = ui.interact(r, ui.id().with("mic"), Sense::click());
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
-            glass_chip(ui.painter(), r, 12.0, 0.6 + 0.6 * hov);
             let (state, color) = match self.mic {
-                Some(true) => ("выключен", Color32::from_rgb(0xFF, 0x6B, 0x6B)),
-                Some(false) => ("включён", Color32::from_rgb(0x7B, 0xE0, 0x9A)),
-                None => ("не найден", DIM),
+                Some(true) => ("микрофон выключен", red),
+                Some(false) => ("микрофон включён", Color32::from_rgb(0x7B, 0xE0, 0x9A)),
+                None => ("микрофон не найден", DIM),
             };
-            ui.painter().text(pos2(r.left() + 19.0, r.center().y), Align2::CENTER_CENTER, "\u{E720}", FontId::proportional(15.0), color);
-            ui.painter().text(pos2(r.left() + 36.0, r.center().y - 8.0), Align2::LEFT_CENTER, "Микрофон", semi(12.5), FG);
-            ui.painter().text(pos2(r.left() + 36.0, r.center().y + 8.0), Align2::LEFT_CENTER, state, FontId::proportional(11.5), DIM);
+            if hov > 0.0 {
+                p.rect_filled(r, Rounding::same(14.0), rgba(255, 255, 255, (22.0 * hov) as u8));
+            }
+            p.text(pos2(r.left() + 18.0, r.center().y), Align2::CENTER_CENTER, "\u{E720}", FontId::proportional(14.0), color);
+            p.text(pos2(r.left() + 32.0, r.center().y), Align2::LEFT_CENTER, state, FontId::proportional(12.0), mix(DIM, FG, hov));
             if resp.clicked() {
                 if let Some(m) = self.mic {
                     sys::set_mic_mute(!m);
@@ -2398,48 +2423,53 @@ impl App {
             }
         }
 
-        ui.add_space(6.0);
+        // ── программы: простые строки с тонкими разделителями, без рамок
+        let list = Rect::from_min_max(pos2(area.left() + 190.0, area.top()), area.max);
+        p.line_segment([pos2(list.left() - 12.0, area.top() + 8.0), pos2(list.left() - 12.0, area.bottom() - 8.0)], Stroke::new(1.0_f32, rgba(255, 255, 255, 22)));
         if self.mixer.is_empty() {
-            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
-            ui.painter().text(r.center(), Align2::CENTER_CENTER, "Сейчас ни одна программа не выводит звук", FontId::proportional(13.0), DIM);
+            empty_at(&p, list.center() + vec2(0.0, 10.0), "\u{E767}", "Тишина", "Сейчас ни одна программа не выводит звук");
             return;
         }
-        let n = self.mixer.len().min(8);
-        let width = ui.available_width();
-        let (grid, _) = ui.allocate_exact_size(vec2(width, ((n + 1) / 2) as f32 * 46.0 - 6.0), Sense::hover());
-        let cw = (width - 10.0) / 2.0;
         let (mut set, mut mute): (Option<(usize, f32)>, Option<usize>) = (None, None);
-        for i in 0..n {
-            let app = &self.mixer[i];
-            let cell = Rect::from_min_size(pos2(grid.left() + (i % 2) as f32 * (cw + 10.0), grid.top() + (i / 2) as f32 * 46.0), vec2(cw, 40.0));
-            glass_chip(ui.painter(), cell, 13.0, if app.active { 0.6 } else { 0.35 });
-            let icon_r = Rect::from_center_size(pos2(cell.left() + 23.0, cell.center().y), vec2(24.0, 24.0));
-            let resp = ui.interact(icon_r.expand(5.0), ui.id().with(("mix-mute", i)), Sense::click()).on_hover_text(if app.muted { "Включить звук программы" } else { "Заглушить программу" });
-            let icon = self.app_icons.entry(app.path.clone()).or_insert_with(|| {
-                sys::icon_rgba(&app.path).map(|(w, h, px)| ui.ctx().load_texture(format!("mix-{}", app.name), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR))
-            });
-            match icon {
-                Some(tex) => rounded_image(ui.painter(), tex, icon_r, 0.0),
-                None => {
-                    let letter: String = app.name.chars().take(1).collect();
-                    ui.painter().text(icon_r.center(), Align2::CENTER_CENTER, letter, semi(15.0), FG);
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(list));
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(&mut child, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for i in 0..self.mixer.len() {
+                let app = &self.mixer[i];
+                let (row, _) = ui.allocate_exact_size(vec2(ui.available_width() - 6.0, 38.0), Sense::hover());
+                let p = ui.painter();
+                if i > 0 {
+                    p.line_segment([pos2(row.left() + 36.0, row.top()), pos2(row.right(), row.top())], Stroke::new(1.0_f32, rgba(255, 255, 255, 14)));
+                }
+                let icon_r = Rect::from_center_size(pos2(row.left() + 14.0, row.center().y), vec2(22.0, 22.0));
+                let resp = ui.interact(icon_r.expand(6.0), ui.id().with(("mix-mute", i)), Sense::click()).on_hover_text(if app.muted { "Включить звук программы" } else { "Заглушить программу" });
+                let icon = self.app_icons.entry(app.path.clone()).or_insert_with(|| {
+                    sys::icon_rgba(&app.path).map(|(w, h, px)| ui.ctx().load_texture(format!("mix-{}", app.name), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR))
+                });
+                match icon {
+                    Some(tex) => rounded_image(p, tex, icon_r, 0.0),
+                    None => {
+                        let letter: String = app.name.chars().take(1).collect();
+                        p.text(icon_r.center(), Align2::CENTER_CENTER, letter, semi(14.0), FG);
+                    }
+                }
+                if app.muted {
+                    p.line_segment([icon_r.left_bottom(), icon_r.right_top()], Stroke::new(2.5_f32, red));
+                }
+                if resp.clicked() {
+                    mute = Some(i);
+                }
+                p.with_clip_rect(Rect::from_min_max(pos2(row.left() + 36.0, row.top()), pos2(row.left() + 166.0, row.bottom())))
+                    .text(pos2(row.left() + 36.0, row.center().y), Align2::LEFT_CENTER, &app.name, semi(12.5), if app.active { FG } else { DIM });
+                p.text(pos2(row.right() - 2.0, row.center().y), Align2::RIGHT_CENTER, format!("{:.0}%", app.level * 100.0), FontId::proportional(11.5), DIM);
+                let mut v = app.level;
+                let track = Rect::from_min_max(pos2(row.left() + 174.0, row.center().y - 6.0), pos2(row.right() - 44.0, row.center().y + 6.0));
+                let tone = if app.active { accent() } else { Color32::from_rgb(150, 150, 166) };
+                if slim_slider(ui, ui.id().with(("mix", i)), track, &mut v, tone, app.muted) {
+                    set = Some((i, v));
                 }
             }
-            if app.muted {
-                ui.painter().line_segment([icon_r.left_bottom(), icon_r.right_top()], Stroke::new(2.5_f32, Color32::from_rgb(0xFF, 0x6B, 0x6B)));
-            }
-            if resp.clicked() {
-                mute = Some(i);
-            }
-            let name: String = if app.name.chars().count() > 20 { app.name.chars().take(19).collect::<String>() + "…" } else { app.name.clone() };
-            ui.painter().text(pos2(cell.left() + 44.0, cell.top() + 12.0), Align2::LEFT_CENTER, name, semi(12.5), if app.active { FG } else { DIM });
-            ui.painter().text(pos2(cell.right() - 12.0, cell.top() + 12.0), Align2::RIGHT_CENTER, format!("{:.0}%", app.level * 100.0), FontId::proportional(11.5), DIM);
-            let mut v = app.level;
-            let track = Rect::from_min_max(pos2(cell.left() + 44.0, cell.top() + 22.0), pos2(cell.right() - 12.0, cell.top() + 34.0));
-            if slim_slider(ui, ui.id().with(("mix", i)), track, &mut v, Color32::from_rgb(0x8F, 0xD3, 0xFF), app.muted) {
-                set = Some((i, v));
-            }
-        }
+        });
         if let Some((i, v)) = set {
             sys::set_app_volume(&self.mixer[i].path, v);
             self.mixer[i].level = v;
@@ -4144,7 +4174,7 @@ impl App {
         -saved + match self.tab {
             Tab::Home => 370.0,
             Tab::Control => 238.0,
-            Tab::Sound => 170.0 + ((self.mixer.len().clamp(1, 8) + 1) / 2) as f32 * 46.0,
+            Tab::Sound => 286.0,
             Tab::Music => 388.0,
             Tab::Remind => 320.0,
             Tab::Qr => 350.0,
