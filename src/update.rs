@@ -71,7 +71,7 @@ fn check() -> Result<Option<(String, PathBuf)>, String> {
     let etag = resp.header("etag").map(str::to_string);
     let list: serde_json::Value = resp.into_json().map_err(|_| "непонятный ответ GitHub".to_string())?;
     let cur = current();
-    let mut best: Option<([u32; 3], String, String, u64)> = None;
+    let mut best: Option<([u32; 3], String, String, u64, String)> = None;
     for r in list.as_array().ok_or("непонятный ответ GitHub")? {
         if r["draft"].as_bool() == Some(true) {
             continue;
@@ -87,10 +87,10 @@ fn check() -> Result<Option<(String, PathBuf)>, String> {
             continue;
         }
         if best.as_ref().map_or(true, |b| ver > b.0) {
-            best = Some((ver, tag.trim_start_matches('v').to_string(), url.to_string(), asset["size"].as_u64().unwrap_or(0)));
+            best = Some((ver, tag.trim_start_matches('v').to_string(), url.to_string(), asset["size"].as_u64().unwrap_or(0), r["body"].as_str().unwrap_or("").to_string()));
         }
     }
-    let Some((_, version, url, size)) = best else {
+    let Some((_, version, url, size, notes)) = best else {
         // метку запоминаем, только когда обновляться не на что: иначе неудачная загрузка не повторилась бы
         *ETAG.lock().unwrap() = etag;
         return Ok(None);
@@ -115,7 +115,21 @@ fn check() -> Result<Option<(String, PathBuf)>, String> {
         }
         std::fs::rename(&part, &ready).map_err(io)?;
     }
+    // описание релиза пригодится новой версии: она покажет, что изменилось
+    let _ = std::fs::write(crate::store::dir().join("whatsnew.txt"), notes);
     Ok(Some((version, ready)))
+}
+
+/// Главное из описания релиза, которым только что обновились: первый заголовок, кроме «Установки».
+/// Читается один раз — файл после этого удаляется.
+pub fn whats_new() -> Option<String> {
+    let path = crate::store::dir().join("whatsnew.txt");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("## "))
+        .map(|h| h.trim().to_string())
+        .find(|h| !h.is_empty() && !h.to_lowercase().starts_with("установка"))
 }
 
 /// Проверяет обновление в стороне от интерфейса; wake зовётся, когда результат готов.

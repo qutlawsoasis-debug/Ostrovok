@@ -767,7 +767,9 @@ impl App {
         update::cleanup();
         if !test_mode() && app.cfg.last_version != env!("CARGO_PKG_VERSION") {
             if !app.cfg.last_version.is_empty() {
-                app.show_toast("\u{E930}", [0x7B, 0xE0, 0x9A], "Островок обновлён", concat!("версия ", env!("CARGO_PKG_VERSION")), 6, false);
+                // вторая строка — что нового, если описание релиза сохранилось при загрузке
+                let news = update::whats_new().unwrap_or_else(|| "установлена новая версия".to_string());
+                app.show_toast("\u{E930}", [0x7B, 0xE0, 0x9A], concat!("Островок обновлён до ", env!("CARGO_PKG_VERSION")), &news, 9, false);
             }
             app.cfg.last_version = env!("CARGO_PKG_VERSION").to_string();
             app.cfg.save();
@@ -1089,7 +1091,14 @@ impl App {
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::Note(t) => self.notify(&t),
-                Msg::Weather(w) => self.weather = Some(w),
+                Msg::Weather(mut w) => {
+                    if test_mode() {
+                        if let Ok(city) = std::env::var("OSTROVOK_CITY") {
+                            w.city = city;
+                        }
+                    }
+                    self.weather = Some(w)
+                }
                 Msg::Notice(n) => {
                     // цвет значка — по мессенджеру
                     let low = n.app.to_lowercase();
@@ -1176,6 +1185,10 @@ impl App {
         {
             let st = self.media.lock().unwrap();
             self.media_now = st.info.clone();
+            // для снимков страницы проекта: название того, что играет у автора, в кадр не попадает
+            if test_mode() && std::env::var_os("OSTROVOK_NOMEDIA").is_some() {
+                self.media_now = None;
+            }
             // проверка вида пилюли без плеера: OSTROVOK_TRACK=«название»
             if let (None, Ok(t)) = (&self.media_now, std::env::var("OSTROVOK_TRACK")) {
                 self.media_now = Some(media::Info { title: t, artist: "Исполнитель".into(), playing: true, pos: 64.0, dur: 200.0, at: Instant::now() });
@@ -1330,7 +1343,10 @@ impl App {
         match (in_call, self.call_since) {
             (true, None) => {
                 self.call_since = Some(now);
-                self.show_toast("\u{E720}", [0x58, 0x65, 0xF2], "Звонок в Discord", "Микрофон используется", 4, false);
+                // звонок, который уже шёл при запуске, не перебивает карточку «обновлён»
+                if ctx.input(|i| i.time) > 12.0 {
+                    self.show_toast("\u{E720}", [0x58, 0x65, 0xF2], "Звонок в Discord", "Микрофон используется", 4, false);
+                }
             }
             (false, Some(since)) => {
                 self.call_since = None;
@@ -3511,6 +3527,11 @@ impl App {
 
     /// Прозрачность стекла в процентах (в настройках 0 значит «не трогали»).
     fn clearness(&self) -> u8 {
+        if test_mode() {
+            if let Some(v) = std::env::var("OSTROVOK_CLEAR").ok().and_then(|v| v.parse::<u8>().ok()) {
+                return v;
+            }
+        }
         if self.cfg.clear == 0 { 60 } else { self.cfg.clear }
     }
 
@@ -4368,6 +4389,16 @@ impl eframe::App for App {
         let animating = animating || moving;
         let scaled = rect_v.size() * self.jelly.v;
         let rect_v = Rect::from_min_size(pos2(WIN_W / 2.0 - scaled.x / 2.0 + self.lean_s.v, TOP + self.drop_y), scaled);
+        // для снимков страницы проекта: тестовая копия пишет, где сейчас корпус острова (в пикселях экрана)
+        if test_mode() {
+            if let Some(path) = std::env::var_os("OSTROVOK_RECT_LOG") {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+                    let _ = writeln!(f, "{ms} {:.1} {:.1} {:.1} {:.1}", (base.x + rect_v.left()) * ppp, (base.y + rect_v.top()) * ppp, rect_v.width() * ppp, rect_v.height() * ppp);
+                }
+            }
+        }
 
         // капли справа от пилюли: выезжают из неё и втягиваются обратно, по пути срастаясь «шейкой»
         let mut bubbles_v: Vec<(Rect, f32, u8, String)> = Vec::new();
