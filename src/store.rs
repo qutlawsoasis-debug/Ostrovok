@@ -45,6 +45,9 @@ pub struct Settings {
     /// номер темы оформления
     #[serde(default)]
     pub theme: u8,
+    /// закреплённые записи буфера обмена — переживают перезапуск
+    #[serde(default)]
+    pub pins: Vec<String>,
     /// папка с движком и моделями Джарвиса; пусто — рядом с настройками
     #[serde(default)]
     pub jarvis_dir: String,

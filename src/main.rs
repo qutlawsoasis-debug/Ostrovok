@@ -300,6 +300,7 @@ struct App {
 
     clipboard: Option<arboard::Clipboard>,
     clips: Vec<String>,
+    clip_query: String,
     clip_seq: u32,
 
     hotkey: Arc<AtomicBool>,
@@ -525,6 +526,7 @@ impl App {
             notes_dirty: None,
             clipboard: arboard::Clipboard::new().ok(),
             clips: Vec::new(),
+            clip_query: String::new(),
             clip_seq: sys::clipboard_seq(),
             hotkey,
             hotkey_name,
@@ -671,7 +673,11 @@ impl App {
                 "weather" => Tab::Weather,
                 "timer" => Tab::Timer,
                 "calendar" => Tab::Calendar,
-                "clip" => Tab::Clip,
+                "clip" => {
+                    // для снимков: образцы записей, чтобы страница не была пустой
+                    app.clips = ["https://github.com/qutlawsoasis-debug/Ostrovok", "#7C5CFF", "128 * 4 + 16", "Купить хлеб и молоко по дороге домой", r"C:\Windows\System32", "hello@example.org"].map(String::from).to_vec();
+                    Tab::Clip
+                }
                 "notes" => Tab::Notes,
                 "system" => Tab::System,
                 "sound" => Tab::Sound,
@@ -2499,21 +2505,39 @@ impl App {
 
     /// Записи → Буфер: история скопированного; для ссылок, цветов, примеров и путей — готовое действие.
     fn ui_clip(&mut self, ui: &mut egui::Ui) {
-        if self.clips.is_empty() {
+        if self.clips.is_empty() && self.cfg.pins.is_empty() {
             empty_state(ui, "\u{E77F}", "Буфер пуст", "Скопируйте текст — он появится здесь, а остров подскажет, что с ним сделать");
             return;
         }
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Щелчок по строке копирует её снова. История хранится до выхода.").color(DIM));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if jelly(ui, "Очистить").clicked() {
-                    self.clips.clear();
-                }
-            });
+            let w = (ui.available_width() - 100.0).max(120.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.clip_query)
+                    .margin(egui::Margin::symmetric(9.0, 7.0))
+                    .hint_text(RichText::new("Поиск по буферу. Щелчок по строке копирует её снова").color(DIM))
+                    .desired_width(w),
+            );
+            if jelly(ui, "Очистить").on_hover_text("Убрать историю. Закреплённые записи останутся").clicked() {
+                self.clips.clear();
+            }
         });
-        let (mut pick, mut act) = (None, None);
+        let q = self.clip_query.trim().to_lowercase();
+        // сначала закреплённые, потом история без повторов
+        let rows: Vec<(bool, String)> = self
+            .cfg
+            .pins
+            .iter()
+            .map(|c| (true, c.clone()))
+            .chain(self.clips.iter().filter(|c| !self.cfg.pins.contains(c)).map(|c| (false, c.clone())))
+            .filter(|(_, c)| q.is_empty() || c.to_lowercase().contains(&q))
+            .collect();
+        let (mut pick, mut act, mut pin) = (None, None, None);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for (i, c) in self.clips.iter().enumerate() {
+            if rows.is_empty() {
+                ui.add_space(30.0);
+                ui.vertical_centered(|ui| ui.label(RichText::new("Ничего не найдено").color(DIM)));
+            }
+            for (i, (pinned, c)) in rows.iter().enumerate() {
                 let hint = smart_hint(c);
                 let preview: String = c.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(110).collect();
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
@@ -2524,13 +2548,26 @@ impl App {
                     None => ("\u{E8C8}", DIM),
                 };
                 ui.painter().text(pos2(r.left() + 20.0, r.center().y), Align2::CENTER_CENTER, glyph, FontId::proportional(14.0), color);
-                let right = if hint.is_some() { r.right() - 170.0 } else { r.right() - 12.0 };
+                // справа: булавка и, если остров узнал содержимое, действие
+                let pr = Rect::from_center_size(pos2(r.right() - 20.0, r.center().y), vec2(28.0, 26.0));
+                let pb = ui.interact(pr, ui.id().with(("clip-pin", i)), Sense::click()).on_hover_text(if *pinned { "Открепить" } else { "Закрепить: запись останется после перезапуска" });
+                let ph = ui.ctx().animate_bool_with_time(pb.id.with("hov"), pb.hovered(), 0.10);
+                if *pinned || ph > 0.0 {
+                    glass_chip(ui.painter(), pr, 9.0, 0.5 + 0.6 * ph);
+                }
+                ui.painter().text(pr.center(), Align2::CENTER_CENTER, if *pinned { "\u{E840}" } else { "\u{E718}" }, FontId::proportional(12.5), if *pinned { accent() } else if hov > 0.0 || ph > 0.0 { FG } else { mix(DIM, BG, 0.45) });
+                let act_w = if hint.is_some() { 158.0 } else { 0.0 };
+                let text_right = r.right() - 40.0 - if hint.is_some() { act_w + 6.0 } else { 0.0 };
                 ui.painter()
-                    .with_clip_rect(Rect::from_min_max(pos2(r.left() + 38.0, r.top()), pos2(right, r.bottom())))
+                    .with_clip_rect(Rect::from_min_max(pos2(r.left() + 38.0, r.top()), pos2(text_right, r.bottom())))
                     .text(pos2(r.left() + 38.0, r.center().y), Align2::LEFT_CENTER, preview, FontId::proportional(13.0), FG);
                 let mut used = false;
+                if pb.clicked() {
+                    pin = Some((c.clone(), !*pinned));
+                    used = true;
+                }
                 if let Some(h) = hint {
-                    let br = Rect::from_min_max(pos2(r.right() - 162.0, r.top() + 4.0), r.max - vec2(4.0, 4.0));
+                    let br = Rect::from_min_max(pos2(r.right() - 40.0 - act_w, r.top() + 4.0), pos2(r.right() - 40.0, r.bottom() - 4.0));
                     let b = ui.interact(br, ui.id().with(("clip-act", i)), Sense::click());
                     let bh = ui.ctx().animate_bool_with_time(b.id.with("hov"), b.hovered(), 0.10);
                     glass_chip(ui.painter(), br, 9.0, 0.6 + 0.6 * bh);
@@ -2541,14 +2578,23 @@ impl App {
                     }
                 }
                 if !used && resp.clicked() {
-                    pick = Some(i);
+                    pick = Some(c.clone());
                 }
             }
         });
-        if let Some(a) = act {
+        if let Some((text, on)) = pin {
+            self.cfg.pins.retain(|p| p != &text);
+            if on {
+                self.cfg.pins.insert(0, text);
+                self.cfg.pins.truncate(20);
+            } else if !self.clips.contains(&text) {
+                // открепили — запись возвращается в обычную историю
+                self.clips.insert(0, text);
+            }
+            self.cfg.save();
+        } else if let Some(a) = act {
             self.do_hint(a);
-        } else if let Some(i) = pick {
-            let text = self.clips[i].clone();
+        } else if let Some(text) = pick {
             self.set_clipboard(&text);
             self.notify("Скопировано в буфер");
         }
