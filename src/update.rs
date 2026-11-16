@@ -15,6 +15,10 @@ const ASSET_PREFIX: &str = "https://github.com/qutlawsoasis-debug/Ostrovok/relea
 const ASSET: &str = "Ostrovok.exe";
 const AGENT: &str = "ostrovok-updater";
 
+/// Метка списка релизов с прошлой проверки. С ней GitHub отвечает «ничего не изменилось» почти даром
+/// и не считает такой запрос в свой часовой предел, поэтому спрашивать можно раз в минуту.
+static ETAG: Mutex<Option<String>> = Mutex::new(None);
+
 #[derive(Clone, Default)]
 pub enum State {
     #[default]
@@ -56,8 +60,16 @@ fn check() -> Result<Option<(String, PathBuf)>, String> {
         _ => "нет связи с GitHub".to_string(),
     };
     let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(15)).timeout_read(Duration::from_secs(60)).build();
-    let list: serde_json::Value =
-        agent.get(API).set("user-agent", AGENT).set("accept", "application/vnd.github+json").call().map_err(net)?.into_json().map_err(|_| "непонятный ответ GitHub".to_string())?;
+    let mut req = agent.get(API).set("user-agent", AGENT).set("accept", "application/vnd.github+json");
+    if let Some(tag) = ETAG.lock().unwrap().as_deref() {
+        req = req.set("if-none-match", tag);
+    }
+    let resp = req.call().map_err(net)?;
+    if resp.status() == 304 {
+        return Ok(None);
+    }
+    let etag = resp.header("etag").map(str::to_string);
+    let list: serde_json::Value = resp.into_json().map_err(|_| "непонятный ответ GitHub".to_string())?;
     let cur = current();
     let mut best: Option<([u32; 3], String, String, u64)> = None;
     for r in list.as_array().ok_or("непонятный ответ GitHub")? {
@@ -78,7 +90,11 @@ fn check() -> Result<Option<(String, PathBuf)>, String> {
             best = Some((ver, tag.trim_start_matches('v').to_string(), url.to_string(), asset["size"].as_u64().unwrap_or(0)));
         }
     }
-    let Some((_, version, url, size)) = best else { return Ok(None) };
+    let Some((_, version, url, size)) = best else {
+        // метку запоминаем, только когда обновляться не на что: иначе неудачная загрузка не повторилась бы
+        *ETAG.lock().unwrap() = etag;
+        return Ok(None);
+    };
     if !(1_000_000..=80_000_000).contains(&size) {
         return Err("у файла обновления странный размер".into());
     }

@@ -1093,10 +1093,10 @@ impl App {
         }
         self.last_slow = now;
 
-        // самообновление: проверка раз в шесть часов, установка — когда остров свёрнут и его не трогают
+        // самообновление: проверка раз в минуту, установка — когда остров свёрнут и его не трогают
         let upd_on = !self.cfg.no_update && (!test_mode() || std::env::var_os("OSTROVOK_FAKE_VERSION").is_some());
         if upd_on && now >= self.upd_at {
-            self.upd_at = now + Duration::from_secs(6 * 3600);
+            self.upd_at = now + Duration::from_secs(60);
             let c = ctx.clone();
             update::spawn(self.upd.clone(), move || c.request_repaint());
         }
@@ -1121,7 +1121,7 @@ impl App {
                         }
                         Err(e) => {
                             *self.upd.lock().unwrap() = update::State::Failed(e);
-                            self.upd_at = now + Duration::from_secs(3600);
+                            self.upd_at = now + Duration::from_secs(600);
                         }
                     }
                 }
