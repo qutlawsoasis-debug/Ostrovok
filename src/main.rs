@@ -1255,7 +1255,7 @@ impl App {
         if let (Some((version, path)), true) = (ready, upd_on) {
             // во время игры или другого полноэкранного приложения остров не перезапускается:
             // новое окно может отобрать у игры фокус, и она свернётся. Обновление подождёт.
-            if self.upd_anim.is_none() && self.mode == Mode::Pill && !self.hover_was && self.toast.is_none() && !self.hidden {
+            if self.upd_anim.is_none() && self.mode == Mode::Pill && !self.hover_was && self.toast.is_none() && !self.hidden && !sys::fullscreen_app_active() {
                 self.upd_anim = Some((now, version, path));
             }
         }
@@ -1349,7 +1349,7 @@ impl App {
             self.notes_dirty = None;
         }
 
-        self.hidden = !test_mode() && sys::fullscreen_app_active();
+        self.hidden = !test_mode() && !self.cfg.over_games && sys::fullscreen_app_active();
         let fg = sys::foreground_other();
         if fg != 0 {
             self.last_fg = fg;
@@ -3462,6 +3462,9 @@ impl App {
             if switch_row(ui, &mut self.cfg.capture_visible, "Виден на записи экрана", "стекло перестанет размывать фон; в звонке Discord виден и так") {
                 self.cfg.save();
             }
+            if switch_row(ui, &mut self.cfg.over_games, "Поверх полноэкранных игр", "работает, если игра в режиме окна без рамки") {
+                self.cfg.save();
+            }
             let mut hud = !self.cfg.no_hud;
             if switch_row(ui, &mut hud, "Громкость и раскладка в пилюле", "") {
                 self.cfg.no_hud = !hud;
@@ -4984,7 +4987,7 @@ impl App {
             Tab::Notes => 340.0,
             Tab::Todo => 340.0,
             Tab::System => if self.stats.battery.is_some() { 416.0 } else { 394.0 },
-            Tab::Settings => 436.0,
+            Tab::Settings => 476.0,
         }
     }
 

@@ -45,6 +45,9 @@ pub struct Settings {
     /// не показывать в пилюле громкость и смену раскладки
     #[serde(default)]
     pub no_hud: bool,
+    /// показывать остров и поверх полноэкранных игр и видео
+    #[serde(default)]
+    pub over_games: bool,
     /// список дел
     #[serde(default)]
     pub todos: Vec<Todo>,

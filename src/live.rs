@@ -12,7 +12,7 @@ use std::sync::Arc;
 use windows::core::Interface;
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Media::Audio::{
-    eCapture, eCommunications, AudioSessionStateActive, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator,
+    eCapture, AudioSessionStateActive, DEVICE_STATE_ACTIVE, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
 use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
@@ -119,25 +119,29 @@ fn apps_recording() -> Vec<String> {
     let mut names = Vec::new();
     unsafe {
         let Ok(enumerator) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) else { return names };
-        let Ok(device) = enumerator.GetDefaultAudioEndpoint(eCapture, eCommunications) else { return names };
-        let Ok(manager) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else { return names };
-        let Ok(sessions) = manager.GetSessionEnumerator() else { return names };
-        for i in 0..sessions.GetCount().unwrap_or(0) {
-            let Ok(session) = sessions.GetSession(i) else { continue };
-            if session.GetState().ok() != Some(AudioSessionStateActive) {
-                continue;
-            }
-            let Ok(pid) = session.cast::<IAudioSessionControl2>().and_then(|s| s.GetProcessId()) else { continue };
-            let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { continue };
-            let mut buf = [0u16; 512];
-            let mut len = buf.len() as u32;
-            if QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len).is_ok() {
-                let path = String::from_utf16_lossy(&buf[..len as usize]);
-                if let Some(name) = path.rsplit('\\').next() {
-                    names.push(name.to_lowercase());
+        // в Discord часто выбран не тот микрофон, что стоит в Windows по умолчанию, — смотрим все включённые
+        let Ok(devices) = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) else { return names };
+        for d in 0..devices.GetCount().unwrap_or(0) {
+            let Ok(device) = devices.Item(d) else { continue };
+            let Ok(manager) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else { continue };
+            let Ok(sessions) = manager.GetSessionEnumerator() else { continue };
+            for i in 0..sessions.GetCount().unwrap_or(0) {
+                let Ok(session) = sessions.GetSession(i) else { continue };
+                if session.GetState().ok() != Some(AudioSessionStateActive) {
+                    continue;
                 }
+                let Ok(pid) = session.cast::<IAudioSessionControl2>().and_then(|s| s.GetProcessId()) else { continue };
+                let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { continue };
+                let mut buf = [0u16; 512];
+                let mut len = buf.len() as u32;
+                if QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len).is_ok() {
+                    let path = String::from_utf16_lossy(&buf[..len as usize]);
+                    if let Some(name) = path.rsplit('\\').next() {
+                        names.push(name.to_lowercase());
+                    }
+                }
+                let _ = CloseHandle(process);
             }
-            let _ = CloseHandle(process);
         }
     }
     names
