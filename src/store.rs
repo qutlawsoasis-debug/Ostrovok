@@ -106,6 +106,10 @@ impl Settings {
     }
 
     pub fn save(&self) {
+        // проверочный запуск не должен менять настоящие настройки
+        if std::env::var_os("OSTROVOK_TEST").is_some() {
+            return;
+        }
         let _ = std::fs::create_dir_all(dir());
         if let Ok(s) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(dir().join("settings.json"), s);

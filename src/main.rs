@@ -442,6 +442,10 @@ struct App {
     sw_start: Option<Instant>,
     sw_acc: Duration,
     cal_shift: i32,
+    /// выбранный в календаре день (None — сегодня) и поля нового дела на него
+    cal_sel: Option<chrono::NaiveDate>,
+    cal_text: String,
+    cal_time: String,
     meter: sys::CpuMeter,
     stats: sys::Stats,
     stats_at: Instant,
@@ -637,6 +641,9 @@ impl App {
             sw_start: None,
             sw_acc: Duration::ZERO,
             cal_shift: 0,
+            cal_sel: None,
+            cal_text: String::new(),
+            cal_time: String::new(),
             meter: sys::CpuMeter::default(),
             stats: sys::Stats::default(),
             stats_at: now,
@@ -672,7 +679,14 @@ impl App {
                 "shelf" => Tab::Shelf,
                 "weather" => Tab::Weather,
                 "timer" => Tab::Timer,
-                "calendar" => Tab::Calendar,
+                "calendar" => {
+                    // для снимков: несколько дел на ближайшие дни
+                    let now = chrono::Local::now().timestamp();
+                    for (days, hour, text) in [(0, 3, "Созвон с командой"), (0, 5, "Забрать посылку"), (2, 4, "Оплатить интернет"), (6, 2, "День рождения Миши")] {
+                        app.cfg.reminders.push(store::Reminder { text: text.into(), at: now + days * 86400 + hour * 3600 });
+                    }
+                    Tab::Calendar
+                }
                 "clip" => {
                     // для снимков: образцы записей, чтобы страница не была пустой
                     app.clips = ["https://github.com/qutlawsoasis-debug/Ostrovok", "#7C5CFF", "128 * 4 + 16", "Купить хлеб и молоко по дороге домой", r"C:\Windows\System32", "hello@example.org"].map(String::from).to_vec();
@@ -2967,17 +2981,33 @@ impl App {
         }
     }
 
+    /// Обзор → Календарь: слева месяц (дни с делами отмечены точкой), справа — выбранный день и его напоминания.
     fn ui_calendar(&mut self, ui: &mut egui::Ui) {
-        use chrono::{Datelike, NaiveDate};
+        use chrono::{Datelike, Local, NaiveDate, NaiveTime, TimeZone};
         const MONTHS: [&str; 12] =
             ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"];
-        let today = chrono::Local::now().date_naive();
+        const OF_MONTH: [&str; 12] =
+            ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
+        const DAYS: [&str; 7] = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"];
+        let today = Local::now().date_naive();
+        let sel = self.cal_sel.unwrap_or(today);
         let index = today.year() * 12 + today.month0() as i32 + self.cal_shift;
         let (year, month0) = (index.div_euclid(12), index.rem_euclid(12) as u32);
         let Some(first) = NaiveDate::from_ymd_opt(year, month0 + 1, 1) else { return };
         let next = if month0 == 11 { NaiveDate::from_ymd_opt(year + 1, 1, 1) } else { NaiveDate::from_ymd_opt(year, month0 + 2, 1) };
         let days = next.map_or(30, |n| (n - first).num_days()) as u32;
         let offset = first.weekday().num_days_from_monday();
+        // на какой день приходится каждое напоминание
+        let dated: Vec<(usize, NaiveDate, String, String)> = self
+            .cfg
+            .reminders
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                let d = chrono::DateTime::from_timestamp(r.at, 0)?.with_timezone(&Local);
+                Some((i, d.date_naive(), d.format("%H:%M").to_string(), r.text.clone()))
+            })
+            .collect();
 
         ui.horizontal(|ui| {
             if jelly(ui, "‹").clicked() {
@@ -2988,30 +3018,129 @@ impl App {
             }
             ui.label(RichText::new(format!("{} {year}", MONTHS[month0 as usize])).font(semi(15.0)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.cal_shift != 0 && jelly(ui, "Сегодня").clicked() {
+                if (self.cal_shift != 0 || self.cal_sel.is_some_and(|d| d != today)) && jelly(ui, "Сегодня").clicked() {
                     self.cal_shift = 0;
+                    self.cal_sel = None;
                 }
             });
         });
-        let cell = vec2(ui.available_width() / 7.0, 27.0);
-        let origin = ui.cursor().min;
-        let p = ui.painter().clone();
-        for (i, name) in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"].into_iter().enumerate() {
-            let c = origin + vec2(cell.x * (i as f32 + 0.5), 10.0);
-            p.text(c, Align2::CENTER_CENTER, name, FontId::proportional(11.5), DIM);
-        }
-        for day in 1..=days {
-            let slot = offset + day - 1;
-            let (col, row) = (slot % 7, slot / 7);
-            let c = origin + vec2(cell.x * (col as f32 + 0.5), 22.0 + cell.y * (row as f32 + 0.5));
-            let is_today = self.cal_shift == 0 && day == today.day();
-            if is_today {
-                p.circle_filled(c, 12.0, accent());
+
+        let (mut click, mut remove, mut add) = (None, None, false);
+        ui.columns(2, |c| {
+            // ----- месяц
+            let ui = &mut c[0];
+            let cell = vec2(ui.available_width() / 7.0, 31.0);
+            let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0 + cell.y * 6.0), Sense::hover());
+            let origin = area.min;
+            let p = ui.painter().clone();
+            for (i, name) in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"].into_iter().enumerate() {
+                p.text(origin + vec2(cell.x * (i as f32 + 0.5), 10.0), Align2::CENTER_CENTER, name, FontId::proportional(11.5), DIM);
             }
-            let color = if is_today { BG } else if col >= 5 { DIM } else { FG };
-            p.text(c, Align2::CENTER_CENTER, day.to_string(), semi(13.5), color);
+            for day in 1..=days {
+                let Some(date) = NaiveDate::from_ymd_opt(year, month0 + 1, day) else { continue };
+                let slot = offset + day - 1;
+                let (col, row) = (slot % 7, slot / 7);
+                let at = origin + vec2(cell.x * (col as f32 + 0.5), 24.0 + cell.y * (row as f32 + 0.5));
+                let resp = ui.interact(Rect::from_center_size(at, vec2(cell.x.min(40.0), 29.0)), ui.id().with(("cal-day", year, month0, day)), Sense::click());
+                let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
+                let (is_today, is_sel) = (date == today, date == sel);
+                if is_today {
+                    p.circle_filled(at, 13.0, accent());
+                } else if is_sel {
+                    p.circle_filled(at, 13.0, rgba(255, 255, 255, 26));
+                    p.circle_stroke(at, 13.0, Stroke::new(1.5, accent()));
+                } else if hov > 0.0 {
+                    p.circle_filled(at, 13.0, rgba(255, 255, 255, (26.0 * hov) as u8));
+                }
+                if is_today && is_sel && self.cal_sel.is_some() {
+                    p.circle_stroke(at, 15.5, Stroke::new(1.2, accent()));
+                }
+                let color = if is_today { BG } else if date < today { mix(DIM, BG, 0.35) } else if col >= 5 { DIM } else { FG };
+                p.text(at, Align2::CENTER_CENTER, day.to_string(), semi(13.5), color);
+                // точка — на этот день есть дела
+                if dated.iter().any(|d| d.1 == date) {
+                    p.circle_filled(at + vec2(0.0, if is_today { 9.0 } else { 11.0 }), 2.0, if is_today { BG } else { accent() });
+                }
+                if resp.clicked() {
+                    click = Some(date);
+                }
+            }
+
+            // ----- выбранный день
+            let ui = &mut c[1];
+            ui.add_space(4.0);
+            let gap = (sel - today).num_days();
+            let when = match gap {
+                0 => "сегодня".to_string(),
+                1 => "завтра".to_string(),
+                -1 => "вчера".to_string(),
+                g if g > 0 => format!("через {g} дн."),
+                g => format!("{} дн. назад", -g),
+            };
+            ui.label(RichText::new(format!("{} {}", sel.day(), OF_MONTH[sel.month0() as usize])).font(light(26.0)).color(FG));
+            ui.label(RichText::new(format!("{} · {when}", DAYS[sel.weekday().num_days_from_monday() as usize])).color(DIM));
+            ui.add_space(6.0);
+            let mine: Vec<&(usize, NaiveDate, String, String)> = dated.iter().filter(|d| d.1 == sel).collect();
+            egui::ScrollArea::vertical().max_height(118.0).auto_shrink([false, true]).show(ui, |ui| {
+                if mine.is_empty() {
+                    ui.label(RichText::new(if sel < today { "В этот день дел не было." } else { "На этот день дел нет." }).color(DIM));
+                }
+                for (i, _, time, text) in mine {
+                    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
+                    glass_chip(ui.painter(), row, 10.0, 0.45);
+                    let p = ui.painter().with_clip_rect(row.shrink2(vec2(0.0, 0.0)));
+                    p.text(pos2(row.left() + 12.0, row.center().y), Align2::LEFT_CENTER, time, semi(13.0), accent());
+                    p.with_clip_rect(Rect::from_min_max(pos2(row.left() + 58.0, row.top()), pos2(row.right() - 34.0, row.bottom())))
+                        .text(pos2(row.left() + 58.0, row.center().y), Align2::LEFT_CENTER, text, FontId::proportional(13.0), FG);
+                    let x = Rect::from_center_size(pos2(row.right() - 18.0, row.center().y), vec2(26.0, 26.0));
+                    let resp = ui.interact(x, ui.id().with(("cal-del", *i)), Sense::click());
+                    ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(12.0), if resp.hovered() { FG } else { DIM });
+                    if resp.clicked() {
+                        remove = Some(*i);
+                    }
+                    ui.add_space(3.0);
+                }
+            });
+            if sel >= today {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let w = (ui.available_width() - 142.0).max(80.0);
+                    let a = ui.add(egui::TextEdit::singleline(&mut self.cal_text).margin(egui::Margin::symmetric(9.0, 7.0)).hint_text(RichText::new("Новое дело").color(DIM)).desired_width(w));
+                    let b = ui.add(egui::TextEdit::singleline(&mut self.cal_time).margin(egui::Margin::symmetric(9.0, 7.0)).hint_text(RichText::new("09:00").color(DIM)).desired_width(46.0));
+                    let enter = (a.lost_focus() || b.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    add = jelly(ui, "+").on_hover_text("Напомнить в этот день").clicked() || enter;
+                });
+            }
+        });
+
+        if let Some(d) = click {
+            self.cal_sel = Some(d);
         }
-        ui.allocate_space(vec2(ui.available_width(), 22.0 + cell.y * 6.0));
+        if let Some(i) = remove {
+            if i < self.cfg.reminders.len() {
+                self.cfg.reminders.remove(i);
+                self.cfg.save();
+            }
+        }
+        if add {
+            let text = self.cal_text.trim().to_string();
+            let spec = self.cal_time.trim().replace(['.', ',', ' '], ":");
+            let time = if spec.is_empty() { NaiveTime::from_hms_opt(9, 0, 0) } else { NaiveTime::parse_from_str(&spec, "%H:%M").ok() };
+            let at = time.and_then(|t| Local.from_local_datetime(&sel.and_time(t)).single()).map(|d| d.timestamp());
+            match at {
+                _ if text.is_empty() => self.notify("Впишите, о чём напомнить"),
+                None => self.notify("Не понял время: напишите, например, 18:30"),
+                Some(at) if at <= Local::now().timestamp() => self.notify("Это время уже прошло"),
+                Some(at) => {
+                    self.cfg.reminders.push(store::Reminder { text, at });
+                    self.cfg.reminders.sort_by_key(|r| r.at);
+                    self.cfg.save();
+                    self.cal_text.clear();
+                    self.cal_time.clear();
+                    self.notify("Напоминание добавлено");
+                }
+            }
+        }
     }
 
     /// Система → Монитор: четыре кольца — процессор, память, диск и батарея (или время работы).
@@ -3870,7 +3999,7 @@ impl App {
             Tab::Weather if self.weather.is_some() => 292.0,
             Tab::Weather => 250.0,
             Tab::Timer => 262.0,
-            Tab::Calendar => 336.0,
+            Tab::Calendar => 360.0,
             Tab::Clip => 340.0,
             Tab::Notes => 340.0,
             Tab::System => if self.stats.battery.is_some() { 262.0 } else { 240.0 },
