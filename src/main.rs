@@ -2417,28 +2417,85 @@ impl App {
             ui.vertical(|ui| {
                 ui.add_space(8.0);
                 ui.label(RichText::new(format!("{text} · {}", w.city)).font(semi(15.0)));
-                ui.label(
-                    RichText::new(format!(
-                        "Ощущается {} · влажность {:.0}% · ветер {:.1} м/с",
-                        weather::deg(w.feels),
-                        w.humidity,
-                        w.wind
-                    ))
-                    .color(DIM),
-                );
+                ui.label(RichText::new(format!("Ощущается {} · влажность {:.0}% · ветер {:.1} м/с", weather::deg(w.feels), w.humidity, w.wind)).color(DIM));
             });
+            if !w.sunrise.is_empty() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.vertical(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(RichText::new(format!("Восход  {}", w.sunrise)).color(DIM).size(12.5));
+                        ui.label(RichText::new(format!("Закат    {}", w.sunset)).color(DIM).size(12.5));
+                    });
+                });
+            }
         });
-        ui.add_space(8.0);
+        ui.add_space(6.0);
+
+        // ближайшие сутки: плавная кривая температуры, под ней — вероятность осадков
+        if w.hours.len() >= 4 {
+            let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 132.0), Sense::hover());
+            let p = ui.painter().with_clip_rect(area);
+            glass_chip(&p, area, 16.0, 0.4);
+            let n = w.hours.len();
+            let (lo, hi) = w.hours.iter().fold((f64::MAX, f64::MIN), |(lo, hi), h| (lo.min(h.temp), hi.max(h.temp)));
+            let span = (hi - lo).max(2.0);
+            let (top, bottom) = (area.top() + 34.0, area.bottom() - 40.0);
+            let px = |i: f32| area.left() + 26.0 + (area.width() - 52.0) * i / (n - 1) as f32;
+            let py = |t: f64| bottom - (bottom - top) * ((t - lo) / span) as f32;
+            // сглаживание: между соседними часами — плавный переход
+            let temp_at = |x: f32| -> f64 {
+                let i = (x.floor() as usize).min(n - 2);
+                let f = (x - i as f32) as f64;
+                let k = f * f * (3.0 - 2.0 * f);
+                w.hours[i].temp * (1.0 - k) + w.hours[i + 1].temp * k
+            };
+            let steps = (n - 1) * 8;
+            let line: Vec<Pos2> = (0..=steps).map(|s| { let x = s as f32 / 8.0; pos2(px(x), py(temp_at(x))) }).collect();
+            let c = accent();
+            let mut mesh = egui::Mesh::default();
+            for (k, pt) in line.iter().enumerate() {
+                mesh.colored_vertex(*pt, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 80));
+                mesh.colored_vertex(pos2(pt.x, area.bottom() - 26.0), Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 0));
+                if k > 0 {
+                    let i = (k * 2) as u32;
+                    mesh.add_triangle(i - 2, i - 1, i);
+                    mesh.add_triangle(i - 1, i, i + 1);
+                }
+            }
+            p.add(egui::Shape::mesh(mesh));
+            p.add(egui::Shape::line(line, Stroke::new(2.2, c)));
+            for (i, h) in w.hours.iter().enumerate() {
+                let x = px(i as f32);
+                // осадки: столбик тем выше и ярче, чем вероятнее
+                if h.rain >= 15.0 {
+                    let bh = 3.0 + 13.0 * (h.rain / 100.0) as f32;
+                    let r = Rect::from_min_max(pos2(x - 4.0, area.bottom() - 24.0 - bh), pos2(x + 4.0, area.bottom() - 24.0));
+                    p.rect_filled(r, Rounding::same(2.0), Color32::from_rgba_unmultiplied(0x6E, 0xB8, 0xFF, (70.0 + 150.0 * (h.rain / 100.0)) as u8));
+                }
+                // подписи — каждые три часа, чтобы не слипались
+                if i % 3 == 0 {
+                    let now = i == 0;
+                    p.circle_filled(pos2(x, py(h.temp)), if now { 4.5 } else { 3.0 }, if now { FG } else { c });
+                    p.text(pos2(x, py(h.temp) - 9.0), Align2::CENTER_BOTTOM, weather::deg(h.temp), semi(12.5), FG);
+                    p.text(pos2(x, area.bottom() - 6.0), Align2::CENTER_BOTTOM, if now { "сейчас".to_string() } else { format!("{:02}:00", h.hour) }, FontId::proportional(11.0), if now { FG } else { DIM });
+                }
+            }
+            let wet = w.hours.iter().map(|h| h.rain).fold(0.0, f64::max);
+            if wet >= 15.0 {
+                p.text(area.right_top() + vec2(-12.0, 8.0), Align2::RIGHT_TOP, format!("осадки до {wet:.0}%"), FontId::proportional(11.0), Color32::from_rgb(0x8F, 0xCB, 0xFF));
+            }
+            ui.add_space(6.0);
+        }
+
         if !w.days.is_empty() {
             ui.columns(w.days.len(), |c| {
                 for (i, d) in w.days.iter().enumerate() {
-                    egui::Frame::none().fill(card()).rounding(10.0).inner_margin(8.0).show(&mut c[i], |ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.label(RichText::new(if i == 0 { "Сегодня" } else { d.label.as_str() }).color(DIM).size(12.0));
-                            ui.label(RichText::new(weather::describe(d.code).0).size(20.0));
-                            ui.label(RichText::new(format!("{} / {}", weather::deg(d.max), weather::deg(d.min))).size(12.5));
-                        });
-                    });
+                    let (r, _) = c[i].allocate_exact_size(vec2(c[i].available_width(), 74.0), Sense::hover());
+                    let p = c[i].painter();
+                    glass_chip(p, r, 12.0, if i == 0 { 0.75 } else { 0.4 });
+                    p.text(r.center_top() + vec2(0.0, 8.0), Align2::CENTER_TOP, if i == 0 { "Сегодня" } else { d.label.as_str() }, FontId::proportional(12.0), DIM);
+                    p.text(r.center() + vec2(0.0, -1.0), Align2::CENTER_CENTER, weather::describe(d.code).0, FontId::proportional(19.0), FG);
+                    p.text(r.center_bottom() - vec2(0.0, 8.0), Align2::CENTER_BOTTOM, format!("{} / {}", weather::deg(d.max), weather::deg(d.min)), semi(12.5), FG);
                 }
             });
         }
@@ -3809,6 +3866,7 @@ impl App {
             Tab::Ai if self.api_key().is_empty() => AI_H,
             Tab::Ai => 420.0,
             Tab::Jarvis => 462.0,
+            Tab::Weather if self.weather.as_ref().is_some_and(|w| w.hours.len() >= 4) => 398.0,
             Tab::Weather if self.weather.is_some() => 292.0,
             Tab::Weather => 250.0,
             Tab::Timer => 262.0,

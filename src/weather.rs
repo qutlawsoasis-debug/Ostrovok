@@ -11,6 +11,17 @@ pub struct Day {
     pub code: i64,
 }
 
+/// Прогноз на один час.
+#[derive(Clone)]
+pub struct Hour {
+    /// час суток, 0…23
+    pub hour: u32,
+    pub temp: f64,
+    /// вероятность осадков, %
+    pub rain: f64,
+    pub code: i64,
+}
+
 #[derive(Clone)]
 pub struct Now {
     pub city: String,
@@ -20,6 +31,11 @@ pub struct Now {
     pub wind: f64,
     pub code: i64,
     pub days: Vec<Day>,
+    /// ближайшие сутки по часам, начиная с текущего
+    pub hours: Vec<Hour>,
+    /// восход и закат сегодня, «07:41»
+    pub sunrise: String,
+    pub sunset: String,
 }
 
 pub fn encode(s: &str) -> String {
@@ -45,21 +61,31 @@ fn get(url: &str) -> Result<Value, String> {
 
 pub fn geocode(city: &str) -> Result<Option<(f64, f64, String)>, String> {
     let v = get(&format!(
-        "https://geocoding-api.open-meteo.com/v1/search?count=1&language=ru&name={}",
+        "https://geocoding-api.open-meteo.com/v1/search?count=6&language=ru&name={}",
         encode(city)
     ))?;
-    let Some(r) = v["results"].get(0) else { return Ok(None) };
-    match (r["latitude"].as_f64(), r["longitude"].as_f64()) {
-        (Some(lat), Some(lon)) => Ok(Some((lat, lon, r["name"].as_str().unwrap_or(city).to_string()))),
-        _ => Ok(None),
-    }
+    // Городов с одним названием бывает несколько (Минден есть и в Германии, и в США).
+    // Берём тот, что лежит в поясе часов этого компьютера: его долгота близка к смещению от Гринвича × 15°.
+    let here = chrono::Local::now().offset().local_minus_utc() as f64 / 3600.0 * 15.0;
+    let found: Vec<(f64, f64, String)> = v["results"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|r| Some((r["latitude"].as_f64()?, r["longitude"].as_f64()?, r["name"].as_str().unwrap_or(city).to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let near = |lon: f64| ((lon - here + 540.0).rem_euclid(360.0) - 180.0).abs() <= 25.0;
+    Ok(found.iter().find(|c| near(c.1)).or(found.first()).cloned())
 }
 
 pub fn fetch(lat: f64, lon: f64, name: &str) -> Result<Now, String> {
     let v = get(&format!(
         "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}\
          &current=temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code\
-         &daily=temperature_2m_max,temperature_2m_min,weather_code&timezone=auto&forecast_days=5&wind_speed_unit=ms"
+         &daily=temperature_2m_max,temperature_2m_min,weather_code,sunrise,sunset\
+         &hourly=temperature_2m,precipitation_probability,weather_code&forecast_hours=24\
+         &timezone=auto&forecast_days=5&wind_speed_unit=ms"
     ))?;
     let cur = &v["current"];
     let daily = &v["daily"];
@@ -74,6 +100,22 @@ pub fn fetch(lat: f64, lon: f64, name: &str) -> Result<Now, String> {
             });
         }
     }
+    let hourly = &v["hourly"];
+    let mut hours = Vec::new();
+    if let Some(times) = hourly["time"].as_array() {
+        for (i, t) in times.iter().enumerate().take(24) {
+            // время приходит как «2026-11-16T15:00»
+            let hour = t.as_str().and_then(|s| s.get(11..13)).and_then(|h| h.parse().ok()).unwrap_or(0);
+            let Some(temp) = hourly["temperature_2m"][i].as_f64() else { continue };
+            hours.push(Hour {
+                hour,
+                temp,
+                rain: hourly["precipitation_probability"][i].as_f64().unwrap_or(0.0),
+                code: hourly["weather_code"][i].as_i64().unwrap_or(3),
+            });
+        }
+    }
+    let clock = |v: &Value| v.as_str().and_then(|s| s.get(11..16)).unwrap_or("").to_string();
     Ok(Now {
         city: name.to_string(),
         temp: cur["temperature_2m"].as_f64().ok_or("нет данных")?,
@@ -82,6 +124,9 @@ pub fn fetch(lat: f64, lon: f64, name: &str) -> Result<Now, String> {
         wind: cur["wind_speed_10m"].as_f64().unwrap_or(0.0),
         code: cur["weather_code"].as_i64().unwrap_or(3),
         days,
+        hours,
+        sunrise: clock(&daily["sunrise"][0]),
+        sunset: clock(&daily["sunset"][0]),
     })
 }
 
