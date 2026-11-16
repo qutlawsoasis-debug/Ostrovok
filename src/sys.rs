@@ -821,3 +821,45 @@ pub fn set_app_mute(path: &str, mute: bool) {
         }
     });
 }
+
+/// Какие программы занимают больше всего оперативной памяти. Процессы одной программы складываются
+/// (у браузера их десятки). Оценка приблизительная: общие страницы памяти считаются у каждого процесса.
+pub fn top_memory(n: usize) -> Vec<(String, u64)> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    let mut sum: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return Vec::new() };
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                let len = e.szExeFile.iter().position(|c| *c == 0).unwrap_or(e.szExeFile.len());
+                let name = String::from_utf16_lossy(&e.szExeFile[..len]);
+                if let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, e.th32ProcessID) {
+                    let mut pmc = PROCESS_MEMORY_COUNTERS::default();
+                    if GetProcessMemoryInfo(h, &mut pmc, std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32).is_ok() {
+                        *sum.entry(name).or_default() += pmc.WorkingSetSize as u64;
+                    }
+                    let _ = CloseHandle(h);
+                }
+                if Process32NextW(snap, &mut e).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    let mut list: Vec<(String, u64)> = sum
+        .into_iter()
+        .map(|(name, bytes)| {
+            let stem = name.strip_suffix(".exe").or_else(|| name.strip_suffix(".EXE")).unwrap_or(&name);
+            let mut c = stem.chars();
+            (c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default(), bytes)
+        })
+        .collect();
+    list.sort_by(|a, b| b.1.cmp(&a.1));
+    list.truncate(n);
+    list
+}

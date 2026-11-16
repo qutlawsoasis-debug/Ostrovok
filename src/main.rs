@@ -449,6 +449,11 @@ struct App {
     meter: sys::CpuMeter,
     stats: sys::Stats,
     stats_at: Instant,
+    /// нагрузка за последние минуты: доля процессора и памяти на каждый замер
+    load_hist: std::collections::VecDeque<(f32, f32)>,
+    /// самые прожорливые по памяти программы — считаются в стороне, пока открыт «Монитор»
+    procs: Arc<Mutex<Vec<(String, u64)>>>,
+    procs_at: Instant,
 }
 
 impl App {
@@ -647,6 +652,9 @@ impl App {
             meter: sys::CpuMeter::default(),
             stats: sys::Stats::default(),
             stats_at: now,
+            load_hist: Default::default(),
+            procs: Default::default(),
+            procs_at: now.checked_sub(Duration::from_secs(60)).unwrap_or(now),
         };
         if test_mode() {
             // только для проверки вёрстки: выбрать персонажа и показать уведомление, ничего не сохраняя
@@ -1143,6 +1151,11 @@ impl App {
         if now.duration_since(self.stats_at) >= Duration::from_millis(1500) {
             self.stats_at = now;
             self.stats = self.meter.sample();
+            let mem = if self.stats.mem_total > 0.0 { (self.stats.mem_used / self.stats.mem_total) as f32 } else { 0.0 };
+            self.load_hist.push_back((self.stats.cpu, mem));
+            while self.load_hist.len() > 120 {
+                self.load_hist.pop_front();
+            }
         }
 
     }
@@ -3179,6 +3192,91 @@ impl App {
         if s.battery.is_some() {
             ui.label(RichText::new(format!("Компьютер работает {d} д {h} ч {m} мин без перезагрузки")).color(DIM));
         }
+        ui.add_space(4.0);
+
+        // список программ обновляется раз в три секунды в отдельном потоке, чтобы панель не подтормаживала
+        if self.procs_at.elapsed() > Duration::from_secs(3) {
+            self.procs_at = Instant::now();
+            let (procs, ctx) = (self.procs.clone(), ui.ctx().clone());
+            std::thread::spawn(move || {
+                let list = sys::top_memory(5);
+                *procs.lock().unwrap() = list;
+                ctx.request_repaint();
+            });
+        }
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 146.0), Sense::hover());
+        let p = ui.painter().clone();
+        let left = Rect::from_min_max(row.min, pos2(row.center().x - 4.0, row.bottom()));
+        let right = Rect::from_min_max(pos2(row.center().x + 4.0, row.top()), row.max);
+
+        // ----- нагрузка во времени
+        glass_chip(&p, left, 18.0, 0.45);
+        p.text(left.min + vec2(14.0, 10.0), Align2::LEFT_TOP, "Нагрузка", semi(12.5), FG);
+        let secs = self.load_hist.len() as f32 * 1.5;
+        let span = if secs >= 90.0 { format!("за {:.0} мин", secs / 60.0) } else { format!("за {secs:.0} с") };
+        p.text(left.right_top() + vec2(-14.0, 11.0), Align2::RIGHT_TOP, span, FontId::proportional(11.0), DIM);
+        let plot = Rect::from_min_max(left.min + vec2(14.0, 34.0), left.max - vec2(14.0, 26.0));
+        for k in 0..=2 {
+            let y = plot.bottom() - plot.height() * k as f32 / 2.0;
+            p.line_segment([pos2(plot.left(), y), pos2(plot.right(), y)], Stroke::new(1.0, rgba(255, 255, 255, 14)));
+        }
+        let n = self.load_hist.len();
+        if n >= 2 {
+            for (which, color) in [(1usize, accent()), (0, blue)] {
+                // график всегда прижат к правому краю: новое появляется справа
+                let pts: Vec<Pos2> = self
+                    .load_hist
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let val = if which == 0 { v.0 } else { v.1 };
+                        pos2(plot.right() - plot.width() * (n - 1 - i) as f32 / 119.0, plot.bottom() - plot.height() * val.clamp(0.0, 1.0))
+                    })
+                    .collect();
+                let mut mesh = egui::Mesh::default();
+                for (k, pt) in pts.iter().enumerate() {
+                    mesh.colored_vertex(*pt, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 46));
+                    mesh.colored_vertex(pos2(pt.x, plot.bottom()), Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 0));
+                    if k > 0 {
+                        let i = (k * 2) as u32;
+                        mesh.add_triangle(i - 2, i - 1, i);
+                        mesh.add_triangle(i - 1, i, i + 1);
+                    }
+                }
+                p.add(egui::Shape::mesh(mesh));
+                p.add(egui::Shape::line(pts, Stroke::new(1.8, color)));
+            }
+        } else {
+            p.text(plot.center(), Align2::CENTER_CENTER, "Собираю данные…", FontId::proportional(12.0), DIM);
+        }
+        let legend = pos2(left.left() + 14.0, left.bottom() - 13.0);
+        p.circle_filled(legend + vec2(4.0, 0.0), 3.5, blue);
+        p.text(legend + vec2(13.0, 0.0), Align2::LEFT_CENTER, "процессор", FontId::proportional(11.0), DIM);
+        p.circle_filled(legend + vec2(92.0, 0.0), 3.5, accent());
+        p.text(legend + vec2(101.0, 0.0), Align2::LEFT_CENTER, "память", FontId::proportional(11.0), DIM);
+
+        // ----- кто занимает память
+        glass_chip(&p, right, 18.0, 0.45);
+        p.text(right.min + vec2(14.0, 10.0), Align2::LEFT_TOP, "Больше всего памяти", semi(12.5), FG);
+        let list = self.procs.lock().unwrap().clone();
+        let top = list.first().map_or(1, |l| l.1).max(1) as f32;
+        let total = (s.mem_total * 1024.0 * 1024.0 * 1024.0).max(1.0);
+        for (i, (name, bytes)) in list.iter().enumerate() {
+            let y = right.top() + 40.0 + i as f32 * 20.5;
+            let size = if *bytes >= 1 << 30 { format!("{:.1} ГБ", *bytes as f64 / (1u64 << 30) as f64).replace('.', ",") } else { format!("{} МБ", bytes >> 20) };
+            p.with_clip_rect(Rect::from_min_max(pos2(right.left() + 14.0, y - 10.0), pos2(right.left() + 124.0, y + 10.0)))
+                .text(pos2(right.left() + 14.0, y), Align2::LEFT_CENTER, name, FontId::proportional(12.5), FG);
+            let track = Rect::from_min_max(pos2(right.left() + 130.0, y - 2.5), pos2(right.right() - 74.0, y + 2.5));
+            p.rect_filled(track, Rounding::same(2.5), rgba(255, 255, 255, 20));
+            // красным — программа занимает больше четверти всей памяти
+            let heavy = *bytes as f64 / total > 0.25;
+            let fill = Rect::from_min_max(track.min, pos2(track.left() + track.width() * (*bytes as f32 / top).clamp(0.03, 1.0), track.bottom()));
+            p.rect_filled(fill, Rounding::same(2.5), if heavy { Color32::from_rgb(0xFF, 0x6B, 0x6B) } else { accent() });
+            p.text(pos2(right.right() - 14.0, y), Align2::RIGHT_CENTER, size, semi(12.0), if heavy { Color32::from_rgb(0xFF, 0x8A, 0x80) } else { DIM });
+        }
+        if list.is_empty() {
+            p.text(right.center(), Align2::CENTER_CENTER, "Считаю…", FontId::proportional(12.0), DIM);
+        }
     }
 
     fn ui_palette(&mut self, ui: &mut egui::Ui) {
@@ -4002,7 +4100,7 @@ impl App {
             Tab::Calendar => 360.0,
             Tab::Clip => 340.0,
             Tab::Notes => 340.0,
-            Tab::System => if self.stats.battery.is_some() { 262.0 } else { 240.0 },
+            Tab::System => if self.stats.battery.is_some() { 416.0 } else { 394.0 },
             Tab::Settings => 564.0,
         }
     }
