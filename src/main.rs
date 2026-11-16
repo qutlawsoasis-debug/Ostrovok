@@ -3875,7 +3875,10 @@ impl eframe::App for App {
                 Mode::Pill => {
                     let island = ui.interact(rect, Id::new("island"), Sense::click());
                     let face = ui.interact(Rect::from_min_size(face_at, vec2(38.0, 18.0)).expand(4.0), Id::new("face"), Sense::click());
-                    let hot = island.hovered() || face.hovered();
+                    // «под курсором» считается по самой пилюле, а не по виджету: кнопки плеера лежат поверх
+                    // и иначе перехватывали бы наведение — пилюля мигала бы между названием и кнопками
+                    let reach = if self.hover_was { 7.0 } else { 0.0 };
+                    let hot = ui.ctx().pointer_hover_pos().is_some_and(|c| rect.expand(reach).contains(c));
                     self.jelly.target = if island.is_pointer_button_down_on() || face.is_pointer_button_down_on() { 0.94 } else if hot { 1.045 } else { 1.0 };
                     if hot && !self.hover_was {
                         self.sheen_at = now;
