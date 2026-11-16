@@ -156,7 +156,9 @@ void main() {
     col += (hash(px) - 0.5) * 0.014;
     col = clamp(col, 0.0, 1.0);
 
-    o = vec4(col * body + outside * (1.0 - body), body + outside_a * (1.0 - body));
+    // без снимка фона корпус полупрозрачный: u_dim тогда задаёт его плотность
+    float op = (u_has > 0.5) ? 1.0 : u_dim;
+    o = vec4(col * body * op + outside * (1.0 - body), body * op + outside_a * (1.0 - body));
 }
 "#;
 

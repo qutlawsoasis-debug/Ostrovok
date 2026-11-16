@@ -3821,7 +3821,14 @@ impl eframe::App for App {
                         cap: self.lens_draw.map_or([0.0; 4], |c| [c.left(), c.top(), c.right(), c.bottom()]),
                         has_tex: self.lens_draw.is_some(),
                         tint: theme().glass.map(|c| c as f32 / 255.0),
-                        dim: if self.mode == Mode::Pill { 0.50 } else { 0.66 },
+                        // со снимком фона — доля затемнения; без него (остров виден на записи) — плотность корпуса:
+                        // сквозь него просвечивает сам экран
+                        dim: match (self.lens_draw.is_some(), self.mode == Mode::Pill) {
+                            (true, true) => 0.32,
+                            (true, false) => 0.52,
+                            (false, true) => 0.62,
+                            (false, false) => 0.80,
+                        },
                         glow,
                         thick: (rect.width().min(rect.height()) / 2.0 * 0.92).clamp(4.0, 17.0),
                         sheen: self.sheen_at.elapsed().as_secs_f32() / 0.7,
