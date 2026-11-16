@@ -499,6 +499,8 @@ struct App {
     watch: Arc<Mutex<sys::Watch>>,
     watch_seen: Option<sys::Watch>,
     clear_saved: u8,
+    /// первое знакомство: номер следующей подсказки и когда её показать
+    intro: Option<(usize, Instant)>,
     todo_edit: String,
     /// режим «Фокус»: идёт ли перерыв и сколько кругов работы пройдено
     focus: Option<(bool, u32)>,
@@ -730,6 +732,7 @@ impl App {
             },
             watch_seen: None,
             clear_saved: 0,
+            intro: (test_mode() && std::env::var_os("OSTROVOK_INTRO").is_some()).then_some((0, now)),
             todo_edit: String::new(),
             focus: None,
             shelf_meta: Default::default(),
@@ -770,6 +773,9 @@ impl App {
                 // вторая строка — что нового, если описание релиза сохранилось при загрузке
                 let news = update::whats_new().unwrap_or_else(|| "установлена новая версия".to_string());
                 app.show_toast("\u{E930}", [0x7B, 0xE0, 0x9A], concat!("Островок обновлён до ", env!("CARGO_PKG_VERSION")), &news, 9, false);
+            } else {
+                // самый первый запуск: коротко показываем, что остров умеет
+                app.intro = Some((0, Instant::now() + Duration::from_secs(2)));
             }
             app.cfg.last_version = env!("CARGO_PKG_VERSION").to_string();
             app.cfg.save();
@@ -1273,6 +1279,26 @@ impl App {
             }
         }
 
+        if let Some((step, at)) = self.intro {
+            const STEPS: [(&str, &str, &str); 5] = [
+                ("\u{E76E}", "Привет! Это Островок", "щёлкните по нему — раскроется панель"),
+                ("\u{E767}", "Колесо мыши над островом", "меняет громкость"),
+                ("\u{E721}", "Alt + Пробел", "поиск программ, примеры и конвертер"),
+                ("\u{E8B7}", "Перетащите файл на остров", "он останется на полке под рукой"),
+                ("\u{E713}", "Темы, персонаж и прозрачность", "в настройках — значок шестерёнки"),
+            ];
+            if now >= at && self.toast.is_none() && self.mode == Mode::Pill {
+                match STEPS.get(step) {
+                    Some((glyph, title, text)) => {
+                        let a = accent();
+                        self.show_toast(glyph, [a.r(), a.g(), a.b()], title, text, 5, false);
+                        self.intro = Some((step + 1, now + Duration::from_millis(5600)));
+                    }
+                    None => self.intro = None,
+                }
+            }
+        }
+
         let seq = sys::clipboard_seq();
         if seq != self.clip_seq {
             self.clip_seq = seq;
@@ -1570,9 +1596,49 @@ impl App {
         }
     }
 
+    /// Идёт ли за окном дождь (1) или снег (2) — по коду погоды. 0 — сухо или эффект выключен.
+    fn precipitation(&self) -> u8 {
+        if test_mode() {
+            match std::env::var("OSTROVOK_WX").as_deref() {
+                Ok("rain") => return 1,
+                Ok("snow") => return 2,
+                _ => {}
+            }
+        }
+        if self.cfg.no_wx {
+            return 0;
+        }
+        match self.weather.as_ref().map(|w| w.code) {
+            Some(51..=67 | 80..=82 | 95..=99) => 1,
+            Some(71..=77 | 85 | 86) => 2,
+            _ => 0,
+        }
+    }
+
     fn draw_pill(&self, ui: &egui::Ui, rect: Rect, segs: &[Seg], time: f64) {
         let p = ui.painter().with_clip_rect(rect);
         let cy = rect.center().y;
+        // живая погода: за текстом пилюли тихо идёт дождь или снег
+        let wet = self.precipitation();
+        if wet > 0 {
+            let (h, inset) = (rect.height(), rect.height() / 2.0);
+            let span = (rect.width() - 2.0 * inset).max(1.0);
+            let frac = |v: f32| v - v.floor();
+            for i in 0..16 {
+                let seed = i as f32 * 12.9898 + 4.1;
+                let fx = frac(seed.sin() * 43758.547);
+                let speed = if wet == 1 { 46.0 } else { 9.0 } * (0.7 + 0.6 * frac(seed * 1.7));
+                let y = rect.top() - 5.0 + (time as f32 * speed + frac(seed * 3.1) * (h + 10.0)) % (h + 10.0);
+                let fade = (1.0 - ((y - rect.center().y).abs() / (h / 2.0)).powi(4)).clamp(0.0, 1.0);
+                if wet == 1 {
+                    let x = rect.left() + inset + fx * span - (y - rect.top()) * 0.25;
+                    p.line_segment([pos2(x, y), pos2(x - 1.4, y + 5.5)], Stroke::new(1.1_f32, rgba(150, 195, 255, (70.0 * fade) as u8)));
+                } else {
+                    let x = rect.left() + inset + fx * span + (time as f32 * 0.9 + seed).sin() * 3.0;
+                    p.circle_filled(pos2(x, y), 1.0 + 0.6 * frac(seed * 5.3), rgba(255, 255, 255, (100.0 * fade) as u8));
+                }
+            }
+        }
         let mut x = rect.left() + 58.0;
         for s in segs {
             match s {
@@ -1975,7 +2041,7 @@ impl App {
             return;
         }
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Щелчок открывает файл, правый щелчок — его папку.").color(DIM));
+            ui.label(RichText::new("Щелчок открывает файл, правый щелчок — его папку. Файл можно вытащить мышью в любое окно.").color(DIM));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if jelly(ui, "Очистить").clicked() {
                     self.cfg.shelf.clear();
@@ -1983,12 +2049,16 @@ impl App {
                 }
             });
         });
+        let mut drag: Option<String> = None;
         let (mut open, mut remove) = (None, None);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
                 for (i, path) in self.cfg.shelf.iter().enumerate() {
-                    let (cell, resp) = ui.allocate_exact_size(vec2(104.0, 96.0), Sense::click());
+                    let (cell, resp) = ui.allocate_exact_size(vec2(104.0, 96.0), Sense::click_and_drag());
+                    if resp.drag_started() && std::path::Path::new(path).exists() {
+                        drag = Some(path.clone());
+                    }
                     let file = std::path::Path::new(path);
                     let name = file.file_name().and_then(|n| n.to_str()).unwrap_or(path);
                     let resp = resp.on_hover_text(path);
@@ -2037,6 +2107,13 @@ impl App {
                 }
             });
         });
+        if let Some(path) = drag {
+            // Windows сама ведёт перетаскивание до конца; после него сбрасываем состояние мыши,
+            // потому что отпускание кнопки досталось другой программе
+            sys::drag_file(&path);
+            ui.ctx().input_mut(|i| i.pointer = Default::default());
+            self.sticky = true;
+        }
         if let Some(path) = open {
             sys::open(&path);
         }
@@ -3481,6 +3558,11 @@ impl App {
             if switch_row(ui, &mut self.cfg.over_games, "Поверх полноэкранных игр", "работает, если игра в режиме окна без рамки") {
                 self.cfg.save();
             }
+            let mut wx = !self.cfg.no_wx;
+            if switch_row(ui, &mut wx, "Живая погода в пилюле", "") {
+                self.cfg.no_wx = !wx;
+                self.cfg.save();
+            }
             let mut hud = !self.cfg.no_hud;
             if switch_row(ui, &mut hud, "Громкость и раскладка в пилюле", "") {
                 self.cfg.no_hud = !hud;
@@ -3506,6 +3588,10 @@ impl App {
             ui.horizontal(|ui| {
                 if jelly(ui, "Проверить обновления").clicked() && !matches!(state, update::State::Checking) {
                     check_update = true;
+                }
+                if jelly(ui, "Подсказки").on_hover_text("Ещё раз показать, что умеет остров").clicked() {
+                    self.intro = Some((0, Instant::now() + Duration::from_millis(600)));
+                    self.mode = Mode::Pill;
                 }
                 ui.label(RichText::new(format!("версия {}", env!("CARGO_PKG_VERSION"))).color(DIM));
             });
@@ -4787,6 +4873,9 @@ impl eframe::App for App {
             ctx.request_repaint();
         } else if self.mode != Mode::Pill || dist < 420.0 || playing {
             ctx.request_repaint_after(Duration::from_millis(16));
+        } else if self.precipitation() > 0 {
+            // дождь и снег идут плавно, но без гонки кадров
+            ctx.request_repaint_after(Duration::from_millis(33));
         } else {
             ctx.request_repaint_after(Duration::from_millis(90));
         }
@@ -5018,7 +5107,7 @@ impl App {
             Tab::Notes => 340.0,
             Tab::Todo => 340.0,
             Tab::System => if self.stats.battery.is_some() { 416.0 } else { 394.0 },
-            Tab::Settings => 476.0,
+            Tab::Settings => 506.0,
         }
     }
 

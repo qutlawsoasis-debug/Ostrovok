@@ -48,6 +48,9 @@ pub struct Settings {
     /// показывать остров и поверх полноэкранных игр и видео
     #[serde(default)]
     pub over_games: bool,
+    /// не рисовать в пилюле дождь и снег по погоде
+    #[serde(default)]
+    pub no_wx: bool,
     /// список дел
     #[serde(default)]
     pub todos: Vec<Todo>,

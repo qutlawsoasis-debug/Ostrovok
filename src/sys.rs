@@ -1006,3 +1006,18 @@ pub fn spawn_watch(wake: impl Fn() + Send + 'static) -> Arc<std::sync::Mutex<Wat
     });
     out
 }
+
+// ---------------------------------------------------------------- перетаскивание файла из острова
+
+/// Начинает перетаскивание файла в другую программу — как из Проводника.
+/// Возвращается, когда файл бросили или перетаскивание отменили.
+pub fn drag_file(path: &str) -> bool {
+    use windows::Win32::System::Com::IDataObject;
+    use windows::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_LINK};
+    use windows::Win32::UI::Shell::{BHID_DataObject, IShellItem, SHCreateItemFromParsingName, SHDoDragDrop};
+    unsafe {
+        let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(path), None) else { return false };
+        let Ok(data) = item.BindToHandler::<_, IDataObject>(None, &BHID_DataObject) else { return false };
+        SHDoDragDrop(None, &data, None, DROPEFFECT_COPY | DROPEFFECT_LINK).is_ok()
+    }
+}
