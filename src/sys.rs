@@ -863,3 +863,71 @@ pub fn top_memory(n: usize) -> Vec<(String, u64)> {
     list.truncate(n);
     list
 }
+
+// ---------------------------------------------------------------- сеть и завершение программ
+
+/// Сколько байт принято и отправлено настоящими сетевыми адаптерами с момента включения компьютера.
+pub fn net_bytes() -> Option<(u64, u64)> {
+    use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
+    unsafe {
+        let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+        if GetIfTable2(&mut table).is_err() || table.is_null() {
+            return None;
+        }
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
+        let (mut rx, mut tx) = (0u64, 0u64);
+        for r in rows {
+            // только «железные» адаптеры: виртуальные и фильтры повторяют те же байты
+            if r.InterfaceAndOperStatusFlags._bitfield & 1 != 0 {
+                rx += r.InOctets;
+                tx += r.OutOctets;
+            }
+        }
+        FreeMibTable(table as *const core::ffi::c_void);
+        Some((rx, tx))
+    }
+}
+
+/// Можно ли предлагать закрыть программу: системные процессы и сам остров трогать нельзя.
+pub fn can_kill(name: &str) -> bool {
+    const KEEP: [&str; 20] = [
+        "system", "registry", "memory compression", "memcompression", "smss", "csrss", "wininit", "winlogon", "services", "lsass", "svchost", "dwm", "explorer", "fontdrvhost",
+        "sihost", "ctfmon", "msmpeng", "securityhealthservice", "ostrovok", "audiodg",
+    ];
+    let low = name.to_lowercase();
+    !low.is_empty() && !KEEP.contains(&low.as_str())
+}
+
+/// Завершает все процессы программы по имени файла (без «.exe»). Возвращает, сколько завершено.
+pub fn kill_by_name(name: &str) -> usize {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    if !can_kill(name) {
+        return 0;
+    }
+    let want = format!("{}.exe", name.to_lowercase());
+    let mut done = 0;
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return 0 };
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                let len = e.szExeFile.iter().position(|c| *c == 0).unwrap_or(e.szExeFile.len());
+                if String::from_utf16_lossy(&e.szExeFile[..len]).to_lowercase() == want && e.th32ProcessID != std::process::id() {
+                    if let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, e.th32ProcessID) {
+                        if TerminateProcess(h, 1).is_ok() {
+                            done += 1;
+                        }
+                        let _ = CloseHandle(h);
+                    }
+                }
+                if Process32NextW(snap, &mut e).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    done
+}

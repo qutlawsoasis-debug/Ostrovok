@@ -259,6 +259,7 @@ struct Item {
 
 enum Seg {
     Thumb,
+    Track(String),
     Eq,
     Text(String, Color32),
 }
@@ -454,6 +455,10 @@ struct App {
     /// самые прожорливые по памяти программы — считаются в стороне, пока открыт «Монитор»
     procs: Arc<Mutex<Vec<(String, u64)>>>,
     procs_at: Instant,
+    kill_arm: Option<(String, Instant)>,
+    /// скорость сети, байт в секунду: приём и отдача
+    net: (f32, f32),
+    net_prev: Option<(u64, u64, Instant)>,
 }
 
 impl App {
@@ -655,6 +660,9 @@ impl App {
             load_hist: Default::default(),
             procs: Default::default(),
             procs_at: now.checked_sub(Duration::from_secs(60)).unwrap_or(now),
+            kill_arm: None,
+            net: (0.0, 0.0),
+            net_prev: None,
         };
         if test_mode() {
             // только для проверки вёрстки: выбрать персонажа и показать уведомление, ничего не сохраняя
@@ -1037,6 +1045,10 @@ impl App {
         {
             let st = self.media.lock().unwrap();
             self.media_now = st.info.clone();
+            // проверка вида пилюли без плеера: OSTROVOK_TRACK=«название»
+            if let (None, Ok(t)) = (&self.media_now, std::env::var("OSTROVOK_TRACK")) {
+                self.media_now = Some(media::Info { title: t, artist: "Исполнитель".into(), playing: true, pos: 64.0, dur: 200.0, at: Instant::now() });
+            }
             if st.thumb_gen != self.thumb_gen {
                 self.thumb_gen = st.thumb_gen;
                 self.album = st.accent;
@@ -1151,6 +1163,13 @@ impl App {
         if now.duration_since(self.stats_at) >= Duration::from_millis(1500) {
             self.stats_at = now;
             self.stats = self.meter.sample();
+            if let Some((rx, tx)) = sys::net_bytes() {
+                if let Some((prx, ptx, at)) = self.net_prev {
+                    let dt = now.duration_since(at).as_secs_f32().max(0.2);
+                    self.net = (rx.saturating_sub(prx) as f32 / dt, tx.saturating_sub(ptx) as f32 / dt);
+                }
+                self.net_prev = Some((rx, tx, now));
+            }
             let mem = if self.stats.mem_total > 0.0 { (self.stats.mem_used / self.stats.mem_total) as f32 } else { 0.0 };
             self.load_hist.push_back((self.stats.cpu, mem));
             while self.load_hist.len() > 120 {
@@ -1169,6 +1188,9 @@ impl App {
         let playing = self.media_now.as_ref().is_some_and(|m| m.playing);
         if self.media_now.is_some() && self.thumb.is_some() {
             v.push(Seg::Thumb);
+        }
+        if let Some(m) = self.media_now.as_ref().filter(|m| m.playing || self.hover_was) {
+            v.push(Seg::Track(if m.artist.trim().is_empty() { m.title.clone() } else { format!("{} — {}", m.title, m.artist) }));
         }
         v.push(Seg::Text(chrono::Local::now().format("%H:%M").to_string(), FG));
         if let (Some(end), true) = (self.timer_end, self.fx.is_none()) {
@@ -1193,6 +1215,7 @@ impl App {
             w += match s {
                 Seg::Thumb => 20.0,
                 Seg::Eq => 24.0,
+                Seg::Track(t) => ctx.fonts(|f| f.layout_no_wrap(t.clone(), semi(13.0), FG).size().x).clamp(96.0, 170.0),
                 Seg::Text(t, _) => ctx.fonts(|f| f.layout_no_wrap(t.clone(), semi(13.5), FG).size().x),
             } + 10.0;
         }
@@ -1359,11 +1382,73 @@ impl App {
                     }
                     x += 34.0;
                 }
+                Seg::Track(t) => {
+                    // название трека; под курсором на его месте — кнопки управления
+                    let full = p.layout_no_wrap(t.clone(), semi(13.0), FG);
+                    let w = full.size().x.clamp(96.0, 170.0);
+                    let area = Rect::from_min_size(pos2(x, rect.top()), vec2(w, rect.height()));
+                    if self.hover_was {
+                        let playing = self.media_now.as_ref().is_some_and(|m| m.playing);
+                        for (k, glyph) in ["\u{E892}", if playing { "\u{E769}" } else { "\u{E768}" }, "\u{E893}"].into_iter().enumerate() {
+                            let hit = Rect::from_center_size(pos2(area.center().x + (k as f32 - 1.0) * 30.0, cy), vec2(28.0, 26.0));
+                            let resp = ui.interact(hit, Id::new(("pill-media", k)), Sense::click());
+                            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
+                            if hov > 0.0 {
+                                p.circle_filled(hit.center(), 12.0, rgba(255, 255, 255, (36.0 * hov) as u8));
+                            }
+                            p.text(hit.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(if k == 1 { 15.0 } else { 12.5 }), FG);
+                            if resp.clicked() {
+                                let _ = self.media_tx.send(match k {
+                                    0 => media::Cmd::Prev,
+                                    1 => media::Cmd::Toggle,
+                                    _ => media::Cmd::Next,
+                                });
+                            }
+                        }
+                    } else {
+                        // длинное название плавно ездит туда-обратно с паузами по краям
+                        let over = full.size().x - w;
+                        let shift = if over > 0.0 {
+                            let travel = over / 22.0;
+                            let period = travel + 3.0;
+                            let ph = time as f32 % (2.0 * period);
+                            let u = if ph < period { ph } else { 2.0 * period - ph };
+                            (u - 1.5).clamp(0.0, travel) / travel * over
+                        } else {
+                            0.0
+                        };
+                        let h = full.size().y;
+                        p.with_clip_rect(area.intersect(rect)).galley(pos2(x - shift, cy - h / 2.0), full, FG);
+                        if over > 0.0 {
+                            // края не обрываются, а уходят в стекло
+                            let dark = Color32::from_rgba_unmultiplied(14, 14, 24, 235);
+                            for (edge, inner) in [(area.left(), area.left() + 16.0), (area.right(), area.right() - 16.0)] {
+                                let mut mesh = egui::Mesh::default();
+                                mesh.colored_vertex(pos2(edge, cy - 10.0), dark);
+                                mesh.colored_vertex(pos2(edge, cy + 10.0), dark);
+                                mesh.colored_vertex(pos2(inner, cy - 10.0), Color32::TRANSPARENT);
+                                mesh.colored_vertex(pos2(inner, cy + 10.0), Color32::TRANSPARENT);
+                                mesh.add_triangle(0, 1, 2);
+                                mesh.add_triangle(1, 2, 3);
+                                p.add(egui::Shape::mesh(mesh));
+                            }
+                        }
+                    }
+                    x += w + 10.0;
+                }
                 Seg::Text(t, c) => {
                     let r = p.text(pos2(x, cy), Align2::LEFT_CENTER, t, semi(13.5), *c);
                     x += r.width() + 10.0;
                 }
             }
+        }
+        // ход трека — тонкая линия по нижней кромке пилюли
+        if let Some(m) = self.media_now.as_ref().filter(|m| m.playing && m.dur > 0.0) {
+            let frac = ((m.pos + m.at.elapsed().as_secs_f64()).min(m.dur) / m.dur) as f32;
+            let color = self.album.map_or(accent(), |c| Color32::from_rgb(c[0], c[1], c[2]));
+            let (l, r, y) = (rect.left() + 18.0, rect.right() - 18.0, rect.bottom() - 3.5);
+            p.line_segment([pos2(l, y), pos2(r, y)], Stroke::new(1.5_f32, rgba(255, 255, 255, 26)));
+            p.line_segment([pos2(l, y), pos2(l + (r - l) * frac, y)], Stroke::new(1.5_f32, color));
         }
     }
 
@@ -3261,9 +3346,26 @@ impl App {
         let list = self.procs.lock().unwrap().clone();
         let top = list.first().map_or(1, |l| l.1).max(1) as f32;
         let total = (s.mem_total * 1024.0 * 1024.0 * 1024.0).max(1.0);
+        let mut kill: Option<String> = None;
         for (i, (name, bytes)) in list.iter().enumerate() {
             let y = right.top() + 40.0 + i as f32 * 20.5;
             let size = if *bytes >= 1 << 30 { format!("{:.1} ГБ", *bytes as f64 / (1u64 << 30) as f64).replace('.', ",") } else { format!("{} МБ", bytes >> 20) };
+            // строку можно нажать: первый щелчок взводит, второй закрывает программу
+            let row_r = Rect::from_min_max(pos2(right.left() + 8.0, y - 10.0), pos2(right.right() - 8.0, y + 10.0));
+            let resp = ui.interact(row_r, ui.id().with(("proc", i)), Sense::click());
+            let safe = sys::can_kill(name);
+            let armed = self.kill_arm.as_ref().is_some_and(|a| a.0 == *name && a.1 > Instant::now());
+            let hot = safe && (resp.hovered() || armed);
+            if hot {
+                p.rect_filled(row_r, Rounding::same(7.0), if armed { rgba(255, 107, 107, 40) } else { rgba(255, 255, 255, 16) });
+            }
+            if resp.clicked() && safe {
+                if armed {
+                    kill = Some(name.clone());
+                } else {
+                    self.kill_arm = Some((name.clone(), Instant::now() + Duration::from_secs(4)));
+                }
+            }
             p.with_clip_rect(Rect::from_min_max(pos2(right.left() + 14.0, y - 10.0), pos2(right.left() + 124.0, y + 10.0)))
                 .text(pos2(right.left() + 14.0, y), Align2::LEFT_CENTER, name, FontId::proportional(12.5), FG);
             let track = Rect::from_min_max(pos2(right.left() + 130.0, y - 2.5), pos2(right.right() - 74.0, y + 2.5));
@@ -3272,8 +3374,21 @@ impl App {
             let heavy = *bytes as f64 / total > 0.25;
             let fill = Rect::from_min_max(track.min, pos2(track.left() + track.width() * (*bytes as f32 / top).clamp(0.03, 1.0), track.bottom()));
             p.rect_filled(fill, Rounding::same(2.5), if heavy { Color32::from_rgb(0xFF, 0x6B, 0x6B) } else { accent() });
-            p.text(pos2(right.right() - 14.0, y), Align2::RIGHT_CENTER, size, semi(12.0), if heavy { Color32::from_rgb(0xFF, 0x8A, 0x80) } else { DIM });
+            let red = Color32::from_rgb(0xFF, 0x8A, 0x80);
+            let (label, color) = if armed { ("ещё раз".to_string(), red) } else if hot { ("закрыть".to_string(), FG) } else { (size, if heavy { red } else { DIM }) };
+            p.text(pos2(right.right() - 14.0, y), Align2::RIGHT_CENTER, label, semi(12.0), color);
         }
+        if let Some(name) = kill {
+            self.kill_arm = None;
+            let n = sys::kill_by_name(&name);
+            self.notify(&if n > 0 { format!("{name} закрыта") } else { format!("{name}: закрыть не удалось") });
+            self.procs_at = Instant::now().checked_sub(Duration::from_secs(2)).unwrap_or_else(Instant::now);
+        }
+        // скорость сети — в правом нижнем углу графика нагрузки
+        let speed = |v: f32| if v >= 1048576.0 { format!("{:.1} МБ/с", v / 1048576.0).replace('.', ",") } else { format!("{:.0} КБ/с", v / 1024.0) };
+        let net_at = pos2(left.right() - 14.0, left.bottom() - 13.0);
+        let up = p.text(net_at, Align2::RIGHT_CENTER, format!("\u{E898} {}", speed(self.net.1)), FontId::proportional(11.0), DIM);
+        p.text(pos2(up.left() - 10.0, net_at.y), Align2::RIGHT_CENTER, format!("\u{E896} {}", speed(self.net.0)), FontId::proportional(11.0), FG);
         if list.is_empty() {
             p.text(right.center(), Align2::CENTER_CENTER, "Считаю…", FontId::proportional(12.0), DIM);
         }
