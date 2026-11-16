@@ -42,6 +42,9 @@ pub struct Settings {
     /// выключить жидкость в пилюле (остров-колбу)
     #[serde(default)]
     pub no_flask: bool,
+    /// номер темы оформления
+    #[serde(default)]
+    pub theme: u8,
     /// папка с движком и моделями Джарвиса; пусто — рядом с настройками
     #[serde(default)]
     pub jarvis_dir: String,

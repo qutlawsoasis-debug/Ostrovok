@@ -2,7 +2,7 @@
 
 use crate::ears::Heard;
 use crate::jarvis::{Ev, MODELS};
-use crate::{empty_state, glass_chip, jelly, semi, store, sys, weather, App, Mode, Msg, Tab, ACCENT, DIM, FG};
+use crate::{empty_state, glass_chip, jelly, semi, store, sys, weather, accent, App, Mode, Msg, Tab, DIM, FG};
 use eframe::egui::{self, vec2, Align2, Color32, FontId, RichText, Sense};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -427,7 +427,7 @@ impl App {
         ui.label(RichText::new(format!("{}  ·  шаг {} из {}", prog.label, prog.step.0, prog.step.1)).color(FG));
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width().min(420.0), 8.0), Sense::hover());
         ui.painter().rect_filled(r, 4.0, Color32::from_white_alpha(22));
-        ui.painter().rect_filled(egui::Rect::from_min_size(r.min, vec2(r.width() * frac.max(0.01), 8.0)), 4.0, ACCENT);
+        ui.painter().rect_filled(egui::Rect::from_min_size(r.min, vec2(r.width() * frac.max(0.01), 8.0)), 4.0, accent());
         ui.label(RichText::new(if all > 0 { format!("{} из {} МБ", mb(done), mb(all)) } else { format!("{} МБ", mb(done)) }).color(DIM).size(11.5));
     }
 
@@ -463,9 +463,9 @@ impl App {
             let on = self.jv_pick == id;
             glass_chip(ui.painter(), row, 11.0, if on { 0.9 } else if resp.hovered() { 0.6 } else { 0.35 });
             let p = ui.painter();
-            p.circle_stroke(row.left_center() + vec2(20.0, 0.0), 6.0, egui::Stroke::new(1.5, if on { ACCENT } else { DIM }));
+            p.circle_stroke(row.left_center() + vec2(20.0, 0.0), 6.0, egui::Stroke::new(1.5, if on { accent() } else { DIM }));
             if on {
-                p.circle_filled(row.left_center() + vec2(20.0, 0.0), 3.2, ACCENT);
+                p.circle_filled(row.left_center() + vec2(20.0, 0.0), 3.2, accent());
             }
             p.text(row.left_center() + vec2(38.0, 0.0), Align2::LEFT_CENTER, name, semi(13.5), FG);
             p.text(row.left_center() + vec2(190.0, 0.0), Align2::LEFT_CENTER, note, FontId::proportional(12.0), DIM);
@@ -519,7 +519,7 @@ impl App {
             ch
         };
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.label(RichText::new("Мозг на компьютере").font(semi(13.5)).color(ACCENT));
+            ui.label(RichText::new("Мозг на компьютере").font(semi(13.5)).color(accent()));
             for (id, name, size) in [("large", "Большая", "2,4 ГБ"), ("medium", "Средняя", "1 ГБ"), ("small", "Малая", "0,4 ГБ")] {
                 ui.horizontal(|ui| {
                     ui.add_sized([120.0, 20.0], egui::Label::new(RichText::new(format!("{name} · {size}")).color(FG)));
@@ -538,14 +538,14 @@ impl App {
             changed |= ui.checkbox(&mut self.cfg.jarvis_cpu, "Считать только на процессоре, без видеокарты").changed();
             ui.add_space(8.0);
 
-            ui.label(RichText::new("Облачный мозг — необязательно").font(semi(13.5)).color(ACCENT));
+            ui.label(RichText::new("Облачный мозг — необязательно").font(semi(13.5)).color(accent()));
             ui.label(RichText::new("Сервер с протоколом чата OpenAI (например, https://api.groq.com/openai/v1). Вопросы и ответы уходят на него, память компьютера не занята; если сервер недоступен, думает локальная модель.").color(DIM).size(11.5));
             changed |= field(ui, "Адрес", &mut self.cfg.jarvis_url, "пусто — думать на компьютере", false);
             changed |= field(ui, "Ключ", &mut self.cfg.jarvis_key, "своему посреднику не нужен", true);
             changed |= field(ui, "Модель", &mut self.cfg.jarvis_remote_model, "имя модели на сервере", false);
             ui.add_space(8.0);
 
-            ui.label(RichText::new("Голос").font(semi(13.5)).color(ACCENT));
+            ui.label(RichText::new("Голос").font(semi(13.5)).color(accent()));
             let mut aloud = !self.cfg.jarvis_mute;
             if ui.checkbox(&mut aloud, "Отвечать вслух").changed() {
                 self.cfg.jarvis_mute = !aloud;
@@ -557,7 +557,7 @@ impl App {
             changed |= field(ui, "Номер голоса", &mut self.cfg.fish_voice, "идентификатор голоса", false);
             ui.add_space(8.0);
 
-            ui.label(RichText::new("Слово «Джарвис»").font(semi(13.5)).color(ACCENT));
+            ui.label(RichText::new("Слово «Джарвис»").font(semi(13.5)).color(accent()));
             changed |= ui.add_enabled(self.ears.ready(), egui::Checkbox::new(&mut self.cfg.jarvis_listen, "Слушать постоянно и откликаться на имя")).changed();
             ui.label(RichText::new("Микрофон включён всё время. Речь распознаётся на этом компьютере; фразы без слова «Джарвис» сразу отбрасываются и нигде не сохраняются.").color(DIM).size(11.5));
         });
@@ -643,7 +643,7 @@ impl App {
                 match kind {
                     0 => {
                         ui.add_space(4.0);
-                        ui.label(RichText::new(text).color(ACCENT));
+                        ui.label(RichText::new(text).color(accent()));
                     }
                     1 => {
                         ui.label(RichText::new(text).color(FG));
@@ -667,7 +667,7 @@ impl App {
                     p.text(r.left_center(), Align2::LEFT_CENTER, "Слушаю…", FontId::proportional(13.0), DIM);
                     let bar = egui::Rect::from_min_size(r.left_center() + vec2(76.0, -3.0), vec2(220.0, 6.0));
                     p.rect_filled(bar, 3.0, Color32::from_white_alpha(22));
-                    p.rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * self.jv_level.clamp(0.02, 1.0), 6.0)), 3.0, ACCENT);
+                    p.rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * self.jv_level.clamp(0.02, 1.0), 6.0)), 3.0, accent());
                 }
                 2 => {
                     ui.label(RichText::new("Разбираю слова…").color(DIM));

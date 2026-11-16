@@ -34,7 +34,34 @@ const ROW_H: f32 = 34.0;
 
 const FG: Color32 = Color32::from_rgb(250, 250, 252);
 const DIM: Color32 = Color32::from_rgb(196, 200, 212);
-const ACCENT: Color32 = Color32::from_rgb(185, 164, 255);
+/// Тема оформления: название, цвет акцента и оттенок тёмного стекла.
+struct Theme {
+    name: &'static str,
+    accent: [u8; 3],
+    glass: [u8; 3],
+}
+
+const THEMES: [Theme; 6] = [
+    Theme { name: "Лаванда", accent: [185, 164, 255], glass: [11, 11, 20] },
+    Theme { name: "Океан", accent: [112, 198, 255], glass: [7, 13, 24] },
+    Theme { name: "Мята", accent: [118, 232, 182], glass: [7, 17, 15] },
+    Theme { name: "Закат", accent: [255, 158, 112], glass: [22, 11, 10] },
+    Theme { name: "Сакура", accent: [255, 152, 204], glass: [21, 9, 17] },
+    Theme { name: "Графит", accent: [226, 229, 236], glass: [13, 13, 14] },
+];
+
+/// Номер выбранной темы. Цвета читают отовсюду, поэтому он общий.
+static THEME: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn theme() -> &'static Theme {
+    &THEMES[THEME.load(Ordering::Relaxed).min(THEMES.len() - 1)]
+}
+
+/// Цвет акцента выбранной темы.
+fn accent() -> Color32 {
+    let a = theme().accent;
+    Color32::from_rgb(a[0], a[1], a[2])
+}
 const BG: Color32 = Color32::from_rgb(11, 11, 20);
 
 /// Цвет с обычной прозрачностью (без пересчёта в линейное пространство).
@@ -449,6 +476,10 @@ impl App {
         let (lens_tx, lens_rx) = glass::spawn(ctx.clone());
         let fx = cc.gl.as_ref().and_then(|gl| fx::Fx::new(gl)).map(Arc::new);
         let cfg = store::Settings::load();
+        THEME.store((cfg.theme as usize).min(THEMES.len() - 1), Ordering::Relaxed);
+        if let Some(t) = std::env::var("OSTROVOK_THEME").ok().and_then(|v| v.parse::<usize>().ok()) {
+            THEME.store(t.min(THEMES.len() - 1), Ordering::Relaxed);
+        }
         let live = {
             let (tx, ctx) = (tx.clone(), ctx.clone());
             live::spawn(cfg.mirror && !test_mode(), move |notice| {
@@ -659,7 +690,7 @@ impl App {
         }
         self.note = Some((t, Instant::now() + Duration::from_secs(4)));
         self.ripple = (self.ripple + 4.0).min(7.0);
-        self.glow = Some((ACCENT, Instant::now()));
+        self.glow = Some((accent(), Instant::now()));
     }
 
     fn show_toast(&mut self, glyph: &'static str, color: [u8; 3], title: &str, text: &str, secs: u64, cover: bool) {
@@ -1099,7 +1130,7 @@ impl App {
     fn segments(&self) -> Vec<Seg> {
         let mut v = Vec::new();
         if let Some((t, _)) = &self.note {
-            v.push(Seg::Text(t.clone(), ACCENT));
+            v.push(Seg::Text(t.clone(), accent()));
             return v;
         }
         let playing = self.media_now.as_ref().is_some_and(|m| m.playing);
@@ -1108,7 +1139,7 @@ impl App {
         }
         v.push(Seg::Text(chrono::Local::now().format("%H:%M").to_string(), FG));
         if let (Some(end), true) = (self.timer_end, self.fx.is_none()) {
-            v.push(Seg::Text(fmt_left(end), ACCENT));
+            v.push(Seg::Text(fmt_left(end), accent()));
         }
         if let (Some(since), true) = (self.call_since, self.fx.is_none()) {
             let secs = since.elapsed().as_secs();
@@ -1189,13 +1220,13 @@ impl App {
                 // робот: антенна с огоньком, тёмный экран со светящимися глазами, рот-эквалайзер
                 p.line_segment([pos2(cx, y - 7.0), pos2(cx, y - 10.0)], Stroke::new(1.2_f32, white));
                 let on = (t * if music { 12.0 } else { 3.0 }).sin() > 0.0 && emo != Emotion::Sleepy;
-                p.circle_filled(pos2(cx, y - 10.5), 1.6, if on { ACCENT } else { white });
+                p.circle_filled(pos2(cx, y - 10.5), 1.6, if on { accent() } else { white });
                 p.rect_filled(Rect::from_min_size(pos2(cx - 10.0, y - 7.0), vec2(20.0, 15.0)), Rounding::same(4.5), white);
                 p.rect_filled(Rect::from_min_size(pos2(cx - 8.0, y - 5.0), vec2(16.0, 8.0)), Rounding::same(2.5), ink);
                 let eh = if emo == Emotion::Happy { 1.2 } else if emo == Emotion::Sleepy { 0.9 } else { 3.6 * (1.0 - blink) }.max(0.8);
                 let (ox, oy) = (look.x * 1.3, look.y * 0.8);
                 for x0 in [cx - 5.6, cx + 2.4] {
-                    p.rect_filled(Rect::from_min_size(pos2(x0 + ox, y - 1.0 - eh / 2.0 + oy), vec2(3.2, eh)), Rounding::same(1.0), ACCENT);
+                    p.rect_filled(Rect::from_min_size(pos2(x0 + ox, y - 1.0 - eh / 2.0 + oy), vec2(3.2, eh)), Rounding::same(1.0), accent());
                 }
                 for i in 0..4 {
                     let mh = if music { 0.8 + (t * 9.0 + i as f32 * 1.3).sin().abs() * 2.2 } else { 0.9 };
@@ -1280,7 +1311,7 @@ impl App {
                     x += 30.0;
                 }
                 Seg::Eq => {
-                    let color = self.album.map_or(ACCENT, |c| Color32::from_rgb(c[0], c[1], c[2]));
+                    let color = self.album.map_or(accent(), |c| Color32::from_rgb(c[0], c[1], c[2]));
                     let live = self.sound.active();
                     for i in 0..5 {
                         // пять столбиков: каждый — среднее по трём соседним полосам настоящего звука
@@ -1532,7 +1563,7 @@ impl App {
                     .map(|d| d.with_timezone(&chrono::Local).format("%d.%m  %H:%M").to_string())
                     .unwrap_or_default();
                 let p = ui.painter().with_clip_rect(row);
-                p.text(pos2(row.left() + 14.0, row.center().y), Align2::LEFT_CENTER, when, semi(13.0), ACCENT);
+                p.text(pos2(row.left() + 14.0, row.center().y), Align2::LEFT_CENTER, when, semi(13.0), accent());
                 p.text(pos2(row.left() + 120.0, row.center().y), Align2::LEFT_CENTER, &r.text, FontId::proportional(13.5), FG);
                 let x = Rect::from_center_size(pos2(row.right() - 20.0, row.center().y), vec2(26.0, 26.0));
                 let resp = ui.interact(x, ui.id().with(("del-reminder", i)), Sense::click());
@@ -1690,7 +1721,7 @@ impl App {
             } else if let Some(r) = next {
                 let mins = (r.at - stamp) / 60;
                 let when = if mins < 60 { format!("через {} мин", mins.max(1)) } else if mins < 1440 { format!("через {} ч", mins / 60) } else { format!("через {} д", mins / 1440) };
-                (format!("\u{E823}  {when} · {}", r.text), ACCENT)
+                (format!("\u{E823}  {when} · {}", r.text), accent())
             } else {
                 ("\u{E823}  дел на сегодня нет".to_string(), DIM)
             };
@@ -1720,7 +1751,7 @@ impl App {
                 let lyric = self.lyrics.iter().rev().find(|l| l.0 <= at).map(|l| l.1.clone());
                 text.text(pos2(x, music_r.top() + 13.0), Align2::LEFT_TOP, &m.title, semi(14.0), FG);
                 match lyric {
-                    Some(line) => text.text(pos2(x, music_r.top() + 33.0), Align2::LEFT_TOP, line, FontId::proportional(12.0), ACCENT),
+                    Some(line) => text.text(pos2(x, music_r.top() + 33.0), Align2::LEFT_TOP, line, FontId::proportional(12.0), accent()),
                     None => text.text(pos2(x, music_r.top() + 33.0), Align2::LEFT_TOP, &m.artist, FontId::proportional(12.0), DIM),
                 };
                 if m.dur > 0.0 {
@@ -1752,7 +1783,7 @@ impl App {
                 if self.sound.active() {
                     p.text(pos2(x, music_r.top() + 16.0), Align2::LEFT_TOP, "Играет звук", semi(14.0), FG);
                     let strip = Rect::from_min_max(pos2(x, music_r.top() + 38.0), pos2(music_r.right() - 16.0, music_r.bottom() - 14.0));
-                    spectrum(&p, strip, &self.bars, ACCENT, 0.8, 1.0);
+                    spectrum(&p, strip, &self.bars, accent(), 0.8, 1.0);
                 } else {
                     p.text(pos2(x, music_r.top() + 30.0), Align2::LEFT_TOP, "Ничего не играет", semi(14.0), FG);
                     p.text(pos2(x, music_r.top() + 51.0), Align2::LEFT_TOP, "Включите музыку в плеере", FontId::proportional(12.0), DIM);
@@ -1794,7 +1825,7 @@ impl App {
             glass_chip(&p, r, 16.0, 0.5 + 0.5 * hov);
             let c = pos2(r.left() + 26.0, r.center().y);
             let shown = ui.ctx().animate_value_with_time(resp.id.with("v"), frac.clamp(0.0, 1.0), 0.5);
-            let color = if shown > 0.9 { Color32::from_rgb(0xFF, 0x6B, 0x6B) } else if k == 0 { Color32::from_rgb(0x8F, 0xD3, 0xFF) } else { ACCENT };
+            let color = if shown > 0.9 { Color32::from_rgb(0xFF, 0x6B, 0x6B) } else if k == 0 { Color32::from_rgb(0x8F, 0xD3, 0xFF) } else { accent() };
             p.circle_stroke(c, 13.0, Stroke::new(3.5_f32, rgba(255, 255, 255, 26)));
             let steps = (shown * 40.0).ceil().max(1.0) as usize;
             let arc: Vec<Pos2> = (0..=steps)
@@ -1817,7 +1848,7 @@ impl App {
                 Some((level, muted)) => {
                     let icon = Rect::from_center_size(pos2(r.left() + 24.0, r.center().y), vec2(30.0, 30.0));
                     let resp = ui.interact(icon, ui.id().with("home-mute"), Sense::click()).on_hover_text(if muted { "Включить звук" } else { "Выключить звук" });
-                    p.text(icon.center(), Align2::CENTER_CENTER, if muted { "\u{E74F}" } else { "\u{E767}" }, FontId::proportional(17.0), if muted { DIM } else { ACCENT });
+                    p.text(icon.center(), Align2::CENTER_CENTER, if muted { "\u{E74F}" } else { "\u{E767}" }, FontId::proportional(17.0), if muted { DIM } else { accent() });
                     if resp.clicked() {
                         sys::set_mute(!muted);
                         self.vol = Some((level, !muted));
@@ -1826,7 +1857,7 @@ impl App {
                     p.text(pos2(r.right() - 13.0, r.center().y - 8.0), Align2::RIGHT_CENTER, format!("{:.0}%", level * 100.0), FontId::proportional(11.5), DIM);
                     let mut v = level;
                     let track = Rect::from_min_max(pos2(r.left() + 46.0, r.center().y + 3.0), pos2(r.right() - 13.0, r.center().y + 15.0));
-                    if slim_slider(ui, ui.id().with("home-vol"), track, &mut v, ACCENT, muted) {
+                    if slim_slider(ui, ui.id().with("home-vol"), track, &mut v, accent(), muted) {
                         sys::set_volume(v);
                         self.vol = Some((v, muted));
                     }
@@ -1977,7 +2008,7 @@ impl App {
 
     /// Обзор → Музыка: большая обложка, управление и текст песни строчка за строчкой.
     fn ui_music(&mut self, ui: &mut egui::Ui) {
-        let accent = self.album.map_or(ACCENT, |c| Color32::from_rgb(c[0], c[1], c[2]));
+        let accent = self.album.map_or(accent(), |c| Color32::from_rgb(c[0], c[1], c[2]));
         let Some(m) = self.media_now.clone() else {
             if self.sound.active() {
                 // кто звучит — спрашиваем у Windows не чаще раза в полторы секунды
@@ -2116,7 +2147,7 @@ impl App {
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
             let p = ui.painter().with_clip_rect(r);
             glass_chip(&p, r, 13.0, 0.5 + 0.5 * hov + if hot { 0.5 } else { 0.0 });
-            p.text(r.min + vec2(14.0, 8.0), Align2::LEFT_TOP, title, semi(13.5), if hot { ACCENT } else { FG });
+            p.text(r.min + vec2(14.0, 8.0), Align2::LEFT_TOP, title, semi(13.5), if hot { accent() } else { FG });
             p.text(r.min + vec2(14.0, 28.0), Align2::LEFT_TOP, hint, FontId::proportional(11.5), DIM);
             resp.clicked()
         };
@@ -2276,7 +2307,7 @@ impl App {
                 ui.painter().text(pos2(right, card.top() + 19.0), Align2::RIGHT_CENTER, format!("{:.0}%", level * 100.0), semi(13.0), if muted { DIM } else { FG });
                 let mut v = level;
                 let track = Rect::from_min_max(pos2(card.left() + 58.0, card.top() + 35.0), pos2(right, card.top() + 47.0));
-                if slim_slider(ui, ui.id().with("master"), track, &mut v, ACCENT, muted) {
+                if slim_slider(ui, ui.id().with("master"), track, &mut v, accent(), muted) {
                     sys::set_volume(v);
                     self.vol = Some((v, muted));
                 }
@@ -2503,7 +2534,7 @@ impl App {
                     let b = ui.interact(br, ui.id().with(("clip-act", i)), Sense::click());
                     let bh = ui.ctx().animate_bool_with_time(b.id.with("hov"), b.hovered(), 0.10);
                     glass_chip(ui.painter(), br, 9.0, 0.6 + 0.6 * bh);
-                    ui.painter().with_clip_rect(br).text(br.center(), Align2::CENTER_CENTER, &h.label, semi(12.0), ACCENT);
+                    ui.painter().with_clip_rect(br).text(br.center(), Align2::CENTER_CENTER, &h.label, semi(12.0), accent());
                     if b.clicked() {
                         act = Some(h.act);
                         used = true;
@@ -2570,6 +2601,26 @@ impl App {
             ui.add(egui::TextEdit::singleline(&mut self.key_edit).margin(egui::Margin::symmetric(9.0, 7.0)).password(true).hint_text(RichText::new(key_state).color(DIM)).desired_width(170.0));
             if jelly(ui, "Сохранить ключ").clicked() {
                 self.save_key();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Тема").color(DIM));
+            let cur = THEME.load(Ordering::Relaxed);
+            for (i, t) in THEMES.iter().enumerate() {
+                let (r, resp) = ui.allocate_exact_size(vec2(88.0, 28.0), Sense::click());
+                let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
+                glass_chip(ui.painter(), r, 10.0, if i == cur { 1.0 } else { 0.4 + 0.4 * hov });
+                let c = Color32::from_rgb(t.accent[0], t.accent[1], t.accent[2]);
+                // кружок показывает и акцент, и оттенок стекла
+                let dot = pos2(r.left() + 16.0, r.center().y);
+                ui.painter().circle_filled(dot, 7.5, Color32::from_rgb(t.glass[0] * 3, t.glass[1] * 3, t.glass[2] * 3));
+                ui.painter().circle_filled(dot, 4.5, c);
+                ui.painter().text(pos2(r.left() + 30.0, r.center().y), Align2::LEFT_CENTER, t.name, semi(12.5), if i == cur { c } else { FG });
+                if resp.clicked() {
+                    THEME.store(i, Ordering::Relaxed);
+                    self.cfg.theme = i as u8;
+                    self.cfg.save();
+                }
             }
         });
         ui.horizontal(|ui| {
@@ -2779,7 +2830,7 @@ impl App {
             }
             for (me, text) in &self.ai_chat {
                 if *me {
-                    ui.label(RichText::new(text).color(ACCENT));
+                    ui.label(RichText::new(text).color(accent()));
                 } else {
                     ui.label(RichText::new(text).color(FG));
                     ui.add_space(4.0);
@@ -2852,7 +2903,7 @@ impl App {
             let c = origin + vec2(cell.x * (col as f32 + 0.5), 22.0 + cell.y * (row as f32 + 0.5));
             let is_today = self.cal_shift == 0 && day == today.day();
             if is_today {
-                p.circle_filled(c, 12.0, ACCENT);
+                p.circle_filled(c, 12.0, accent());
             }
             let color = if is_today { BG } else if col >= 5 { DIM } else { FG };
             p.text(c, Align2::CENTER_CENTER, day.to_string(), semi(13.5), color);
@@ -2870,7 +2921,7 @@ impl App {
         let mut items: Vec<(&str, f32, String, String, Color32, bool)> = vec![("Процессор", s.cpu, format!("{:.0}%", s.cpu * 100.0), "загрузка сейчас".into(), blue, true)];
         if s.mem_total > 0.0 {
             let f = (s.mem_used / s.mem_total) as f32;
-            items.push(("Память", f, format!("{:.0}%", f * 100.0), format!("{:.1} из {:.0} ГБ", s.mem_used, s.mem_total), ACCENT, true));
+            items.push(("Память", f, format!("{:.0}%", f * 100.0), format!("{:.1} из {:.0} ГБ", s.mem_used, s.mem_total), accent(), true));
         }
         if s.disk_total > 0.0 {
             let f = (1.0 - s.disk_free / s.disk_total) as f32;
@@ -3352,7 +3403,7 @@ impl eframe::App for App {
                         light: [light_at.x, light_at.y],
                         cap: self.lens_draw.map_or([0.0; 4], |c| [c.left(), c.top(), c.right(), c.bottom()]),
                         has_tex: self.lens_draw.is_some(),
-                        tint: [11.0 / 255.0, 11.0 / 255.0, 20.0 / 255.0],
+                        tint: theme().glass.map(|c| c as f32 / 255.0),
                         dim: if self.mode == Mode::Pill { 0.50 } else { 0.66 },
                         glow,
                         thick: (rect.width().min(rect.height()) / 2.0 * 0.92).clamp(4.0, 17.0),
@@ -3719,7 +3770,7 @@ impl App {
             Tab::Clip => 340.0,
             Tab::Notes => 340.0,
             Tab::System => if self.stats.battery.is_some() { 262.0 } else { 240.0 },
-            Tab::Settings => 528.0,
+            Tab::Settings => 564.0,
         }
     }
 
