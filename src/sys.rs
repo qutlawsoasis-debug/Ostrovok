@@ -949,3 +949,60 @@ pub fn kill_by_name(name: &str) -> usize {
     }
     done
 }
+
+// ---------------------------------------------------------------- наблюдение за громкостью и раскладкой
+
+/// Что сейчас с общей громкостью и на каком языке печатает активное окно.
+#[derive(Clone, Copy, Default, PartialEq)]
+pub struct Watch {
+    pub vol: f32,
+    pub muted: bool,
+    /// код языка раскладки (0x419 — русская, 0x409 — английская), 0 — неизвестно
+    pub layout: u16,
+    /// удалось ли прочитать громкость
+    pub ok: bool,
+}
+
+/// Следит за громкостью и раскладкой в стороне от интерфейса; wake зовётся при каждом изменении.
+pub fn spawn_watch(wake: impl Fn() + Send + 'static) -> Arc<std::sync::Mutex<Watch>> {
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
+    let shared = Arc::new(std::sync::Mutex::new(Watch::default()));
+    let out = shared.clone();
+    std::thread::spawn(move || unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let mut endpoint = None;
+        let mut tick = 0u32;
+        loop {
+            // устройство вывода могли сменить — раз в несколько секунд берём его заново
+            if endpoint.is_none() || tick % 40 == 0 {
+                endpoint = endpoint_volume(false);
+            }
+            tick = tick.wrapping_add(1);
+            let mut w = Watch::default();
+            if let Some(v) = &endpoint {
+                if let (Ok(level), Ok(mute)) = (v.GetMasterVolumeLevelScalar(), v.GetMute()) {
+                    w.vol = level;
+                    w.muted = mute.as_bool();
+                    w.ok = true;
+                }
+            }
+            if !w.ok {
+                endpoint = None;
+            }
+            let tid = GetWindowThreadProcessId(GetForegroundWindow(), None);
+            w.layout = (GetKeyboardLayout(tid).0 as usize & 0xFFFF) as u16;
+            let changed = {
+                let mut s = shared.lock().unwrap();
+                let c = *s != w;
+                *s = w;
+                c
+            };
+            if changed {
+                wake();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        }
+    });
+    out
+}

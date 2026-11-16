@@ -146,6 +146,10 @@ struct Toast {
     until: Instant,
     /// показать обложку трека вместо значка
     cover: bool,
+    /// шкала вместо текста (громкость), 0…1
+    level: Option<f32>,
+    /// маленькая всплывашка в одну строку: громкость, раскладка
+    compact: bool,
 }
 
 /// Как контур острова отклоняется от ровной капсулы в этом кадре.
@@ -459,6 +463,11 @@ struct App {
     upd: Arc<Mutex<update::State>>,
     upd_at: Instant,
     upd_go: Option<Instant>,
+    /// громкость и раскладка из потока наблюдения и то, что уже показано
+    watch: Arc<Mutex<sys::Watch>>,
+    watch_seen: Option<sys::Watch>,
+    mem_hot: u8,
+    mem_alert_at: Option<Instant>,
     kill_arm: Option<(String, Instant)>,
     /// скорость сети, байт в секунду: приём и отдача
     net: (f32, f32),
@@ -667,6 +676,13 @@ impl App {
             upd: Default::default(),
             upd_at: now + Duration::from_secs(15),
             upd_go: None,
+            watch: {
+                let c = cc.egui_ctx.clone();
+                sys::spawn_watch(move || c.request_repaint())
+            },
+            watch_seen: None,
+            mem_hot: 0,
+            mem_alert_at: None,
             kill_arm: None,
             net: (0.0, 0.0),
             net_prev: None,
@@ -751,12 +767,20 @@ impl App {
             }
             out
         };
-        self.toast = Some(Toast { glyph, color, title: short(title, 44), text: short(text, 56), until: Instant::now() + Duration::from_secs(secs), cover });
+        self.toast = Some(Toast { glyph, color, title: short(title, 44), text: short(text, 56), until: Instant::now() + Duration::from_secs(secs), cover, level: None, compact: false });
         self.ripple = (self.ripple + 4.0).min(7.0);
         self.jelly.vel += 0.7;
         self.glow = Some((Color32::from_rgb(color[0], color[1], color[2]), Instant::now()));
         self.emotion = Emotion::Happy;
         self.emotion_until = Instant::now() + Duration::from_millis(1600);
+    }
+
+    /// Маленькая всплывашка в пилюле (громкость, раскладка). Важное уведомление она не перебивает.
+    fn show_hud(&mut self, glyph: &'static str, color: [u8; 3], title: String, level: Option<f32>, ms: u64) {
+        if self.toast.as_ref().is_some_and(|t| !t.compact) {
+            return;
+        }
+        self.toast = Some(Toast { glyph, color, title, text: String::new(), until: Instant::now() + Duration::from_millis(ms), cover: false, level, compact: true });
     }
 
     fn start_timer(&mut self, minutes: f64) {
@@ -1088,6 +1112,37 @@ impl App {
             }
         }
 
+        // проверка вида всплывашек на тестовой копии: OSTROVOK_HUD=vol или lang
+        if test_mode() && self.toast.is_none() {
+            match std::env::var("OSTROVOK_HUD").as_deref() {
+                Ok("vol") => self.show_hud("\u{E767}", [185, 164, 255], String::new(), Some(0.64), 60_000),
+                Ok("lang") => self.show_hud("\u{E765}", [0x8F, 0xD3, 0xFF], "Русский".to_string(), None, 60_000),
+                _ => {}
+            }
+        }
+        // громкость и раскладка всплывают в пилюле, когда меняются
+        let w = *self.watch.lock().unwrap();
+        if let Some(prev) = self.watch_seen.replace(w) {
+            if !self.cfg.no_hud && self.mode == Mode::Pill && !test_mode() {
+                if w.ok && prev.ok && ((w.vol - prev.vol).abs() > 0.004 || w.muted != prev.muted) {
+                    let a = accent();
+                    let quiet = w.muted || w.vol < 0.005;
+                    self.show_hud(if quiet { "\u{E74F}" } else { "\u{E767}" }, [a.r(), a.g(), a.b()], String::new(), Some(if w.muted { 0.0 } else { w.vol }), 1400);
+                } else if w.layout != prev.layout && w.layout != 0 && prev.layout != 0 {
+                    let name = match w.layout {
+                        0x419 => "Русский".to_string(),
+                        0x409 | 0x809 => "English".to_string(),
+                        0x422 => "Українська".to_string(),
+                        0x423 => "Беларуская".to_string(),
+                        0x43F => "Қазақша".to_string(),
+                        0x407 => "Deutsch".to_string(),
+                        other => format!("Раскладка {other:04X}"),
+                    };
+                    self.show_hud("\u{E765}", [0x8F, 0xD3, 0xFF], name, None, 1100);
+                }
+            }
+        }
+
         if now.duration_since(self.last_slow) < Duration::from_millis(400) {
             return;
         }
@@ -1222,6 +1277,12 @@ impl App {
             }
             let mem = if self.stats.mem_total > 0.0 { (self.stats.mem_used / self.stats.mem_total) as f32 } else { 0.0 };
             self.load_hist.push_back((self.stats.cpu, mem));
+            // память забита несколько замеров подряд — предупреждаем, но не чаще раза в четверть часа
+            self.mem_hot = if mem > 0.92 { self.mem_hot.saturating_add(1) } else { 0 };
+            if self.mem_hot == 4 && self.mem_alert_at.map_or(true, |t| now.duration_since(t) > Duration::from_secs(900)) {
+                self.mem_alert_at = Some(now);
+                self.show_toast("\u{E7BA}", [0xFF, 0x6B, 0x6B], "Память почти заполнена", &format!("занято {:.0}% — загляните в «Монитор»", mem * 100.0), 7, false);
+            }
             while self.load_hist.len() > 120 {
                 self.load_hist.pop_front();
             }
@@ -2897,6 +2958,11 @@ impl App {
         if ui.checkbox(&mut self.autostart, "Запускать вместе с Windows").changed() {
             store::set_autostart(self.autostart);
         }
+        let mut hud = !self.cfg.no_hud;
+        if ui.checkbox(&mut hud, "Показывать в пилюле громкость и смену раскладки").changed() {
+            self.cfg.no_hud = !hud;
+            self.cfg.save();
+        }
         ui.horizontal(|ui| {
             let mut auto = !self.cfg.no_update;
             if ui.checkbox(&mut auto, "Обновляться с GitHub автоматически").changed() {
@@ -3579,7 +3645,11 @@ impl eframe::App for App {
             Mode::Pill => match &self.toast {
                 Some(t) => {
                     let w = |text: &str, font: FontId| ctx.fonts(|f| f.layout_no_wrap(text.to_string(), font, FG).size().x);
-                    vec2((66.0 + w(&t.title, semi(13.5)).max(w(&t.text, FontId::proportional(12.0))) + 24.0).clamp(220.0, 470.0), 54.0)
+                    if t.compact {
+                        vec2(if t.level.is_some() { 236.0 } else { (62.0 + w(&t.title, semi(13.5))).max(120.0) }, 40.0)
+                    } else {
+                        vec2((66.0 + w(&t.title, semi(13.5)).max(w(&t.text, FontId::proportional(12.0))) + 24.0).clamp(220.0, 470.0), 54.0)
+                    }
                 }
                 None => vec2(self.pill_width(ctx, &segs), PILL_H),
             },
@@ -3944,7 +4014,6 @@ impl eframe::App for App {
                         if let Some((level, _)) = sys::volume() {
                             let v = (level + wheel.signum() * 0.02).clamp(0.0, 1.0);
                             sys::set_volume(v);
-                            self.show_toast("\u{E767}", [185, 164, 255], &format!("Громкость {:.0}%", v * 100.0), "", 1, false);
                         }
                     }
                     if face.clicked() {
@@ -3956,6 +4025,26 @@ impl eframe::App for App {
                         self.mode = Mode::Panel;
                     }
                     match &self.toast {
+                        Some(t) if t.compact => {
+                            let p = ui.painter().with_clip_rect(rect);
+                            let cy = rect.center().y;
+                            let tone = Color32::from_rgb(t.color[0], t.color[1], t.color[2]);
+                            p.text(pos2(rect.left() + 24.0, cy), Align2::CENTER_CENTER, t.glyph, FontId::proportional(16.0), tone);
+                            match t.level {
+                                Some(level) => {
+                                    let track = Rect::from_min_max(pos2(rect.left() + 46.0, cy - 3.0), pos2(rect.right() - 54.0, cy + 3.0));
+                                    p.rect_filled(track, Rounding::same(3.0), rgba(255, 255, 255, 34));
+                                    let shown = ui.ctx().animate_value_with_time(Id::new("hud-level"), level.clamp(0.0, 1.0), 0.10);
+                                    if shown > 0.005 {
+                                        p.rect_filled(Rect::from_min_max(track.min, pos2(track.left() + (track.width() * shown).max(6.0), track.bottom())), Rounding::same(3.0), tone);
+                                    }
+                                    p.text(pos2(rect.right() - 18.0, cy), Align2::RIGHT_CENTER, format!("{:.0}", level * 100.0), semi(13.5), FG);
+                                }
+                                None => {
+                                    p.text(pos2(rect.left() + 44.0, cy), Align2::LEFT_CENTER, &t.title, semi(13.5), FG);
+                                }
+                            }
+                        }
                         Some(t) => {
                             let p = ui.painter().with_clip_rect(rect);
                             let at = pos2(rect.left() + 29.0, rect.center().y);
@@ -4272,7 +4361,7 @@ impl App {
             Tab::Clip => 340.0,
             Tab::Notes => 340.0,
             Tab::System => if self.stats.battery.is_some() { 416.0 } else { 394.0 },
-            Tab::Settings => 594.0,
+            Tab::Settings => 618.0,
         }
     }
 

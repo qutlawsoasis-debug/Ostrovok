@@ -42,6 +42,9 @@ pub struct Settings {
     /// выключить жидкость в пилюле (остров-колбу)
     #[serde(default)]
     pub no_flask: bool,
+    /// не показывать в пилюле громкость и смену раскладки
+    #[serde(default)]
+    pub no_hud: bool,
     /// не обновляться с GitHub самостоятельно
     #[serde(default)]
     pub no_update: bool,
