@@ -487,7 +487,14 @@ struct App {
     /// самообновление: состояние проверки, время следующей и момент установки
     upd: Arc<Mutex<update::State>>,
     upd_at: Instant,
-    upd_go: Option<Instant>,
+    /// идёт представление обновления: когда началось, какая версия и где её файл (пустой путь — проверочный прогон)
+    upd_anim: Option<(Instant, String, std::path::PathBuf)>,
+    /// форма острова, которую диктует представление, и его сдвиг по высоте
+    upd_shape: Option<Vec2>,
+    drop_y: f32,
+    /// новая версия «падает» на место после перезапуска
+    arrive_at: Option<Instant>,
+    arrive_done: bool,
     /// громкость и раскладка из потока наблюдения и то, что уже показано
     watch: Arc<Mutex<sys::Watch>>,
     watch_seen: Option<sys::Watch>,
@@ -712,7 +719,11 @@ impl App {
             procs_at: now.checked_sub(Duration::from_secs(60)).unwrap_or(now),
             upd: Default::default(),
             upd_at: now + Duration::from_secs(15),
-            upd_go: None,
+            upd_anim: (test_mode() && std::env::var_os("OSTROVOK_UPD_ANIM").is_some()).then(|| (now + Duration::from_secs(3), "0.1.17".to_string(), std::path::PathBuf::new())),
+            upd_shape: None,
+            drop_y: 0.0,
+            arrive_at: std::env::args().any(|a| a == "--updated").then_some(now),
+            arrive_done: false,
             watch: {
                 let c = cc.egui_ctx.clone();
                 sys::spawn_watch(move || c.request_repaint())
@@ -1242,29 +1253,10 @@ impl App {
             _ => None,
         };
         if let (Some((version, path)), true) = (ready, upd_on) {
-            match self.upd_go {
-                // во время игры или другого полноэкранного приложения остров не перезапускается:
-                // новое окно может отобрать у игры фокус, и она свернётся. Обновление подождёт.
-                None if self.mode == Mode::Pill && !self.hover_was && self.toast.is_none() && !self.hidden => {
-                    self.show_toast("\u{E896}", [0x8F, 0xD3, 0xFF], "Обновляю Островок", &format!("ставлю версию {version}"), 3, false);
-                    self.upd_go = Some(now + Duration::from_millis(1800));
-                }
-                Some(at) if now >= at => {
-                    self.upd_go = None;
-                    match update::apply(&path) {
-                        Ok(()) => {
-                            store::save_notes(&self.notes);
-                            self.jarvis.stop();
-                            self.ears.stop_server();
-                            std::process::exit(0);
-                        }
-                        Err(e) => {
-                            *self.upd.lock().unwrap() = update::State::Failed(e);
-                            self.upd_at = now + Duration::from_secs(600);
-                        }
-                    }
-                }
-                _ => {}
+            // во время игры или другого полноэкранного приложения остров не перезапускается:
+            // новое окно может отобрать у игры фокус, и она свернётся. Обновление подождёт.
+            if self.upd_anim.is_none() && self.mode == Mode::Pill && !self.hover_was && self.toast.is_none() && !self.hidden {
+                self.upd_anim = Some((now, version, path));
             }
         }
 
@@ -4117,6 +4109,80 @@ impl eframe::App for App {
         let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.05);
         let time = ctx.input(|i| i.time);
         self.pump(ctx, now);
+        // ── обновление как представление: шкала в пилюле → остров сжимается в каплю и втягивается за верхний
+        // край экрана → новая версия падает оттуда же и разворачивается обратно
+        self.upd_shape = None;
+        let mut drop = 0.0f32;
+        if let Some((at, version, path)) = self.upd_anim.clone() {
+            let t = now.duration_since(at).as_secs_f32();
+            ctx.request_repaint();
+            if t < 1.9 {
+                let a = accent();
+                self.toast = Some(Toast {
+                    glyph: "\u{E896}",
+                    color: [a.r(), a.g(), a.b()],
+                    title: format!("Обновление {version}"),
+                    text: String::new(),
+                    until: now + Duration::from_secs(1),
+                    cover: false,
+                    level: Some(ease((t / 1.7).min(1.0))),
+                    compact: true,
+                });
+            } else {
+                self.toast = None;
+                self.upd_shape = Some(vec2(54.0, 30.0));
+                // сначала капля чуть приседает, потом резко уходит вверх
+                let k = ((t - 2.15) / 0.40).clamp(0.0, 1.0);
+                let dip = (((t - 1.9) / 0.25).clamp(0.0, 1.0) * std::f32::consts::PI).sin() * 5.0;
+                drop = dip - 90.0 * k * k * k;
+            }
+            if t >= 2.6 {
+                self.upd_anim = None;
+                if path.as_os_str().is_empty() {
+                    // проверочный прогон без установки: сразу показываем возвращение
+                    self.arrive_at = Some(now);
+                } else {
+                    match update::apply(&path) {
+                        Ok(()) => {
+                            store::save_notes(&self.notes);
+                            self.jarvis.stop();
+                            self.ears.stop_server();
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            *self.upd.lock().unwrap() = update::State::Failed(e);
+                            self.upd_at = now + Duration::from_secs(600);
+                            self.arrive_at = Some(now);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(at) = self.arrive_at {
+            let t = now.duration_since(at).as_secs_f32();
+            ctx.request_repaint();
+            if t < 1.0 {
+                // падение из-за верхнего края и один мягкий отскок
+                let k = (t / 0.42).min(1.0);
+                let fall = -90.0 * (1.0 - k) * (1.0 - k);
+                let bounce = if t > 0.42 { -7.0 * ((t - 0.42) / 0.30).min(1.0).mul_add(std::f32::consts::PI, 0.0).sin() * (1.0 - ((t - 0.42) / 0.58).min(1.0)) } else { 0.0 };
+                drop = fall + bounce;
+                if t < 0.40 {
+                    self.upd_shape = Some(vec2(54.0, 30.0));
+                } else if !self.arrive_done {
+                    // капля приземлилась — расплёскивается в пилюлю
+                    self.arrive_done = true;
+                    self.ripple = 6.0;
+                    self.jelly.vel += 1.6;
+                    self.sheen_at = now;
+                }
+            } else {
+                self.arrive_at = None;
+                self.arrive_done = false;
+            }
+        }
+        self.drop_y = drop;
+
         self.web_slot = None;
         let dropped: Vec<String> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.as_ref().map(|p| p.display().to_string())).collect());
         if !dropped.is_empty() {
@@ -4179,7 +4245,7 @@ impl eframe::App for App {
                 Some(t) => {
                     let w = |text: &str, font: FontId| ctx.fonts(|f| f.layout_no_wrap(text.to_string(), font, FG).size().x);
                     if t.compact {
-                        vec2(if t.level.is_some() { 236.0 } else { (62.0 + w(&t.title, semi(13.5))).max(120.0) }, 40.0)
+                        vec2(if t.level.is_some() { 236.0 + if t.title.is_empty() { 0.0 } else { w(&t.title, semi(13.0)) + 10.0 } } else { (62.0 + w(&t.title, semi(13.5))).max(120.0) }, 40.0)
                     } else {
                         vec2((66.0 + w(&t.title, semi(13.5)).max(w(&t.text, FontId::proportional(12.0))) + 24.0).clamp(220.0, 470.0), 54.0)
                     }
@@ -4192,6 +4258,7 @@ impl eframe::App for App {
                 vec2(PANEL_W, 50.0 + n * ROW_H + if n > 0.0 { 10.0 } else { 0.0 })
             }
         };
+        let target = self.upd_shape.unwrap_or(target);
         // пружина: остров слегка «переливается» за цель и возвращается, как капля
         let sdt = dt.min(0.02);
         self.vel += ((target - self.size) * 340.0 - self.vel * 31.0) * sdt;
@@ -4199,8 +4266,8 @@ impl eframe::App for App {
         self.size = self.size.max(vec2(40.0, 20.0));
         let animating = (target - self.size).length() > 0.4 || self.vel.length() > 3.0;
 
-        let rect_v = Rect::from_min_size(pos2(WIN_W / 2.0 - self.size.x / 2.0, TOP), self.size);
-        let layout_v = Rect::from_min_size(pos2(WIN_W / 2.0 - target.x / 2.0, TOP), target);
+        let rect_v = Rect::from_min_size(pos2(WIN_W / 2.0 - self.size.x / 2.0, TOP + self.drop_y), self.size);
+        let layout_v = Rect::from_min_size(pos2(WIN_W / 2.0 - target.x / 2.0, TOP + self.drop_y), target);
 
         // «жидкая» физика (по образцу Atoll): пилюля тянется к курсору, пружинит и идёт рябью
         let (mut bump, mut lean_t) = (0.0f32, 0.0f32);
@@ -4225,7 +4292,7 @@ impl eframe::App for App {
         self.reach.step(dt);
         self.lean_s.step(dt);
         self.jelly.step(dt);
-        let side = self.fx.is_some() && self.mode == Mode::Pill && self.toast.is_none() && !self.hidden;
+        let side = self.fx.is_some() && self.mode == Mode::Pill && self.toast.is_none() && !self.hidden && self.upd_anim.is_none() && self.arrive_at.is_none();
         self.bub_timer.target = if side && self.timer_end.is_some() { 1.0 } else { 0.0 };
         self.bub_call.target = if side && self.call_since.is_some() { 1.0 } else { 0.0 };
         self.bub_timer.step(dt);
@@ -4297,7 +4364,7 @@ impl eframe::App for App {
         let moving = !self.reach.settled() || self.reach.v > 0.01 || !self.lean_s.settled() || !self.jelly.settled() || self.ripple > 0.0 || dripping || glowing || glowing_music || self.sound.active() || sloshing || !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || self.sheen_at.elapsed().as_secs_f32() < 0.75;
         let animating = animating || moving;
         let scaled = rect_v.size() * self.jelly.v;
-        let rect_v = Rect::from_min_size(pos2(WIN_W / 2.0 - scaled.x / 2.0 + self.lean_s.v, TOP), scaled);
+        let rect_v = Rect::from_min_size(pos2(WIN_W / 2.0 - scaled.x / 2.0 + self.lean_s.v, TOP + self.drop_y), scaled);
 
         // капли справа от пилюли: выезжают из неё и втягиваются обратно, по пути срастаясь «шейкой»
         let mut bubbles_v: Vec<(Rect, f32, u8, String)> = Vec::new();
@@ -4582,7 +4649,11 @@ impl eframe::App for App {
                             p.text(pos2(rect.left() + 24.0, cy), Align2::CENTER_CENTER, t.glyph, FontId::proportional(16.0), tone);
                             match t.level {
                                 Some(level) => {
-                                    let track = Rect::from_min_max(pos2(rect.left() + 46.0, cy - 3.0), pos2(rect.right() - 54.0, cy + 3.0));
+                                    let mut x0 = rect.left() + 46.0;
+                                    if !t.title.is_empty() {
+                                        x0 = p.text(pos2(x0 - 2.0, cy), Align2::LEFT_CENTER, &t.title, semi(13.0), FG).right() + 12.0;
+                                    }
+                                    let track = Rect::from_min_max(pos2(x0, cy - 3.0), pos2(rect.right() - 54.0, cy + 3.0));
                                     p.rect_filled(track, Rounding::same(3.0), rgba(255, 255, 255, 34));
                                     let shown = ui.ctx().animate_value_with_time(Id::new("hud-level"), level.clamp(0.0, 1.0), 0.10);
                                     if shown > 0.005 {
