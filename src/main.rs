@@ -5399,10 +5399,13 @@ fn main() -> eframe::Result<()> {
     }
     let test_x = std::env::var("OSTROVOK_TEST_X").ok().and_then(|v| v.parse::<f32>().ok());
     let x = if let Some(tx) = test_x { tx } else if test { -6000.0 } else { ((sys::screen_width() as f32 - WIN_W) / 2.0).max(0.0) };
+    // Если сейчас идёт полноэкранная игра, окно создаётся сразу за пределами экрана: окно «поверх всех»,
+    // появившееся над игрой хоть на кадр, сворачивает её. На место остров встанет сам, когда игра уйдёт.
+    let start_at = if !test && sys::fullscreen_app_active() { [-9000.0, 0.0] } else { [x + WIN_W / 2.0 - 90.0, TOP - 2.0] };
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(if test { "Островок (тест)" } else { "Островок" })
         .with_inner_size([180.0, PILL_H + 4.0])
-        .with_position([x + WIN_W / 2.0 - 90.0, TOP - 2.0])
+        .with_position(start_at)
         .with_decorations(false)
         .with_transparent(true)
         .with_taskbar(false)
