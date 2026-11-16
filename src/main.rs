@@ -1243,7 +1243,9 @@ impl App {
         };
         if let (Some((version, path)), true) = (ready, upd_on) {
             match self.upd_go {
-                None if self.mode == Mode::Pill && !self.hover_was && self.toast.is_none() => {
+                // во время игры или другого полноэкранного приложения остров не перезапускается:
+                // новое окно может отобрать у игры фокус, и она свернётся. Обновление подождёт.
+                None if self.mode == Mode::Pill && !self.hover_was && self.toast.is_none() && !self.hidden => {
                     self.show_toast("\u{E896}", [0x8F, 0xD3, 0xFF], "Обновляю Островок", &format!("ставлю версию {version}"), 3, false);
                     self.upd_go = Some(now + Duration::from_millis(1800));
                 }
