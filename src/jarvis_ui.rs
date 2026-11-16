@@ -67,6 +67,10 @@ fn split_name(text: &str) -> (bool, String) {
 }
 
 pub fn default_dir(cfg: &store::Settings) -> std::path::PathBuf {
+    // для проверок: другая папка без правки настроек
+    if let Ok(d) = std::env::var("OSTROVOK_JARVIS_DIR") {
+        return d.into();
+    }
     if cfg.jarvis_dir.trim().is_empty() { store::dir().join("jarvis") } else { cfg.jarvis_dir.trim().into() }
 }
 
@@ -415,11 +419,171 @@ impl App {
         format!("Ошибка: программа, файл или сайт «{t}» не найдены. Если это сайт — укажи адрес, например youtube.com")
     }
 
+    /// Полоска загрузки с подписью.
+    fn jv_progress(ui: &mut egui::Ui, prog: &crate::setup::Progress) {
+        let (done, all) = prog.bytes;
+        let frac = if all > 0 { (done as f32 / all as f32).clamp(0.0, 1.0) } else { 0.0 };
+        let mb = |b: u64| b / 1_048_576;
+        ui.label(RichText::new(format!("{}  ·  шаг {} из {}", prog.label, prog.step.0, prog.step.1)).color(FG));
+        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width().min(420.0), 8.0), Sense::hover());
+        ui.painter().rect_filled(r, 4.0, Color32::from_white_alpha(22));
+        ui.painter().rect_filled(egui::Rect::from_min_size(r.min, vec2(r.width() * frac.max(0.01), 8.0)), 4.0, ACCENT);
+        ui.label(RichText::new(if all > 0 { format!("{} из {} МБ", mb(done), mb(all)) } else { format!("{} МБ", mb(done)) }).color(DIM).size(11.5));
+    }
+
+    fn jv_download(&mut self, model: &'static str, ctx: &egui::Context) {
+        let ctx = ctx.clone();
+        self.setup.start(model, move || ctx.request_repaint());
+    }
+
+    /// Первая установка: выбор модели и загрузка всего нужного.
+    fn ui_jarvis_setup(&mut self, ui: &mut egui::Ui, prog: &crate::setup::Progress) {
+        let ctx = ui.ctx().clone();
+        ui.add_space(14.0);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new("Включить Джарвиса").font(semi(19.0)).color(FG));
+            ui.add_space(2.0);
+            ui.label(RichText::new("Голосовой помощник, который работает на этом компьютере: без ключей, подписок и интернета.").color(DIM));
+            ui.label(RichText::new("Понимает просьбы своими словами и сам выполняет их: открывает программы, ставит таймеры, меняет громкость.").color(DIM));
+        });
+        ui.add_space(12.0);
+        if prog.running {
+            ui.vertical_centered(|ui| Self::jv_progress(ui, prog));
+            ui.add_space(6.0);
+            ui.vertical_centered(|ui| ui.label(RichText::new("Можно закрыть панель — загрузка продолжится.").color(DIM).size(11.5)));
+            return;
+        }
+        const CHOICES: [(&str, &str, &str); 3] = [
+            ("large", "Большая — 2,4 ГБ", "Самая сообразительная. Нужно около 3 ГБ свободной памяти на время ответа."),
+            ("medium", "Средняя — 1 ГБ", "Простые просьбы выполняет, в разговоре слабее."),
+            ("small", "Малая — 0,4 ГБ", "Только для очень слабых компьютеров: часто отвечает невпопад."),
+        ];
+        for (id, name, note) in CHOICES {
+            let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
+            let on = self.jv_pick == id;
+            glass_chip(ui.painter(), row, 11.0, if on { 0.9 } else if resp.hovered() { 0.6 } else { 0.35 });
+            let p = ui.painter();
+            p.circle_stroke(row.left_center() + vec2(20.0, 0.0), 6.0, egui::Stroke::new(1.5, if on { ACCENT } else { DIM }));
+            if on {
+                p.circle_filled(row.left_center() + vec2(20.0, 0.0), 3.2, ACCENT);
+            }
+            p.text(row.left_center() + vec2(38.0, 0.0), Align2::LEFT_CENTER, name, semi(13.5), FG);
+            p.text(row.left_center() + vec2(190.0, 0.0), Align2::LEFT_CENTER, note, FontId::proportional(12.0), DIM);
+            if resp.clicked() {
+                self.jv_pick = id;
+            }
+            ui.add_space(3.0);
+        }
+        ui.add_space(6.0);
+        if let Some(e) = &prog.error {
+            ui.label(RichText::new(format!("Не получилось: {e}")).color(Color32::from_rgb(0xFF, 0x8A, 0x80)));
+        }
+        let need = self.setup.need_mb(self.jv_pick);
+        let size = if need >= 1000 { format!("{:.1} ГБ", need as f32 / 1024.0).replace('.', ",") } else { format!("{need} МБ") };
+        let (mut go, mut settings) = (false, false);
+        ui.horizontal(|ui| {
+            go = jelly(ui, if prog.error.is_some() { "Повторить".to_string() } else { format!("Скачать {size} и включить") }).clicked();
+            settings = jelly(ui, "Настройки").clicked();
+            ui.label(RichText::new("Вместе с моделью ставятся распознавание речи и голос.").color(DIM).size(11.5));
+        });
+        if go {
+            self.jv_download(self.jv_pick, &ctx);
+        }
+        if settings {
+            self.jv_view = 1;
+        }
+    }
+
+    /// Настройки Джарвиса: модели, облачный мозг, голос, постоянное прослушивание.
+    fn ui_jarvis_settings(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let prog = self.setup.progress();
+        let mut back = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Настройки Джарвиса").font(semi(16.0)).color(FG));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| back = jelly(ui, "Назад").clicked());
+        });
+        if back {
+            self.jv_view = 0;
+        }
+        let mut changed = false;
+        let mut download = None;
+        let field = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, secret: bool| -> bool {
+            let mut ch = false;
+            ui.horizontal(|ui| {
+                ui.add_sized([120.0, 20.0], egui::Label::new(RichText::new(label).color(DIM)));
+                ch = ui
+                    .add(egui::TextEdit::singleline(value).margin(egui::Margin::symmetric(9.0, 6.0)).password(secret).hint_text(RichText::new(hint).color(DIM)).desired_width(360.0))
+                    .changed();
+            });
+            ch
+        };
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.label(RichText::new("Мозг на компьютере").font(semi(13.5)).color(ACCENT));
+            for (id, name, size) in [("large", "Большая", "2,4 ГБ"), ("medium", "Средняя", "1 ГБ"), ("small", "Малая", "0,4 ГБ")] {
+                ui.horizontal(|ui| {
+                    ui.add_sized([120.0, 20.0], egui::Label::new(RichText::new(format!("{name} · {size}")).color(FG)));
+                    if self.jarvis.model_path(id).exists() {
+                        ui.label(RichText::new("установлена").color(Color32::from_rgb(0x7B, 0xE0, 0x9A)));
+                    } else if ui.add_enabled(!prog.running, egui::Button::new("Скачать")).clicked() {
+                        download = Some(id);
+                    }
+                });
+            }
+            if prog.running {
+                Self::jv_progress(ui, &prog);
+            } else if let Some(e) = &prog.error {
+                ui.label(RichText::new(format!("Не получилось: {e}")).color(Color32::from_rgb(0xFF, 0x8A, 0x80)));
+            }
+            changed |= ui.checkbox(&mut self.cfg.jarvis_cpu, "Считать только на процессоре, без видеокарты").changed();
+            ui.add_space(8.0);
+
+            ui.label(RichText::new("Облачный мозг — необязательно").font(semi(13.5)).color(ACCENT));
+            ui.label(RichText::new("Сервер с протоколом чата OpenAI (например, https://api.groq.com/openai/v1). Вопросы и ответы уходят на него, память компьютера не занята; если сервер недоступен, думает локальная модель.").color(DIM).size(11.5));
+            changed |= field(ui, "Адрес", &mut self.cfg.jarvis_url, "пусто — думать на компьютере", false);
+            changed |= field(ui, "Ключ", &mut self.cfg.jarvis_key, "своему посреднику не нужен", true);
+            changed |= field(ui, "Модель", &mut self.cfg.jarvis_remote_model, "имя модели на сервере", false);
+            ui.add_space(8.0);
+
+            ui.label(RichText::new("Голос").font(semi(13.5)).color(ACCENT));
+            let mut aloud = !self.cfg.jarvis_mute;
+            if ui.checkbox(&mut aloud, "Отвечать вслух").changed() {
+                self.cfg.jarvis_mute = !aloud;
+                self.voice.hush();
+                changed = true;
+            }
+            ui.label(RichText::new("Встроенный голос работает на компьютере. Свой голос Fish Audio — необязательно: тогда текст ответов уходит на api.fish.audio.").color(DIM).size(11.5));
+            changed |= field(ui, "Ключ Fish Audio", &mut self.cfg.fish_key, "пусто — встроенный голос", true);
+            changed |= field(ui, "Номер голоса", &mut self.cfg.fish_voice, "идентификатор голоса", false);
+            ui.add_space(8.0);
+
+            ui.label(RichText::new("Слово «Джарвис»").font(semi(13.5)).color(ACCENT));
+            changed |= ui.add_enabled(self.ears.ready(), egui::Checkbox::new(&mut self.cfg.jarvis_listen, "Слушать постоянно и откликаться на имя")).changed();
+            ui.label(RichText::new("Микрофон включён всё время. Речь распознаётся на этом компьютере; фразы без слова «Джарвис» сразу отбрасываются и нигде не сохраняются.").color(DIM).size(11.5));
+        });
+        if changed {
+            self.cfg.save();
+        }
+        if let Some(id) = download {
+            self.jv_download(id, &ctx);
+        }
+    }
+
     pub(crate) fn ui_jarvis(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        if self.jv_view == 1 {
+            self.ui_jarvis_settings(ui);
+            return;
+        }
+        // думать нечем: ни локальной модели, ни облачного мозга — предлагаем установку
+        let prog = self.setup.progress();
+        if prog.running || (!self.setup.brain_ready() && self.jv_remote().is_none()) {
+            self.ui_jarvis_setup(ui, &prog);
+            return;
+        }
         let cur = self.jv_model();
         let loaded = self.jarvis.loaded();
-        let (mut pick, mut flip_gpu, mut clear, mut flip_voice) = (None, false, false, false);
+        let (mut pick, mut clear) = (None, false);
         ui.horizontal(|ui| {
             for (id, name, _) in MODELS {
                 let have = self.jarvis.model_path(id).exists();
@@ -428,16 +592,10 @@ impl App {
                     pick = Some(id);
                 }
             }
-            flip_gpu = ui
-                .add_enabled(!self.jv_busy, egui::Button::new(if self.cfg.jarvis_cpu { "Процессор" } else { "Видеокарта" }))
-                .on_hover_text("Переключить: считать на видеокарте или только на процессоре")
-                .clicked();
-            flip_voice = ui
-                .add_enabled(self.voice.ready() || !self.cfg.fish_key.is_empty(), egui::Button::new(if self.cfg.jarvis_mute { "Голос выкл" } else { "Голос вкл" }))
-                .on_hover_text("Отвечать вслух или только текстом")
-                .on_disabled_hover_text("Голос ещё не скачан")
-                .clicked();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if jelly(ui, "Настройки").clicked() {
+                    self.jv_view = 1;
+                }
                 clear = jelly(ui, "Очистить").clicked();
             });
         });
@@ -466,15 +624,6 @@ impl App {
         }
         if let Some(id) = pick {
             self.cfg.jarvis_model = id.to_string();
-            self.cfg.save();
-        }
-        if flip_voice {
-            self.cfg.jarvis_mute = !self.cfg.jarvis_mute;
-            self.cfg.save();
-            self.voice.hush();
-        }
-        if flip_gpu {
-            self.cfg.jarvis_cpu = !self.cfg.jarvis_cpu;
             self.cfg.save();
         }
         if clear && !self.jv_busy {

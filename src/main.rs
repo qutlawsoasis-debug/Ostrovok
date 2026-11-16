@@ -7,6 +7,7 @@ mod ears;
 mod glass;
 mod jarvis;
 mod jarvis_ui;
+mod setup;
 mod live;
 mod media;
 mod store;
@@ -387,6 +388,11 @@ struct App {
     jv_stats: String,
     jv_confirm: Option<(String, mpsc::Sender<bool>)>,
     ears: ears::Ears,
+    setup: setup::Setup,
+    /// страница Джарвиса: 0 — разговор, 1 — настройки
+    jv_view: u8,
+    /// какую модель ставить при первой установке
+    jv_pick: &'static str,
     voice: voice::Voice,
     /// 0 — микрофон выключен, 1 — слушает, 2 — распознаёт
     jv_listen: u8,
@@ -471,6 +477,9 @@ impl App {
             city_edit: cfg.city.clone(),
             jarvis: jarvis::Jarvis::new(jarvis_ui::default_dir(&cfg)),
             ears: ears::Ears::new(jarvis_ui::default_dir(&cfg)),
+            setup: setup::Setup::new(jarvis_ui::default_dir(&cfg)),
+            jv_view: 0,
+            jv_pick: "large",
             voice: voice::Voice::new(jarvis_ui::default_dir(&cfg)),
             cfg,
             autostart: store::autostart_enabled(),
@@ -607,6 +616,10 @@ impl App {
             app.tab = match demo.as_str() {
                 "ai" => Tab::Ai,
                 "jarvis" => Tab::Jarvis,
+                "jarvis-settings" => {
+                    app.jv_view = 1;
+                    Tab::Jarvis
+                }
                 "shots" => Tab::Shots,
                 "control" => Tab::Control,
                 "music" => Tab::Music,
