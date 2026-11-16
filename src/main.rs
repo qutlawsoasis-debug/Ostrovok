@@ -3,6 +3,7 @@
 
 mod ai;
 mod fx;
+mod convert;
 mod ears;
 mod glass;
 mod jarvis;
@@ -138,6 +139,17 @@ impl Spr {
 }
 
 /// Живое уведомление: на несколько секунд пилюля становится карточкой со значком, заголовком и текстом.
+/// Только что сделанный снимок экрана: его показывают карточкой с действиями.
+struct ShotCard {
+    path: String,
+    tex: egui::TextureHandle,
+    size: (usize, usize),
+    /// сам снимок — для распознавания текста
+    rgba: Arc<Vec<u8>>,
+    /// когда карточка сама свернётся, если её не тронули
+    until: Instant,
+}
+
 struct Toast {
     glyph: &'static str,
     color: [u8; 3],
@@ -218,6 +230,8 @@ enum Tab {
     Clip,
     Notes,
     Todo,
+    /// карточка только что сделанного снимка экрана (в меню разделов её нет)
+    Shot,
     Calendar,
     System,
     Sound,
@@ -242,6 +256,8 @@ enum Msg {
     Ai(Result<String, String>),
     Jarvis(jarvis::Ev),
     Heard(ears::Heard),
+    /// снимок области пришёл из буфера обмена: ширина, высота, точки
+    Shot(usize, usize, Vec<u8>),
     Download(String),
     Notice(live::Notice),
     Lyrics(String, Vec<(f64, String)>),
@@ -307,6 +323,11 @@ struct App {
     clipboard: Option<arboard::Clipboard>,
     clips: Vec<String>,
     clip_query: String,
+    /// курсы валют для конвертера в строке поиска
+    rates: convert::Rates,
+    rates_shown: bool,
+    palette_demo: bool,
+    shot_card: Option<ShotCard>,
     clip_seq: u32,
 
     hotkey: Arc<AtomicBool>,
@@ -561,6 +582,10 @@ impl App {
             clipboard: arboard::Clipboard::new().ok(),
             clips: Vec::new(),
             clip_query: String::new(),
+            rates: Default::default(),
+            rates_shown: false,
+            palette_demo: false,
+            shot_card: None,
             clip_seq: sys::clipboard_seq(),
             hotkey,
             hotkey_name,
@@ -713,6 +738,12 @@ impl App {
         if test_mode() && std::env::var_os("OSTROVOK_SHELF").is_some() {
             app.cfg.shelf = ["C:\\Windows\\explorer.exe", "C:\\Windows\\System32\\notepad.exe", "C:\\Windows\\win.ini", "C:\\Windows\\Fonts", "C:\\нет\\такого.txt"].map(String::from).to_vec();
         }
+        // для снимков: открыть строку поиска с готовым запросом
+        if let Ok(q) = std::env::var("OSTROVOK_QUERY") {
+            app.query = q;
+            app.build_results();
+            app.palette_demo = true;
+        }
         if let Ok(t) = std::env::var("OSTROVOK_HINT") {
             app.hint = smart_hint(&t);
             app.hint_until = Instant::now() + Duration::from_secs(60);
@@ -730,6 +761,13 @@ impl App {
             app.sticky = true;
             app.tab = match demo.as_str() {
                 "ai" => Tab::Ai,
+                "shot" => {
+                    // для снимков: карточка с тем, что сейчас на экране (файл не создаётся)
+                    if let Ok((w, h, px)) = sys::capture_screen() {
+                        app.show_shot(&cc.egui_ctx, w, h, px, r"C:\Users\user\Pictures\Островок\Снимок 2026-11-16 20-55-10.png".into());
+                    }
+                    Tab::Shot
+                }
                 "jarvis" => Tab::Jarvis,
                 "jarvis-settings" => {
                     app.jv_view = 1;
@@ -927,6 +965,14 @@ impl App {
             }
         }
 
+        // конвертер: единицы считаются сразу, для валют подгружаются курсы
+        let rates = self.rates.get();
+        for (title, value, sub) in convert::convert(&q, rates.as_ref()) {
+            let action = if value.is_empty() { Action::Copy(String::new()) } else { Action::Copy(value) };
+            self.results.push(Item { title, sub: sub.into(), action });
+        }
+        let converted = !self.results.is_empty();
+
         let is_expr = q.chars().all(|c| c.is_ascii_digit() || " +-*/().,".contains(c))
             && q.chars().any(|c| c.is_ascii_digit())
             && q.chars().any(|c| "+-*/".contains(c));
@@ -965,7 +1011,7 @@ impl App {
             let url = if q.starts_with("http://") || q.starts_with("https://") { q.clone() } else { format!("https://{q}") };
             self.results.push(Item { title: format!("Открыть {q}"), sub: "сайт".into(), action: Action::Url(url) });
         }
-        if !is_expr {
+        if !is_expr && !converted {
             self.results.push(Item { title: format!("Спросить ИИ: {q}"), sub: "чат".into(), action: Action::Ask(q.clone()) });
         }
         self.results.push(Item {
@@ -980,6 +1026,7 @@ impl App {
         self.mode = Mode::Pill;
         match action {
             Action::Launch(p) | Action::Url(p) => sys::open(&p),
+            Action::Copy(s) if s.is_empty() => {}
             Action::Copy(s) => {
                 self.set_clipboard(&s);
                 self.notify(&format!("Скопировано: {s}"));
@@ -997,6 +1044,10 @@ impl App {
 
     /// Фоновые дела: сообщения потоков, буфер обмена, таймер, погода, заметки.
     fn pump(&mut self, ctx: &egui::Context, now: Instant) {
+        if self.palette_demo {
+            self.mode = Mode::Palette;
+            self.sticky = true;
+        }
         // столбики эквалайзера догоняют звук плавно, без дрожания
         let snd = self.sound.frame();
         for (b, t) in self.bars.iter_mut().zip(snd.bands) {
@@ -1042,6 +1093,10 @@ impl App {
                         self.lyrics = lines;
                     }
                 }
+                Msg::Shot(w, h, px) => match sys::save_png(w, h, &px) {
+                    Ok(path) => self.show_shot(ctx, w, h, px, path),
+                    Err(e) => self.notify(&format!("Ошибка: {e}")),
+                },
                 Msg::Jarvis(ev) => self.jarvis_event(ev),
                 Msg::Heard(h) => self.jarvis_heard(h, ctx),
                 Msg::Ai(res) => {
@@ -1673,6 +1728,7 @@ impl App {
             Tab::Clip => self.ui_clip(ui),
             Tab::Notes => self.ui_notes(ui),
             Tab::Todo => self.ui_todo(ui),
+            Tab::Shot => self.ui_shot(ui),
             Tab::Settings => self.ui_settings(ui, ctx),
         }
     }
@@ -1976,9 +2032,27 @@ impl App {
     fn run_action(&mut self, id: &str, ctx: &egui::Context) {
         match id {
             "region" => {
+                let seq0 = sys::clipboard_seq();
                 sys::open("ms-screenclip:");
                 self.mode = Mode::Pill;
-                self.notify("Выделите область — снимок попадёт в буфер");
+                self.notify("Выделите область на экране");
+                // когда Windows положит снимок в буфер обмена — сохраняем его и показываем карточку
+                let (tx, ctx) = (self.tx.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    let start = Instant::now();
+                    while start.elapsed() < Duration::from_secs(90) {
+                        std::thread::sleep(Duration::from_millis(300));
+                        if sys::clipboard_seq() == seq0 {
+                            continue;
+                        }
+                        std::thread::sleep(Duration::from_millis(250));
+                        if let Some(img) = arboard::Clipboard::new().ok().and_then(|mut cb| cb.get_image().ok()) {
+                            let _ = tx.send(Msg::Shot(img.width, img.height, img.bytes.into_owned()));
+                            ctx.request_repaint();
+                        }
+                        return;
+                    }
+                });
             }
             "full" => {
                 self.mode = Mode::Pill;
@@ -3036,6 +3110,110 @@ impl App {
         }
     }
 
+    /// Показывает карточку снимка: миниатюра и что с ним можно сделать.
+    fn show_shot(&mut self, ctx: &egui::Context, w: usize, h: usize, px: Vec<u8>, path: String) {
+        // миниатюра — не больше 640 точек по длинной стороне
+        let k = (640.0 / w.max(h) as f32).min(1.0);
+        let (tw, th) = (((w as f32 * k) as u32).max(1), ((h as f32 * k) as u32).max(1));
+        let Some(img) = image::RgbaImage::from_raw(w as u32, h as u32, px.clone()) else { return };
+        let small = image::imageops::thumbnail(&img, tw, th);
+        let tex = ctx.load_texture("shot-card", egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], small.as_raw()), Default::default());
+        self.shot_card = Some(ShotCard { path, tex, size: (w, h), rgba: Arc::new(px), until: Instant::now() + Duration::from_secs(8) });
+        self.mode = Mode::Panel;
+        self.tab = Tab::Shot;
+        self.sticky = true;
+    }
+
+    /// Карточка снимка экрана.
+    fn ui_shot(&mut self, ui: &mut egui::Ui) {
+        let Some(card) = &self.shot_card else {
+            empty_state(ui, "\u{E722}", "Снимков пока нет", "Сделайте снимок экрана — здесь появятся действия с ним");
+            return;
+        };
+        let (path, size, tex, rgba) = (card.path.clone(), card.size, card.tex.clone(), card.rgba.clone());
+        let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 196.0), Sense::hover());
+        // слева миниатюра: вписана в рамку с сохранением пропорций
+        let frame = Rect::from_min_size(row.min, vec2(330.0, row.height()));
+        let p = ui.painter().clone();
+        glass_chip(&p, frame, 16.0, 0.4);
+        let inner = frame.shrink(8.0);
+        let k = (inner.width() / size.0 as f32).min(inner.height() / size.1 as f32);
+        let img = Rect::from_center_size(inner.center(), vec2(size.0 as f32 * k, size.1 as f32 * k));
+        rounded_image(&p, &tex, img, 9.0);
+
+        let x = frame.right() + 18.0;
+        p.text(pos2(x, row.top() + 4.0), Align2::LEFT_TOP, "Снимок сохранён", semi(17.0), FG);
+        p.with_clip_rect(Rect::from_min_max(pos2(x, row.top()), row.max))
+            .text(pos2(x, row.top() + 30.0), Align2::LEFT_TOP, format!("{} × {} · уже в буфере обмена", size.0, size.1), FontId::proportional(12.5), DIM);
+        p.with_clip_rect(Rect::from_min_max(pos2(x, row.top()), row.max))
+            .text(pos2(x, row.top() + 48.0), Align2::LEFT_TOP, &name, FontId::proportional(12.0), mix(DIM, BG, 0.25));
+        let mut act = None;
+        let mut side = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(pos2(x, row.top() + 74.0), row.max)));
+        side.horizontal_wrapped(|ui| {
+            for (id, label, tip) in [
+                ("text", "Скопировать текст", "Распознать текст на снимке и положить его в буфер обмена"),
+                ("open", "Открыть", "Открыть снимок в программе просмотра"),
+                ("folder", "Показать в папке", "Открыть папку со снимком"),
+                ("shelf", "На полку", "Положить снимок на полку острова"),
+                ("delete", "Удалить", "Удалить файл снимка"),
+            ] {
+                if jelly(ui, label).on_hover_text(tip).clicked() {
+                    act = Some(id);
+                }
+            }
+        });
+        // пока курсор над карточкой, она не сворачивается
+        if ui.rect_contains_pointer(ui.max_rect()) {
+            if let Some(c) = &mut self.shot_card {
+                c.until = Instant::now() + Duration::from_secs(8);
+            }
+        }
+        match act {
+            Some("text") => {
+                self.notify("Распознаю текст…");
+                let (tx, ctx) = (self.tx.clone(), ui.ctx().clone());
+                std::thread::spawn(move || {
+                    let res = sys::ocr(size.0, size.1, &rgba).and_then(|text| {
+                        if text.trim().is_empty() {
+                            return Err("На снимке текста не найдено".to_string());
+                        }
+                        let n = text.chars().count();
+                        arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)).map_err(|e| e.to_string())?;
+                        Ok(n)
+                    });
+                    let _ = tx.send(Msg::Note(match res {
+                        Ok(n) => format!("Текст скопирован: {n} симв."),
+                        Err(e) => e,
+                    }));
+                    ctx.request_repaint();
+                });
+            }
+            Some("open") => {
+                sys::open(&path);
+                self.mode = Mode::Pill;
+            }
+            Some("folder") => {
+                let _ = std::process::Command::new("explorer.exe").arg(format!("/select,{path}")).spawn();
+                self.mode = Mode::Pill;
+            }
+            Some("shelf") => {
+                if !self.cfg.shelf.contains(&path) {
+                    self.cfg.shelf.insert(0, path);
+                    self.cfg.save();
+                }
+                self.notify("Снимок на полке");
+            }
+            Some("delete") => {
+                let _ = std::fs::remove_file(&path);
+                self.shot_card = None;
+                self.mode = Mode::Pill;
+                self.notify("Снимок удалён");
+            }
+            _ => {}
+        }
+    }
+
     /// Выполняет подсказанное действие: открыть ссылку или папку, либо положить результат в буфер.
     fn do_hint(&mut self, act: HintAct) {
         match act {
@@ -3752,7 +3930,7 @@ impl App {
     fn ui_palette(&mut self, ui: &mut egui::Ui) {
         let te = ui.add(
             egui::TextEdit::singleline(&mut self.query)
-                .hint_text(RichText::new("Программа, сайт, пример или «таймер 5»").color(DIM))
+                .hint_text(RichText::new("Программа, сайт, пример, «5 км в мили», «100 usd в рубли» или «таймер 5»").color(DIM))
                 .desired_width(f32::INFINITY)
                 .frame(false)
                 .font(FontId::proportional(17.0)),
@@ -3764,6 +3942,16 @@ impl App {
         if te.changed() {
             self.build_results();
             self.sel = 0;
+        }
+        // спросили про валюту — подгружаем курсы и, когда они придут, пересчитываем ответ
+        if convert::wants_rates(&self.query) {
+            let ctx = ui.ctx().clone();
+            self.rates.refresh(store::dir().join("rates.json"), move || ctx.request_repaint());
+            let have = self.rates.get().is_some();
+            if have != self.rates_shown {
+                self.rates_shown = have;
+                self.build_results();
+            }
         }
         let (down, up, enter, esc) = ui.input(|i| {
             (
@@ -3851,13 +4039,15 @@ impl eframe::App for App {
                 self.shot = None;
                 let res = sys::capture_screen().and_then(|(w, h, px)| {
                     let path = sys::save_png(w, h, &px)?;
-                    if let Some(cb) = &mut self.clipboard {
-                        let _ = cb.set_image(arboard::ImageData { width: w, height: h, bytes: px.into() });
-                    }
-                    Ok(path)
+                    Ok((w, h, px, path))
                 });
                 match res {
-                    Ok(_) => self.notify("Снимок сохранён: Изображения\\Островок"),
+                    Ok((w, h, px, path)) => {
+                        if let Some(cb) = &mut self.clipboard {
+                            let _ = cb.set_image(arboard::ImageData { width: w, height: h, bytes: px.clone().into() });
+                        }
+                        self.show_shot(ctx, w, h, px, path);
+                    }
                     Err(e) => self.notify(&format!("Ошибка: {e}")),
                 }
             }
@@ -4137,6 +4327,11 @@ impl eframe::App for App {
             _ => None,
         };
 
+        // карточка снимка висит несколько секунд и уходит сама, если к ней не подошли
+        if self.mode == Mode::Panel && self.tab == Tab::Shot && self.sticky && self.shot_card.as_ref().is_none_or(|c| now > c.until) && std::env::var_os("OSTROVOK_DEMO").is_none() {
+            self.mode = Mode::Pill;
+            self.sticky = false;
+        }
         // панель сворачивается, когда курсор ушёл
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         match self.mode {
@@ -4158,7 +4353,7 @@ impl eframe::App for App {
                 }
             }
             Mode::Palette => {
-                if !focused && now.duration_since(self.palette_at) > Duration::from_millis(700) {
+                if !focused && now.duration_since(self.palette_at) > Duration::from_millis(700) && !self.palette_demo {
                     self.mode = Mode::Pill;
                 }
             }
@@ -4607,6 +4802,7 @@ impl App {
             Tab::Weather => 250.0,
             Tab::Timer => 262.0,
             Tab::Calendar => 360.0,
+            Tab::Shot => 306.0,
             Tab::Clip => 340.0,
             Tab::Notes => 340.0,
             Tab::Todo => 340.0,
