@@ -22,6 +22,24 @@ pub fn single_instance() -> bool {
     }
 }
 
+/// То же после самообновления: прежняя копия ещё закрывается, поэтому ждём её до восьми секунд.
+pub fn wait_single_instance() -> bool {
+    for _ in 0..80 {
+        unsafe {
+            let h = CreateMutexW(None, true, w!("Ostrovok.SingleInstance"));
+            if windows::Win32::Foundation::GetLastError() != ERROR_ALREADY_EXISTS {
+                std::mem::forget(h);
+                return true;
+            }
+            if let Ok(h) = h {
+                let _ = windows::Win32::Foundation::CloseHandle(h);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
 pub fn cursor() -> Option<(i32, i32)> {
     let mut p = POINT::default();
     unsafe { GetCursorPos(&mut p).ok()? };

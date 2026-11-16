@@ -42,6 +42,12 @@ pub struct Settings {
     /// выключить жидкость в пилюле (остров-колбу)
     #[serde(default)]
     pub no_flask: bool,
+    /// не обновляться с GitHub самостоятельно
+    #[serde(default)]
+    pub no_update: bool,
+    /// версия, которая запускалась в прошлый раз, — чтобы сказать «обновлено»
+    #[serde(default)]
+    pub last_version: String,
     /// номер темы оформления
     #[serde(default)]
     pub theme: u8,

@@ -12,6 +12,7 @@ mod sound;
 mod live;
 mod media;
 mod store;
+mod update;
 mod sys;
 mod voice;
 mod weather;
@@ -454,6 +455,10 @@ struct App {
     /// самые прожорливые по памяти программы — считаются в стороне, пока открыт «Монитор»
     procs: Arc<Mutex<Vec<(String, u64)>>>,
     procs_at: Instant,
+    /// самообновление: состояние проверки, время следующей и момент установки
+    upd: Arc<Mutex<update::State>>,
+    upd_at: Instant,
+    upd_go: Option<Instant>,
     kill_arm: Option<(String, Instant)>,
     /// скорость сети, байт в секунду: приём и отдача
     net: (f32, f32),
@@ -659,6 +664,9 @@ impl App {
             load_hist: Default::default(),
             procs: Default::default(),
             procs_at: now.checked_sub(Duration::from_secs(60)).unwrap_or(now),
+            upd: Default::default(),
+            upd_at: now + Duration::from_secs(15),
+            upd_go: None,
             kill_arm: None,
             net: (0.0, 0.0),
             net_prev: None,
@@ -675,6 +683,14 @@ impl App {
         if let Ok(t) = std::env::var("OSTROVOK_HINT") {
             app.hint = smart_hint(&t);
             app.hint_until = Instant::now() + Duration::from_secs(60);
+        }
+        update::cleanup();
+        if !test_mode() && app.cfg.last_version != env!("CARGO_PKG_VERSION") {
+            if !app.cfg.last_version.is_empty() {
+                app.show_toast("\u{E930}", [0x7B, 0xE0, 0x9A], "Островок обновлён", concat!("версия ", env!("CARGO_PKG_VERSION")), 6, false);
+            }
+            app.cfg.last_version = env!("CARGO_PKG_VERSION").to_string();
+            app.cfg.save();
         }
         if let Ok(demo) = std::env::var("OSTROVOK_DEMO") {
             app.mode = Mode::Panel;
@@ -1076,6 +1092,42 @@ impl App {
             return;
         }
         self.last_slow = now;
+
+        // самообновление: проверка раз в шесть часов, установка — когда остров свёрнут и его не трогают
+        let upd_on = !self.cfg.no_update && (!test_mode() || std::env::var_os("OSTROVOK_FAKE_VERSION").is_some());
+        if upd_on && now >= self.upd_at {
+            self.upd_at = now + Duration::from_secs(6 * 3600);
+            let c = ctx.clone();
+            update::spawn(self.upd.clone(), move || c.request_repaint());
+        }
+        let ready = match &*self.upd.lock().unwrap() {
+            update::State::Ready(v, p) => Some((v.clone(), p.clone())),
+            _ => None,
+        };
+        if let (Some((version, path)), true) = (ready, upd_on) {
+            match self.upd_go {
+                None if self.mode == Mode::Pill && !self.hover_was && self.toast.is_none() => {
+                    self.show_toast("\u{E896}", [0x8F, 0xD3, 0xFF], "Обновляю Островок", &format!("ставлю версию {version}"), 3, false);
+                    self.upd_go = Some(now + Duration::from_millis(1800));
+                }
+                Some(at) if now >= at => {
+                    self.upd_go = None;
+                    match update::apply(&path) {
+                        Ok(()) => {
+                            store::save_notes(&self.notes);
+                            self.jarvis.stop();
+                            self.ears.stop_server();
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            *self.upd.lock().unwrap() = update::State::Failed(e);
+                            self.upd_at = now + Duration::from_secs(3600);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
 
         let seq = sys::clipboard_seq();
         if seq != self.clip_seq {
@@ -2845,6 +2897,29 @@ impl App {
         if ui.checkbox(&mut self.autostart, "Запускать вместе с Windows").changed() {
             store::set_autostart(self.autostart);
         }
+        ui.horizontal(|ui| {
+            let mut auto = !self.cfg.no_update;
+            if ui.checkbox(&mut auto, "Обновляться с GitHub автоматически").changed() {
+                self.cfg.no_update = !auto;
+                self.cfg.save();
+            }
+            let state = self.upd.lock().unwrap().clone();
+            let busy = matches!(state, update::State::Checking);
+            if jelly(ui, if busy { "Проверяю…" } else { "Проверить сейчас" }).clicked() && !busy {
+                if matches!(state, update::State::Fresh | update::State::Failed(_)) {
+                    *self.upd.lock().unwrap() = update::State::Idle;
+                }
+                let c = ui.ctx().clone();
+                update::spawn(self.upd.clone(), move || c.request_repaint());
+            }
+            let note = match state {
+                update::State::Fresh => "установлена последняя версия".to_string(),
+                update::State::Ready(v, _) => format!("версия {v} скачана, поставится сама"),
+                update::State::Failed(e) => e,
+                _ => String::new(),
+            };
+            ui.label(RichText::new(note).color(DIM).size(11.5));
+        });
         ui.add_space(2.0);
         ui.label(RichText::new(format!("Поиск открывается по {}. Щелчок по глазкам меняет эмоцию.", self.hotkey_name)).color(DIM));
         ui.add_space(6.0);
@@ -4197,7 +4272,7 @@ impl App {
             Tab::Clip => 340.0,
             Tab::Notes => 340.0,
             Tab::System => if self.stats.battery.is_some() { 416.0 } else { 394.0 },
-            Tab::Settings => 564.0,
+            Tab::Settings => 594.0,
         }
     }
 
@@ -4652,7 +4727,8 @@ fn setup_style(ctx: &egui::Context) {
 
 fn main() -> eframe::Result<()> {
     let test = test_mode();
-    if !test && !sys::single_instance() {
+    let updated = std::env::args().any(|a| a == "--updated");
+    if !test && !(if updated { sys::wait_single_instance() } else { sys::single_instance() }) {
         return Ok(());
     }
     let test_x = std::env::var("OSTROVOK_TEST_X").ok().and_then(|v| v.parse::<f32>().ok());
