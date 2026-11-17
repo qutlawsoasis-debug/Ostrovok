@@ -285,6 +285,14 @@ pub fn reply_fresh(reply: u64, current: u64) -> bool {
 }
 
 #[cfg(test)]
+mod encode_tests {
+    #[test]
+    fn encode_special() {
+        assert_eq!(super::encode("a&b#c+d 😀"), "a%26b%23c%2Bd%20%F0%9F%98%80");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]

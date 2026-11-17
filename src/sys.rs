@@ -289,7 +289,16 @@ pub fn dedup_apps(list: Vec<(String, String, String)>) -> Vec<(String, String)> 
     list.into_iter().filter(|(n, _, t)| seen.insert((n.to_lowercase(), t.to_lowercase()))).map(|(n, l, _)| (n, l)).collect()
 }
 
-/// Простой калькулятор: + - * / ^ (степень, правоассоциативна), скобки и унарный минус.
+/// «50% от 300» → «50%*300»: одно вхождение « от » (без учёта регистра), только если слева стоит '%'.
+pub fn pct_of(s: &str) -> String {
+    let lc = s.to_lowercase();
+    match lc.find(" от ") {
+        Some(pos) if lc[..pos].trim_end().ends_with('%') => format!("{}*{}", &lc[..pos], &lc[pos + " от ".len()..]),
+        _ => s.to_string(),
+    }
+}
+
+/// Простой калькулятор: проценты (200+10% = 220, 50% от 300 = 150), + - * / ^ (степень, правоассоциативна), скобки и унарный минус.
 /// Приоритет: -2^2 = -4. Глубина вложенности ограничена (200), длина входа — 1000 символов.
 pub fn eval(expr: &str) -> Option<f64> {
     const MAX_DEPTH: usize = 200;
@@ -297,6 +306,7 @@ pub fn eval(expr: &str) -> Option<f64> {
         s: &'a [u8],
         i: usize,
         depth: usize,
+        pct: bool,
     }
     impl P<'_> {
         fn ws(&mut self) {
@@ -313,8 +323,8 @@ pub fn eval(expr: &str) -> Option<f64> {
             loop {
                 self.ws();
                 match self.s.get(self.i) {
-                    Some(b'+') => { self.i += 1; v += self.term()?; }
-                    Some(b'-') => { self.i += 1; v -= self.term()?; }
+                    Some(b'+') => { self.i += 1; let r = self.term()?; v += if self.pct { v * r } else { r }; }
+                    Some(b'-') => { self.i += 1; let r = self.term()?; v -= if self.pct { v * r } else { r }; }
                     _ => return Some(v),
                 }
             }
@@ -324,8 +334,8 @@ pub fn eval(expr: &str) -> Option<f64> {
             loop {
                 self.ws();
                 match self.s.get(self.i) {
-                    Some(b'*') => { self.i += 1; v *= self.unary()?; }
-                    Some(b'/') => { self.i += 1; v /= self.unary()?; }
+                    Some(b'*') => { self.i += 1; v *= self.unary()?; self.pct = false; }
+                    Some(b'/') => { self.i += 1; v /= self.unary()?; self.pct = false; }
                     _ => return Some(v),
                 }
             }
@@ -343,8 +353,15 @@ pub fn eval(expr: &str) -> Option<f64> {
             }
         }
         fn power(&mut self) -> Option<f64> {
-            let base = self.atom()?;
+            self.pct = false;
+            let mut base = self.atom()?;
             self.ws();
+            if self.s.get(self.i) == Some(&b'%') {
+                self.i += 1;
+                base /= 100.0;
+                self.pct = true;
+                self.ws();
+            }
             if self.s.get(self.i) != Some(&b'^') {
                 return Some(base);
             }
@@ -352,6 +369,7 @@ pub fn eval(expr: &str) -> Option<f64> {
             self.enter()?;
             let exp = self.unary()?;
             self.depth -= 1;
+            self.pct = false;
             let v = base.powf(exp);
             v.is_finite().then_some(v)
         }
@@ -363,6 +381,7 @@ pub fn eval(expr: &str) -> Option<f64> {
                     self.enter()?;
                     let v = self.expr()?;
                     self.depth -= 1;
+                    self.pct = false;
                     self.ws();
                     if self.s.get(self.i) == Some(&b')') { self.i += 1; Some(v) } else { None }
                 }
@@ -379,11 +398,39 @@ pub fn eval(expr: &str) -> Option<f64> {
     if expr.chars().count() > 1000 {
         return None;
     }
-    let clean = expr.replace(',', ".");
-    let mut p = P { s: clean.as_bytes(), i: 0, depth: 0 };
+    let clean = pct_of(expr).replace(',', ".");
+    let mut p = P { s: clean.as_bytes(), i: 0, depth: 0, pct: false };
     let v = p.expr()?;
     p.ws();
     (p.i == p.s.len() && v.is_finite()).then_some(v)
+}
+
+#[cfg(test)]
+mod pct_tests {
+    use super::eval;
+    fn ok(s: &str, want: f64) {
+        let v = eval(s).unwrap_or_else(|| panic!("{s} -> None"));
+        assert!((v - want).abs() < 1e-9, "{s} = {v}, want {want}");
+    }
+    #[test]
+    fn percents() {
+        ok("200+10%", 220.0);
+        ok("200-10%", 180.0);
+        ok("200*10%", 20.0);
+        ok("200/10%", 2000.0);
+        ok("15%", 0.15);
+        ok("50% от 300", 150.0);
+        ok("50 % ОТ 300", 150.0);
+        ok("(200+10)%", 2.1);
+        ok("2^10%", 2f64.powf(0.1));
+        ok("-10%", -0.1);
+        ok("200+-10%", 180.0);
+        ok("200+10%*2", 200.2);
+        ok("100+(10%)", 100.1);
+        for bad in ["от 300", "50 от", "10%%", "%5", "%", "5%("] {
+            assert_eq!(eval(bad), None, "{bad}");
+        }
+    }
 }
 
 /// Звуковой сигнал системы (для таймера).

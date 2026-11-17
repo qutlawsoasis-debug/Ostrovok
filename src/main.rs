@@ -172,6 +172,33 @@ fn thumb_size(w: usize, h: usize, height: f32) -> Vec2 {
 }
 
 #[cfg(test)]
+mod calc_layout_tests {
+    use super::*;
+    #[test]
+    fn candidates() {
+        assert!(!calc_candidate("скидка 10%"));
+        assert!(calc_candidate("10%"));
+        assert!(calc_candidate("50% от 300"));
+        assert!(!calc_candidate("работа от 5"));
+        assert!(calc_candidate("2^3"));
+        assert!(!calc_candidate("привет"));
+    }
+    #[test]
+    fn layout_shift() {
+        assert_eq!(fix_layout("J<TL"), "ОБЕД");
+        assert_eq!(fix_layout("{jhjij"), "Хорошо");
+        assert_eq!(fix_layout("ytn'"), "нетэ"); // ' после буквы — это «э»
+        assert_eq!(fix_layout("ytn"), "нет");
+        assert_eq!(fix_layout("ghbdtn, vbh"), "привет, мир");
+        assert_eq!(fix_layout("ghbdtn 😀"), "привет 😀");
+        assert_eq!(fix_layout("ОБЕД"), "J<TL");
+        assert_eq!(map_key('{', true), Some('Х'));
+        assert_eq!(map_key('Х', false), Some('{'));
+        assert_eq!(swap_layout("J<TL"), "обед");
+    }
+}
+
+#[cfg(test)]
 mod clip_img_tests {
     use super::*;
     #[test]
@@ -2030,9 +2057,7 @@ impl App {
         // ответ про дату не прячет «Спросить ИИ» (быстрые команды и конвертер — прячут)
         let converted = self.results.len() > date_items;
 
-        let is_expr = q.chars().all(|c| c.is_ascii_digit() || " +-*/^().,".contains(c))
-            && q.chars().any(|c| c.is_ascii_digit())
-            && q.chars().any(|c| "+-*/^".contains(c));
+        let is_expr = calc_candidate(&q);
         if is_expr {
             if let Some(v) = sys::eval(&q) {
                 let s = fmt_num(v);
@@ -9394,10 +9419,10 @@ fn smart_hint(text: &str) -> Option<Hint> {
         }
     }
     // пример: только цифры и знаки, и знак действия стоит после первой цифры (номера телефонов и даты не считаем)
-    if t.chars().all(|c| c.is_ascii_digit() || " .,+-*/^()".contains(c)) {
+    if calc_candidate(t) {
         if let Some(first) = t.find(|c: char| c.is_ascii_digit()) {
             let rest = &t[first..];
-            if rest.contains(['+', '*', '/', '^']) || rest.contains(" - ") {
+            if rest.contains(['+', '*', '/', '^', '%']) || rest.contains(" - ") {
                 if let Some(v) = sys::eval(&t.replace(',', ".")).filter(|v| v.is_finite()) {
                     let res = fmt_num(v);
                     return Some(Hint { glyph: "\u{E8EF}", label: format!("= {res}"), color: [0xB9, 0xA4, 0xFF], act: HintAct::Copy(res) });
@@ -9421,17 +9446,35 @@ fn smart_hint(text: &str) -> Option<Hint> {
 /// Переводит текст, набранный не в той раскладке: ЙЦУКЕН ↔ QWERTY по положению клавиш.
 /// Направление выбирается по первой букве.
 fn swap_layout(s: &str) -> String {
-    const EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
-    const RU: &str = "йцукенгшщзхъфывапролджэячсмитьбюё";
-    let (en, ru): (Vec<char>, Vec<char>) = (EN.chars().collect(), RU.chars().collect());
-    let to_en = s.chars().find(|c| c.is_alphabetic()).is_some_and(|c| ru.contains(&c.to_lowercase().next().unwrap_or(c)));
-    s.chars()
-        .map(|c| {
-            let l = c.to_lowercase().next().unwrap_or(c);
-            let (from, to) = if to_en { (&ru, &en) } else { (&en, &ru) };
-            from.iter().position(|x| *x == l).map_or(c, |i| to[i])
-        })
-        .collect()
+    let to_en = s.chars().find(|c| c.is_alphabetic()).is_some_and(|c| LAYOUT_RU.contains(c.to_lowercase().next().unwrap_or(c)));
+    // буквы — строчными, как раньше; Shift-знаки («<» → «б») тоже переводим
+    s.chars().map(|c| map_key(c, !to_en).map_or(c, |t| t.to_lowercase().next().unwrap_or(t))).collect()
+}
+
+const LAYOUT_EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
+const LAYOUT_RU: &str = "йцукенгшщзхъфывапролджэячсмитьбюё";
+const LAYOUT_EN_UP: &str = "QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>~";
+const LAYOUT_RU_UP: &str = "ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮЁ";
+
+/// Та же клавиша в другой раскладке (to_ru: QWERTY → ЙЦУКЕН), с учётом Shift-знаков.
+/// Сначала точный символ в верхнем ряду, потом нижний регистр (регистр буквы сохраняется).
+fn map_key(c: char, to_ru: bool) -> Option<char> {
+    let (from_up, to_up, from, to) =
+        if to_ru { (LAYOUT_EN_UP, LAYOUT_RU_UP, LAYOUT_EN, LAYOUT_RU) } else { (LAYOUT_RU_UP, LAYOUT_EN_UP, LAYOUT_RU, LAYOUT_EN) };
+    if let Some(k) = from_up.chars().position(|x| x == c) {
+        return to_up.chars().nth(k);
+    }
+    let low = c.to_lowercase().next().unwrap_or(c);
+    let t = to.chars().nth(from.chars().position(|x| x == low)?)?;
+    Some(if c != low { t.to_uppercase().next().unwrap_or(t) } else { t })
+}
+
+/// Строка из калькулятора: цифры и знаки « +-*/^().,%» (и «% от»), хоть одна цифра и хоть один оператор.
+fn calc_candidate(q: &str) -> bool {
+    let n = sys::pct_of(q);
+    n.chars().all(|c| c.is_ascii_digit() || " +-*/^().,%".contains(c))
+        && n.chars().any(|c| c.is_ascii_digit())
+        && n.chars().any(|c| "+-*/^%".contains(c))
 }
 
 /// Латиница, в которой почти нет гласных, — скорее всего русский текст, набранный в английской раскладке.
@@ -9852,25 +9895,24 @@ fn translit(text: &str) -> String {
 
 /// Текст, набранный не в той раскладке: латиницу в кириллицу или наоборот — куда больше букв просится.
 fn fix_layout(text: &str) -> String {
-    const EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
-    const RU: &str = "йцукенгшщзхъфывапролджэячсмитьбюё";
-    let (en, ru): (Vec<char>, Vec<char>) = (EN.chars().collect(), RU.chars().collect());
     let latin = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
-    let cyr = text.chars().filter(|c| ru.contains(&c.to_lowercase().next().unwrap_or(*c))).count();
+    let cyr = text.chars().filter(|c| LAYOUT_RU.contains(c.to_lowercase().next().unwrap_or(*c))).count();
     let to_ru = latin >= cyr;
     let cs: Vec<char> = text.chars().collect();
     cs.iter()
         .enumerate()
         .map(|(i, &c)| {
-            let low = c.to_lowercase().next().unwrap_or(c);
-            let (from, to) = if to_ru { (&en, &ru) } else { (&ru, &en) };
-            let Some(k) = from.iter().position(|f| *f == low) else { return c };
-            // знаки препинания меняем только внутри слова: «j,tl» → «обед», а запятая в «ghbdtn, vbh» остаётся
-            if to_ru && !low.is_ascii_alphabetic() && !cs.get(i + 1).is_some_and(|n| n.is_ascii_alphabetic()) {
-                return c;
+            let Some(t) = map_key(c, to_ru) else { return c };
+            // знаки препинания меняем только внутри слова: «j,tl» → «обед», а запятая в «ghbdtn, vbh» остаётся;
+            // [ ] ; ' ` и их Shift-версии — буквы (х ъ ж э ё), их меняем и в конце слова
+            if to_ru && !c.is_ascii_alphabetic() {
+                let next = cs.get(i + 1).is_some_and(|n| n.is_ascii_alphabetic());
+                let prev = i > 0 && cs[i - 1].is_ascii_alphabetic();
+                if !(next || (prev && "[];'`{}:\"~".contains(c))) {
+                    return c;
+                }
             }
-            let t = to[k];
-            if c != low { t.to_uppercase().next().unwrap_or(t) } else { t }
+            t
         })
         .collect()
 }
