@@ -2202,7 +2202,10 @@ impl App {
             return;
         }
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Щелчок открывает файл, правый щелчок — его папку. Файл можно вытащить мышью в любое окно.").color(DIM));
+            let w = (ui.available_width() - 120.0).max(80.0);
+            ui.allocate_ui_with_layout(vec2(w, 30.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(RichText::new("Щелчок — открыть, правый — показать в папке, можно вытащить мышью").color(DIM).size(12.5)).truncate());
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if jelly(ui, "Очистить").clicked() {
                     self.cfg.shelf.clear();
@@ -5436,7 +5439,8 @@ impl App {
             Tab::Music => 388.0,
             Tab::Remind => 320.0,
             Tab::Qr => 350.0,
-            Tab::Shelf => 340.0,
+            // полка растёт по рядам значков (в ряду помещается шесть)
+            Tab::Shelf => (150.0 + ((self.cfg.shelf.len().max(1) + 5) / 6) as f32 * 118.0).clamp(270.0, 400.0),
             Tab::Ai if self.api_key().is_empty() => AI_H,
             Tab::Ai => 420.0,
             Tab::Jarvis => 462.0,
