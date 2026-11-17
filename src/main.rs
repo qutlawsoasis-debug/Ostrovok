@@ -1007,6 +1007,12 @@ struct App {
     power_pick: &'static str,
     was_foreground: bool,
     qr_text: String,
+    /// QR для Wi-Fi: режим, сеть, пароль (только в памяти, пока открыта страница), показать ли пароль, с паролем ли сеть
+    qr_wifi: bool,
+    wifi_ssid: String,
+    wifi_pass: String,
+    wifi_show: bool,
+    wifi_secure: bool,
     pick_at: Option<Instant>,
     remind_text: String,
     remind_time: String,
@@ -1296,6 +1302,11 @@ impl App {
             power_pick: "sleep",
             was_foreground: false,
             qr_text: String::new(),
+            qr_wifi: false,
+            wifi_ssid: String::new(),
+            wifi_pass: String::new(),
+            wifi_show: false,
+            wifi_secure: true,
             pick_at: None,
             remind_text: String::new(),
             remind_time: String::new(),
@@ -1415,6 +1426,12 @@ impl App {
             for _ in 0..n {
                 app.push_inbox(live::Notice { app: "Telegram".into(), title: "Мирон".into(), body: "привет".into() }, [0x2A, 0xAB, 0xEE]);
             }
+        }
+        // для снимков QR для Wi‑Fi: OSTROVOK_WIFIQR=1 — выдуманная сеть HomeNet / example123
+        if test_mode() && std::env::var_os("OSTROVOK_WIFIQR").is_some() {
+            app.qr_wifi = true;
+            app.wifi_ssid = "HomeNet".into();
+            app.wifi_pass = "example123".into();
         }
         // для снимков настраиваемого ряда действий: OSTROVOK_HIDEACT=ocr,cleantext
         if let Some(v) = std::env::var("OSTROVOK_HIDEACT").ok().filter(|_| test_mode()) {
@@ -2292,6 +2309,11 @@ impl App {
         }
         if now.duration_since(self.stats_at) >= Duration::from_millis(1500) {
             self.stats_at = now;
+            // пароль Wi‑Fi живёт только пока открыта страница QR
+            if !(self.mode == Mode::Panel && self.tab == Tab::Qr) && !self.wifi_pass.is_empty() {
+                self.wifi_pass.clear();
+                self.wifi_show = false;
+            }
             // отложенная блокировка или сон со страницы «Управление»
             if let Some((action, at, warned)) = self.power_timer {
                 let left = at.saturating_duration_since(now).as_secs();
@@ -2812,22 +2834,64 @@ impl App {
 
     /// Инструменты → QR-код.
     fn ui_qr(&mut self, ui: &mut egui::Ui) {
+        // переключатель «Текст / Wi‑Fi» — две капсулы
         ui.horizontal(|ui| {
-            let w = (ui.available_width() - 120.0).max(120.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.qr_text)
-                    .margin(egui::Margin::symmetric(9.0, 7.0))
-                    .hint_text(RichText::new("Текст или ссылка").color(DIM))
-                    .desired_width(w),
-            );
-            if jelly(ui, "Из буфера").clicked() {
-                self.qr_text = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()).unwrap_or_default().chars().take(400).collect();
+            for (wifi, label) in [(false, "\u{E8C1}  Текст"), (true, "\u{E701}  Wi‑Fi")] {
+                let w = ui.painter().layout_no_wrap(label.to_string(), semi(12.5), FG).size().x + 26.0;
+                let (r, resp) = ui.allocate_exact_size(vec2(w, 28.0), Sense::click());
+                let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
+                let on = self.qr_wifi == wifi;
+                glass_chip(ui.painter(), r, 14.0, if on { 1.1 } else { 0.4 + 0.4 * hov });
+                ui.painter().text(r.center(), Align2::CENTER_CENTER, label, semi(12.5), if on { accent() } else { mix(DIM, FG, hov) });
+                if resp.clicked() {
+                    self.qr_wifi = wifi;
+                }
             }
         });
-        let text = self.qr_text.trim();
+        ui.add_space(4.0);
+        let wifi_text;
+        let text: &str = if self.qr_wifi {
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.wifi_ssid).margin(egui::Margin::symmetric(9.0, 7.0)).hint_text(RichText::new("Сеть").color(DIM)).desired_width(150.0));
+                if self.wifi_secure {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.wifi_pass)
+                            .password(!self.wifi_show)
+                            .margin(egui::Margin::symmetric(9.0, 7.0))
+                            .hint_text(RichText::new("Пароль").color(DIM))
+                            .desired_width(150.0),
+                    );
+                    if jelly(ui, if self.wifi_show { "\u{ED1A}" } else { "\u{E7B3}" }).on_hover_text(if self.wifi_show { "Скрыть пароль" } else { "Показать пароль" }).clicked() {
+                        self.wifi_show = !self.wifi_show;
+                    }
+                }
+                if jelly(ui, if self.wifi_secure { "WPA" } else { "Без пароля" }).on_hover_text("Тип защиты сети — щелчок меняет").clicked() {
+                    self.wifi_secure = !self.wifi_secure;
+                }
+            });
+            wifi_text = wifi_payload(self.wifi_ssid.trim(), &self.wifi_pass, self.wifi_secure);
+            &wifi_text
+        } else {
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 120.0).max(120.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.qr_text)
+                        .margin(egui::Margin::symmetric(9.0, 7.0))
+                        .hint_text(RichText::new("Текст или ссылка").color(DIM))
+                        .desired_width(w),
+                );
+                if jelly(ui, "Из буфера").clicked() {
+                    self.qr_text = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()).unwrap_or_default().chars().take(400).collect();
+                }
+            });
+            self.qr_text.trim()
+        };
+        let text = text.to_string();
+        let text = text.as_str();
         let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 196.0), Sense::hover());
         if text.is_empty() {
-            empty_at(ui.painter(), area.center(), "\u{ED14}", "Кода пока нет", "Впишите текст или ссылку — здесь появится код");
+            let hint = if self.qr_wifi { "Впишите имя сети — телефон подключится, наведя камеру" } else { "Впишите текст или ссылку — здесь появится код" };
+            empty_at(ui.painter(), area.center(), "\u{ED14}", "Кода пока нет", hint);
             return;
         }
         match qrcode::QrCode::new(text.as_bytes()) {
@@ -2859,7 +2923,12 @@ impl App {
                 let side_r = Rect::from_min_max(pos2(sq.right() + 40.0, sq.top() + 6.0), pos2(area.right(), sq.bottom()));
                 let kind = if text.starts_with("http") { "Ссылка" } else if text.starts_with("WIFI:") { "Wi‑Fi" } else { "Текст" };
                 p.text(side_r.min, Align2::LEFT_TOP, kind, semi(14.0), FG);
-                let preview: String = text.chars().take(60).collect::<String>() + if text.chars().count() > 60 { "…" } else { "" };
+                // у Wi‑Fi показываем только сеть и защиту — пароль на экран не выводим
+                let preview: String = if self.qr_wifi {
+                    format!("Сеть «{}» · {}", self.wifi_ssid.trim().chars().take(32).collect::<String>(), if self.wifi_secure { "WPA" } else { "без пароля" })
+                } else {
+                    text.chars().take(60).collect::<String>() + if text.chars().count() > 60 { "…" } else { "" }
+                };
                 p.with_clip_rect(side_r).text(side_r.min + vec2(0.0, 22.0), Align2::LEFT_TOP, preview, FontId::proportional(12.0), DIM);
                 p.text(side_r.min + vec2(0.0, 42.0), Align2::LEFT_TOP, format!("{n}×{n} точек · наводите камеру телефона"), FontId::proportional(11.5), DIM);
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(side_r.min + vec2(0.0, 74.0), side_r.max)));
@@ -3604,7 +3673,7 @@ impl App {
         for (slot, &i) in shown.iter().enumerate() {
             let (id, glyph, label, col) = &ACTIONS[i];
             let r = Rect::from_min_size(pos2(row.left() + step * slot as f32, row.top()), vec2(step, row.height()));
-            let resp = ui.interact(r, ui.id().with(("act", *id)), Sense::click()).on_hover_text(match *id {
+            let resp = ui.interact(r, ui.id().with(("act", *id)), Sense::click()).on_hover_text(format!("{} · правый щелчок — скрыть", match *id {
                 "region" => "Выделите часть экрана — снимок попадёт в буфер",
                 "full" => "Снимок всего экрана: файл в «Изображения\\Островок» и копия в буфере",
                 "ocr" => "Выделите область — текст с неё скопируется",
@@ -3613,7 +3682,7 @@ impl App {
                 "cleantext" => "Убрать оформление у текста в буфере",
                 "remind" => "Добавить напоминание",
                 _ => "Строка поиска и команд",
-            });
+            }));
             if resp.secondary_clicked() {
                 hide = Some(*id);
             }
@@ -7365,7 +7434,7 @@ impl App {
             // напоминания: страница растёт по их числу (до шести без прокрутки)
             Tab::Remind if self.cfg.reminders.is_empty() => 320.0,
             Tab::Remind => 200.0 + self.cfg.reminders.len().clamp(3, 6) as f32 * 42.0,
-            Tab::Qr => 350.0,
+            Tab::Qr => 384.0,
             // полка растёт по рядам значков (в ряду помещается шесть)
             Tab::Shelf => (150.0 + ((self.cfg.shelf.len().max(1) + 5) / 6) as f32 * 118.0).clamp(270.0, 400.0),
             Tab::Ai if self.api_key().is_empty() => AI_H,
@@ -7760,6 +7829,49 @@ fn hide_action(ids: &[&str], hidden: &[String], id: &str) -> Vec<String> {
         out.push(id.to_string());
     }
     out
+}
+
+/// Экранирование для строки Wi-Fi в QR: обратная косая, ; , : и кавычка.
+fn wifi_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '\\' | ';' | ',' | ':' | '"') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Строка для QR-кода Wi-Fi; пустая, если сеть не указана.
+fn wifi_payload(ssid: &str, pass: &str, secure: bool) -> String {
+    if ssid.trim().is_empty() {
+        return String::new();
+    }
+    if secure {
+        format!("WIFI:T:WPA;S:{};P:{};;", wifi_escape(ssid), wifi_escape(pass))
+    } else {
+        format!("WIFI:T:nopass;S:{};;", wifi_escape(ssid))
+    }
+}
+
+#[cfg(test)]
+mod wifi_qr_tests {
+    use super::*;
+    #[test]
+    fn escapes_special() {
+        assert_eq!(wifi_escape("HomeNet"), "HomeNet");
+        assert_eq!(wifi_escape(r#"a\b;c,d:e"f"#), r#"a\\b\;c\,d\:e\"f"#);
+        assert_eq!(wifi_escape("Дача 5G"), "Дача 5G");
+    }
+    #[test]
+    fn payload_format() {
+        assert_eq!(wifi_payload("HomeNet", "example123", true), "WIFI:T:WPA;S:HomeNet;P:example123;;");
+        assert_eq!(wifi_payload("Cafe;Free", "", false), "WIFI:T:nopass;S:Cafe\\;Free;;");
+        // без пароля пароль не попадает в код, даже если вписан
+        assert_eq!(wifi_payload("Open", "secret", false), "WIFI:T:nopass;S:Open;;");
+        assert_eq!(wifi_payload("  ", "x", true), "");
+    }
 }
 
 #[cfg(test)]
