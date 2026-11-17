@@ -1365,6 +1365,17 @@ impl App {
                 app.push_inbox(live::Notice { app: "Telegram".into(), title: "Мирон".into(), body: "привет".into() }, [0x2A, 0xAB, 0xEE]);
             }
         }
+        // для снимков ленты дня: OSTROVOK_DAY=1 — три дела сегодня (утро, через час, вечер)
+        if test_mode() && std::env::var_os("OSTROVOK_DAY").is_some() {
+            let now = chrono::Local::now();
+            if let Some(mid) = now.date_naive().and_hms_opt(0, 0, 0).and_then(|m| m.and_local_timezone(chrono::Local).earliest()) {
+                let m = mid.timestamp();
+                let soon = (now.timestamp() + 3600).min(m + 86_340);
+                for (text, at) in [("Зарядка", m + 8 * 3600), ("Созвон с командой", soon), ("Полить цветы", m + 21 * 3600 + 1800)] {
+                    app.cfg.reminders.push(store::Reminder { text: text.into(), at });
+                }
+            }
+        }
         if test_mode() && std::env::var_os("OSTROVOK_TODO").is_some() {
             app.cfg.todos = [("Купить хлеб и молоко", false), ("Ответить Мирону", false), ("Оплатить интернет", true), ("Записаться к врачу", false)].map(|(t, done)| store::Todo { text: t.to_string(), done }).to_vec();
         }
@@ -3467,6 +3478,49 @@ impl App {
                     }
                     None => self.notify(&format!("Программа «{q}» не найдена")),
                 }
+            }
+        }
+
+        // ── лента дня: сутки полосой, «сейчас» и сегодняшние напоминания точками
+        ui.add_space(6.0);
+        let (strip, sresp) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::click());
+        let now = chrono::Local::now();
+        let midnight = now.date_naive().and_hms_opt(0, 0, 0).and_then(|m| m.and_local_timezone(chrono::Local).earliest()).map_or(now.timestamp() - 43_200, |m| m.timestamp());
+        let marks = day_marks(&self.cfg.reminders, midnight);
+        let frac_now = ((now.timestamp() - midnight) as f32 / 86_400.0).clamp(0.0, 1.0);
+        let left_n = marks.iter().filter(|m| m.0 > frac_now).count();
+        let shov = ui.ctx().animate_bool_with_time(sresp.id.with("hov"), sresp.hovered(), 0.12);
+        p.text(pos2(strip.left() + 2.0, strip.center().y), Align2::LEFT_CENTER, "Сегодня", semi(11.5), mix(DIM, FG, shov));
+        let tail = if left_n > 0 { format!("ещё {}", dela_word(left_n)) } else if marks.is_empty() { "день свободен".into() } else { "всё позади".into() };
+        p.text(pos2(strip.right() - 2.0, strip.center().y), Align2::RIGHT_CENTER, tail, FontId::proportional(11.0), if left_n > 0 { accent() } else { DIM });
+        let track = Rect::from_min_max(pos2(strip.left() + 62.0, strip.center().y - 2.0), pos2(strip.right() - 92.0, strip.center().y + 2.0));
+        if track.width() > 40.0 {
+            p.rect_filled(track, Rounding::same(2.0), rgba(255, 255, 255, (28.0 + 14.0 * shov) as u8));
+            let x_of = |f: f32| track.left() + track.width() * f;
+            let done = Rect::from_min_max(track.min, pos2(x_of(frac_now), track.bottom()));
+            let a = accent();
+            if done.width() > 1.0 { gradient_rrect(&p, done, 2.0, |q| mix_a(Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 40), a, ((q.x - track.left()) / done.width()).clamp(0.0, 1.0))); }
+            for h in [6.0_f32, 12.0, 18.0] {
+                p.circle_filled(pos2(x_of(h / 24.0), track.center().y), 1.2, rgba(255, 255, 255, 70));
+            }
+            let pointer = ui.input(|i| i.pointer.hover_pos());
+            let mut tip: Option<String> = None;
+            for (f, text) in &marks {
+                let c = pos2(x_of(*f), track.center().y);
+                let past = *f <= frac_now;
+                p.circle_filled(c, 4.5, if past { rgba(255, 255, 255, 60) } else { Color32::from_rgb(0xFF, 0x8B, 0x61) });
+                p.circle_stroke(c, 4.5, Stroke::new(1.0_f32, rgba(0, 0, 0, 90)));
+                if pointer.is_some_and(|q| (q - c).length() < 8.0) {
+                    let secs = (*f * 86_400.0).round() as u32;
+                    tip = Some(format!("{:02}:{:02} · {text}", secs / 3600, secs / 60 % 60));
+                }
+            }
+            let nx = x_of(frac_now);
+            p.circle_filled(pos2(nx, track.center().y), 7.0, Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 50));
+            p.circle_filled(pos2(nx, track.center().y), 3.5, FG);
+            let sresp = sresp.on_hover_text(tip.unwrap_or_else(|| format!("Сейчас {} · щелчок — напоминания", now.format("%H:%M"))));
+            if sresp.clicked() {
+                self.tab = Tab::Remind;
             }
         }
     }
@@ -6671,7 +6725,7 @@ impl App {
         // навигация теперь в одну строку
         let saved = if matches!(self.tab, Tab::Ai | Tab::Settings) { 0.0 } else { 24.0 };
         -saved + match self.tab {
-            Tab::Home => 370.0,
+            Tab::Home => 396.0,
             Tab::Control => 238.0,
             Tab::Sound => 286.0,
             Tab::Music => 388.0,
@@ -6848,6 +6902,54 @@ fn moon_disc(p: &egui::Painter, c: Pos2, r: f32, illum: f32, waxing: bool) {
         }
     }
     p.add(egui::Shape::mesh(mesh));
+}
+
+/// Лента дня: сегодняшние напоминания как доля суток (0..1) и текст, по порядку.
+fn day_marks(list: &[store::Reminder], day_start: i64) -> Vec<(f32, String)> {
+    let mut v: Vec<&store::Reminder> = list.iter().filter(|r| r.at >= day_start && r.at < day_start + 86_400).collect();
+    v.sort_by_key(|r| r.at);
+    v.into_iter().map(|r| ((r.at - day_start) as f32 / 86_400.0, r.text.clone())).collect()
+}
+
+/// «1 дело», «3 дела», «5 дел».
+fn dela_word(n: usize) -> String {
+    let w = match (n % 10, n % 100) {
+        (_, 11..=14) => "дел",
+        (1, _) => "дело",
+        (2..=4, _) => "дела",
+        _ => "дел",
+    };
+    format!("{n} {w}")
+}
+
+#[cfg(test)]
+mod day_strip_tests {
+    use super::*;
+    fn r(text: &str, at: i64) -> store::Reminder {
+        store::Reminder { text: text.into(), at }
+    }
+    #[test]
+    fn marks_only_today_sorted() {
+        let day = 1_000_000;
+        let list = [r("завтра", day + 86_400), r("вечер", day + 64_800), r("вчера", day - 1), r("утро", day + 21_600), r("полночь", day)];
+        let m = day_marks(&list, day);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[0], (0.0, "полночь".to_string()));
+        assert_eq!(m[1], (0.25, "утро".to_string()));
+        assert_eq!(m[2], (0.75, "вечер".to_string()));
+        assert!(day_marks(&[], day).is_empty());
+    }
+    #[test]
+    fn russian_plural() {
+        assert_eq!(dela_word(1), "1 дело");
+        assert_eq!(dela_word(3), "3 дела");
+        assert_eq!(dela_word(5), "5 дел");
+        assert_eq!(dela_word(11), "11 дел");
+        assert_eq!(dela_word(12), "12 дел");
+        assert_eq!(dela_word(21), "21 дело");
+        assert_eq!(dela_word(104), "104 дела");
+        assert_eq!(dela_word(0), "0 дел");
+    }
 }
 
 #[cfg(test)]
