@@ -25,14 +25,12 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const WIN_W: f32 = 780.0;
-const WIN_H: f32 = 680.0;
 const AI_H: f32 = 620.0;
 /// Способ размытия фона по умолчанию: acrylic, blur или off.
 const DEFAULT_BLUR: &str = "off";
 const TOP: f32 = 6.0;
 const PILL_H: f32 = 36.0;
 const PANEL_W: f32 = 700.0;
-const PANEL_H: f32 = 318.0;
 const ROW_H: f32 = 34.0;
 
 const FG: Color32 = Color32::from_rgb(250, 250, 252);
@@ -99,10 +97,6 @@ fn contour(rect: Rect, r: f32, inset: f32, n: usize) -> Vec<(Pos2, Vec2)> {
 fn test_mode() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("OSTROVOK_TEST").is_some())
-}
-
-fn card() -> Color32 {
-    tint(18)
 }
 
 /// Пружина: значение догоняет цель и немного колеблется. Параметры и шаг — как в Atoll (Services/Spring.cs, MIT).
@@ -870,8 +864,6 @@ struct App {
     mode: Mode,
     tab: Tab,
     size: Vec2,
-    lean: Vec2,
-    grow: f32,
     passthrough: Option<bool>,
     hidden: bool,
     outside_since: Option<Instant>,
@@ -1196,8 +1188,6 @@ impl App {
             mode: Mode::Pill,
             tab: Tab::Home,
             size: vec2(150.0, PILL_H),
-            lean: Vec2::ZERO,
-            grow: 0.0,
             passthrough: None,
             hidden: false,
             outside_since: None,
@@ -4556,7 +4546,7 @@ impl App {
                 }
             }
             p.add(egui::Shape::mesh(mesh));
-            p.add(egui::Shape::line(line, Stroke::new(2.2, c)));
+            p.add(egui::Shape::line(line, Stroke::new(2.2_f32, c)));
             for (i, h) in w.hours.iter().enumerate() {
                 let x = px(i as f32);
                 // осадки: столбик тем выше и ярче, чем вероятнее
@@ -6122,12 +6112,12 @@ impl App {
                     p.circle_filled(at, 13.0, accent());
                 } else if is_sel {
                     p.circle_filled(at, 13.0, rgba(255, 255, 255, 26));
-                    p.circle_stroke(at, 13.0, Stroke::new(1.5, accent()));
+                    p.circle_stroke(at, 13.0, Stroke::new(1.5_f32, accent()));
                 } else if hov > 0.0 {
                     p.circle_filled(at, 13.0, rgba(255, 255, 255, (26.0 * hov) as u8));
                 }
                 if is_today && is_sel && self.cal_sel.is_some() {
-                    p.circle_stroke(at, 15.5, Stroke::new(1.2, accent()));
+                    p.circle_stroke(at, 15.5, Stroke::new(1.2_f32, accent()));
                 }
                 let color = if is_today {
                     BG
@@ -6327,7 +6317,7 @@ impl App {
         let plot = Rect::from_min_max(left.min + vec2(14.0, 34.0), left.max - vec2(14.0, 26.0));
         for k in 0..=2 {
             let y = plot.bottom() - plot.height() * k as f32 / 2.0;
-            p.line_segment([pos2(plot.left(), y), pos2(plot.right(), y)], Stroke::new(1.0, rgba(255, 255, 255, 14)));
+            p.line_segment([pos2(plot.left(), y), pos2(plot.right(), y)], Stroke::new(1.0_f32, rgba(255, 255, 255, 14)));
         }
         let n = self.load_hist.len();
         if n >= 2 {
@@ -6355,7 +6345,7 @@ impl App {
                     }
                 }
                 p.add(egui::Shape::mesh(mesh));
-                p.add(egui::Shape::line(pts, Stroke::new(1.8, color)));
+                p.add(egui::Shape::line(pts, Stroke::new(1.8_f32, color)));
             }
         } else {
             p.text(plot.center(), Align2::CENTER_CENTER, "Собираю данные…", FontId::proportional(12.0), DIM);
