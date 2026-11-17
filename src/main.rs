@@ -363,9 +363,9 @@ enum Emotion {
 
 enum Msg {
     Note(String),
-    City(f64, f64, String),
-    Weather(weather::Now),
-    WeatherFailed(String),
+    City(u64, f64, f64, String),
+    Weather(u64, weather::Now),
+    WeatherFailed(u64, String),
     Ai(Result<String, String>),
     Jarvis(jarvis::Ev),
     Heard(ears::Heard),
@@ -947,6 +947,8 @@ struct App {
     weather_at: Option<Instant>,
     weather_err: Option<String>,
     weather_fails: u32,
+    /// поколение запросов погоды: ответы для прежнего города отбрасываются
+    weather_gen: u64,
     cfg: store::Settings,
     city_edit: String,
     autostart: bool,
@@ -1270,6 +1272,7 @@ impl App {
             weather_at: None,
             weather_err: None,
             weather_fails: 0,
+            weather_gen: 0,
             city_edit: cfg.city.clone(),
             jarvis: jarvis::Jarvis::new(jarvis_ui::default_dir(&cfg)),
             ears: ears::Ears::new(jarvis_ui::default_dir(&cfg)),
@@ -1767,6 +1770,7 @@ impl App {
     fn refresh_weather(&mut self, ctx: &egui::Context) {
         self.weather_at = Some(Instant::now());
         let (Some(lat), Some(lon)) = (self.cfg.lat, self.cfg.lon) else { return };
+        let gen = self.weather_gen;
         // координаты, сохранённые старой версией, могли указать на одноимённый город за океаном
         // (Минден в США вместо Германии). Один раз за запуск переспрашиваем город с учётом часового пояса.
         if !self.city_rechecked && !self.cfg.city_checked && !self.cfg.city.trim().is_empty() && !weather::fits_zone(lon, weather::local_offset_hours()) {
@@ -1778,7 +1782,7 @@ impl App {
             std::thread::spawn(move || {
                 if let Ok(Some((la, lo, name))) = weather::geocode(&city) {
                     if weather::fits_zone(lo, weather::local_offset_hours()) {
-                        let _ = tx.send(Msg::City(la, lo, name));
+                        let _ = tx.send(Msg::City(gen, la, lo, name));
                         ctx.request_repaint();
                     }
                 }
@@ -1787,14 +1791,17 @@ impl App {
         let (tx, ctx, name) = (self.tx.clone(), ctx.clone(), self.cfg.city_name.clone());
         std::thread::spawn(move || {
             let _ = tx.send(match weather::fetch(lat, lon, &name) {
-                Ok(w) => Msg::Weather(w),
-                Err(e) => Msg::WeatherFailed(e),
+                Ok(w) => Msg::Weather(gen, w),
+                Err(e) => Msg::WeatherFailed(gen, e),
             });
             ctx.request_repaint();
         });
     }
 
     fn save_city(&mut self, ctx: &egui::Context) {
+        // новый выбор города делает все прежние запросы погоды устаревшими
+        self.weather_gen += 1;
+        let gen = self.weather_gen;
         let city = self.city_edit.trim().to_string();
         // новый город — со свежим счётчиком сбоев, без чужой ошибки
         self.weather_err = None;
@@ -1813,7 +1820,7 @@ impl App {
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let msg = match weather::geocode(&city) {
-                Ok(Some((lat, lon, name))) => Msg::City(lat, lon, name),
+                Ok(Some((lat, lon, name))) => Msg::City(gen, lat, lon, name),
                 Ok(None) => Msg::Note("Город не найден".into()),
                 Err(_) => Msg::Note("Нет связи с сервером погоды".into()),
             };
@@ -2061,7 +2068,10 @@ impl App {
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::Note(t) => self.notify(&t),
-                Msg::Weather(mut w) => {
+                Msg::Weather(gen, mut w) => {
+                    if !weather::reply_fresh(gen, self.weather_gen) {
+                        continue;
+                    }
                     if test_mode() {
                         if let Ok(city) = std::env::var("OSTROVOK_CITY") {
                             w.city = city;
@@ -2071,7 +2081,10 @@ impl App {
                     self.weather_err = None;
                     self.weather_fails = 0;
                 }
-                Msg::WeatherFailed(e) => {
+                Msg::WeatherFailed(gen, e) => {
+                    if !weather::reply_fresh(gen, self.weather_gen) {
+                        continue;
+                    }
                     self.weather_err = Some(e);
                     self.weather_fails = self.weather_fails.saturating_add(1);
                 }
@@ -2125,7 +2138,10 @@ impl App {
                         }
                     }
                 }
-                Msg::City(lat, lon, name) => {
+                Msg::City(gen, lat, lon, name) => {
+                    if !weather::reply_fresh(gen, self.weather_gen) {
+                        continue;
+                    }
                     self.cfg.city_checked = true;
                     self.cfg.lat = Some(lat);
                     self.cfg.lon = Some(lon);
@@ -2816,7 +2832,7 @@ impl App {
         }
         // ход трека — тонкая линия по нижней кромке пилюли
         if let Some(m) = self.media_now.as_ref().filter(|m| m.playing && m.dur > 0.0) {
-            let frac = ((m.pos + m.at.elapsed().as_secs_f64()).min(m.dur) / m.dur) as f32;
+            let frac = media::track_frac(m.pos, m.at.elapsed().as_secs_f64(), m.dur, true);
             let color = self.album.map_or(accent(), |c| Color32::from_rgb(c[0], c[1], c[2]));
             let (l, r, y) = (rect.left() + 18.0, rect.right() - 18.0, rect.bottom() - 3.5);
             p.line_segment([pos2(l, y), pos2(r, y)], Stroke::new(1.5_f32, rgba(255, 255, 255, 26)));
@@ -3619,7 +3635,7 @@ impl App {
                     let accent = self.album.map_or(FG, |c| Color32::from_rgb(c[0], c[1], c[2]));
                     let track = Rect::from_min_max(pos2(x, music_r.top() + 56.0), pos2(music_r.right() - 14.0, music_r.top() + 60.0));
                     p.rect_filled(track, Rounding::same(2.0), rgba(255, 255, 255, 0x2A));
-                    let done = Rect::from_min_max(track.min, pos2(track.left() + track.width() * (at.min(m.dur) / m.dur) as f32, track.bottom()));
+                    let done = Rect::from_min_max(track.min, pos2(track.left() + track.width() * media::track_frac(at, 0.0, m.dur, false), track.bottom()));
                     p.rect_filled(done, Rounding::same(2.0), accent);
                 }
                 let mid = (x + music_r.right() - 14.0) / 2.0;
@@ -4049,7 +4065,7 @@ impl App {
             }
         }
         if m.dur > 0.0 {
-            let done = Rect::from_min_max(track.min, pos2(track.left() + track.width() * (at / m.dur) as f32, track.bottom()));
+            let done = Rect::from_min_max(track.min, pos2(track.left() + track.width() * media::track_frac(at, 0.0, m.dur, false), track.bottom()));
             p.rect_filled(done, Rounding::same(2.5 + 1.5 * grab), accent);
             p.circle_filled(pos2(done.right(), track.center().y), 5.0 + 2.0 * grab, FG);
             p.text(pos2(x, track.bottom() + 6.0), Align2::LEFT_TOP, clock(at), FontId::proportional(11.5), DIM);
@@ -8846,7 +8862,8 @@ fn slim_slider(ui: &egui::Ui, id: Id, r: Rect, v: &mut f32, color: Color32, off:
     let resp = ui.interact(r.expand2(vec2(4.0, 3.0)), id, Sense::click_and_drag());
     let mut changed = false;
     if resp.is_pointer_button_down_on() || resp.dragged() {
-        if let Some(p) = resp.interact_pointer_pos() {
+        // ползунок нулевой ширины дал бы NaN вместо громкости
+        if let Some(p) = resp.interact_pointer_pos().filter(|_| r.width() > 0.0 && r.width().is_finite()) {
             let nv = ((p.x - r.left()) / r.width()).clamp(0.0, 1.0);
             if (nv - *v).abs() > 0.002 {
                 *v = nv;

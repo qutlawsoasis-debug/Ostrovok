@@ -697,10 +697,16 @@ pub fn volume() -> Option<(f32, bool)> {
     unsafe { Some((v.GetMasterVolumeLevelScalar().ok()?, v.GetMute().ok()?.as_bool())) }
 }
 
+/// Громкость в 0..1; NaN и бесконечность отбрасываются.
+pub fn sane_level(v: f32) -> Option<f32> {
+    v.is_finite().then(|| v.clamp(0.0, 1.0))
+}
+
 pub fn set_volume(level: f32) {
+    let Some(level) = sane_level(level) else { return };
     if let Some(v) = endpoint_volume(false) {
         unsafe {
-            let _ = v.SetMasterVolumeLevelScalar(level.clamp(0.0, 1.0), std::ptr::null());
+            let _ = v.SetMasterVolumeLevelScalar(level, std::ptr::null());
         }
     }
 }
@@ -905,9 +911,10 @@ pub fn app_volumes() -> Vec<AppVol> {
 }
 
 pub fn set_app_volume(path: &str, level: f32) {
+    let Some(level) = sane_level(level) else { return };
     audio_sessions(|p, _, vol| unsafe {
         if p.eq_ignore_ascii_case(path) {
-            let _ = vol.SetMasterVolume(level.clamp(0.0, 1.0), std::ptr::null());
+            let _ = vol.SetMasterVolume(level, std::ptr::null());
         }
     });
 }
@@ -1148,6 +1155,19 @@ pub fn drag_file(path: &str) -> bool {
         let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(path), None) else { return false };
         let Ok(data) = item.BindToHandler::<_, IDataObject>(None, &BHID_DataObject) else { return false };
         SHDoDragDrop(None, &data, None, DROPEFFECT_COPY | DROPEFFECT_LINK).is_ok()
+    }
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+    #[test]
+    fn sane_levels() {
+        assert_eq!(sane_level(f32::NAN), None);
+        assert_eq!(sane_level(f32::INFINITY), None);
+        assert_eq!(sane_level(1.5), Some(1.0));
+        assert_eq!(sane_level(-0.2), Some(0.0));
+        assert_eq!(sane_level(0.4), Some(0.4));
     }
 }
 

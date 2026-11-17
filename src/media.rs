@@ -107,7 +107,8 @@ pub fn spawn() -> (Arc<Mutex<State>>, mpsc::Sender<Cmd>) {
                     }
                     shared.lock().unwrap().info = Some(info);
                     if !have_thumb {
-                        if let Some(t) = session.as_ref().and_then(|s| thumbnail(s).ok()) {
+                        // обложка могла прийти от прошлого трека — берём только с меткой текущего
+                        if let Some((t, _, _)) = session.as_ref().and_then(|s| thumbnail(s).ok()).filter(|(_, ti, ar)| thumb_matches(&key, ti, ar)) {
                             have_thumb = true;
                             let mut st = shared.lock().unwrap();
                             st.accent = dominant(&t.2);
@@ -159,9 +160,33 @@ fn poll(s: &Session) -> windows::core::Result<Info> {
     Ok(Info { title, artist, playing, pos, dur, at: Instant::now() })
 }
 
-fn thumbnail(s: &Session) -> Result<(usize, usize, Vec<u8>), String> {
+type Thumb = (usize, usize, Vec<u8>);
+
+/// Ключ трека в том же виде, что строит опрос.
+fn track_key(title: &str, artist: &str) -> String {
+    format!("{}|{}", clean_title(title), clean_artist(artist))
+}
+
+/// Обложка с «сырыми» заголовком и исполнителем относится к текущему треку.
+fn thumb_matches(key: &str, title: &str, artist: &str) -> bool {
+    !key.is_empty() && track_key(title, artist) == key
+}
+
+/// Доля прошедшего трека в 0..1; 0 при неизвестной длительности.
+pub fn track_frac(pos: f64, elapsed: f64, dur: f64, playing: bool) -> f32 {
+    if !(dur > 0.0) {
+        return 0.0;
+    }
+    let at = if playing { pos + elapsed } else { pos };
+    ((at.min(dur) / dur) as f32).clamp(0.0, 1.0)
+}
+
+/// Обложка вместе с заголовком и исполнителем из тех же свойств.
+fn thumbnail(s: &Session) -> Result<(Thumb, String, String), String> {
     let e = |e: windows::core::Error| e.to_string();
     let p = s.TryGetMediaPropertiesAsync().map_err(e)?.get().map_err(e)?;
+    let title = p.Title().map(|t| t.to_string()).unwrap_or_default();
+    let artist = p.Artist().map(|a| a.to_string()).unwrap_or_default();
     let stream = p.Thumbnail().map_err(e)?.OpenReadAsync().map_err(e)?.get().map_err(e)?;
     let size = stream.Size().map_err(e)? as u32;
     if size == 0 || size > 8_000_000 {
@@ -173,7 +198,7 @@ fn thumbnail(s: &Session) -> Result<(usize, usize, Vec<u8>), String> {
     reader.ReadBytes(&mut buf).map_err(e)?;
     let img = image::load_from_memory(&buf).map_err(|e| e.to_string())?;
     let img = img.thumbnail(160, 160).to_rgba8();
-    Ok((img.width() as usize, img.height() as usize, img.into_raw()))
+    Ok(((img.width() as usize, img.height() as usize, img.into_raw()), title, artist))
 }
 
 /// Текст песни с отметками времени с lrclib.net (бесплатно, без ключа).
@@ -245,6 +270,25 @@ pub fn clean_artist(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thumb_only_for_current_track() {
+        assert!(thumb_matches("Song|Band", "Song", "Band"));
+        assert!(!thumb_matches("Song|Band", "Other", "Band"));
+        assert!(thumb_matches("Song|Band", "(3) Song - YouTube", "Band"));
+        assert!(!thumb_matches("", "Song", "Band"));
+    }
+
+    #[test]
+    fn frac_bounds() {
+        assert_eq!(track_frac(10.0, 0.0, 0.0, true), 0.0);
+        assert_eq!(track_frac(10.0, 0.0, f64::NAN, true), 0.0);
+        assert_eq!(track_frac(50.0, 0.0, 100.0, false), 0.5);
+        assert_eq!(track_frac(50.0, 25.0, 100.0, true), 0.75);
+        assert_eq!(track_frac(50.0, 25.0, 100.0, false), 0.5);
+        assert_eq!(track_frac(90.0, 30.0, 100.0, true), 1.0);
+        assert_eq!(track_frac(-5.0, 0.0, 100.0, false), 0.0);
+    }
 
     #[test]
     fn seek_by_click() {

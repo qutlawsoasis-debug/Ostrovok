@@ -259,9 +259,20 @@ pub fn retry_after(fails: u32) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Ответ фонового запроса погоды актуален, только если с тех пор не сменили город.
+pub fn reply_fresh(reply: u64, current: u64) -> bool {
+    reply == current
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stale_reply_dropped() {
+        assert!(reply_fresh(3, 3));
+        assert!(!reply_fresh(2, 3));
+        assert!(!reply_fresh(4, 3));
+    }
     #[test]
     fn empty_texts() {
         assert_eq!(empty_text(false, None).0, "Город не указан");
