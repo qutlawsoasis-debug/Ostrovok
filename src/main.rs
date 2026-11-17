@@ -1048,6 +1048,11 @@ struct App {
     /// самые прожорливые по памяти программы — считаются в стороне, пока открыт «Монитор»
     procs: Arc<Mutex<Vec<(String, u64)>>>,
     procs_at: Instant,
+    /// топ по процессору и прошлый снимок времени процессов, по которому он считается
+    procs_cpu: Arc<Mutex<Vec<(String, f32)>>>,
+    cpu_snap: Arc<Mutex<Option<(std::collections::HashMap<String, u64>, Instant)>>>,
+    /// правая карточка монитора показывает процессор, а не память
+    procs_by_cpu: bool,
     /// самообновление: состояние проверки, время следующей и момент установки
     upd: Arc<Mutex<update::State>>,
     upd_at: Instant,
@@ -1300,6 +1305,9 @@ impl App {
             stats_at: now,
             load_hist: Default::default(),
             procs: Default::default(),
+            procs_cpu: Default::default(),
+            cpu_snap: Default::default(),
+            procs_by_cpu: false,
             procs_at: now.checked_sub(Duration::from_secs(60)).unwrap_or(now),
             upd: Default::default(),
             upd_at: now + Duration::from_secs(15),
@@ -1489,6 +1497,10 @@ impl App {
                 }
                 "todo" => Tab::Todo,
                 "system" => Tab::System,
+                "system-cpu" => {
+                    app.procs_by_cpu = true;
+                    Tab::System
+                }
                 "sound" => Tab::Sound,
                 "settings" => Tab::Settings,
                 _ => Tab::Home,
@@ -5659,9 +5671,18 @@ impl App {
         if self.procs_at.elapsed() > Duration::from_secs(3) {
             self.procs_at = Instant::now();
             let (procs, ctx) = (self.procs.clone(), ui.ctx().clone());
+            let (procs_cpu, snap) = (self.procs_cpu.clone(), self.cpu_snap.clone());
             std::thread::spawn(move || {
                 let list = sys::top_memory(5);
                 *procs.lock().unwrap() = list;
+                // процессор: разница времени процессов с прошлым снимком
+                let (cur, at) = (sys::proc_times(), Instant::now());
+                let prev = snap.lock().unwrap().replace((cur.clone(), at));
+                if let Some((prev, was)) = prev {
+                    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+                    let el = at.duration_since(was).as_nanos() as u64 / 100;
+                    *procs_cpu.lock().unwrap() = sys::cpu_top(&prev, &cur, el, cores, 5);
+                }
                 ctx.request_repaint();
             });
         }
@@ -5720,14 +5741,43 @@ impl App {
 
         // ----- кто занимает память
         glass_chip(&p, right, 18.0, 0.45);
-        p.text(right.min + vec2(14.0, 10.0), Align2::LEFT_TOP, "Больше всего памяти", semi(12.5), FG);
-        let list = self.procs.lock().unwrap().clone();
-        let top = list.first().map_or(1, |l| l.1).max(1) as f32;
+        p.text(right.min + vec2(14.0, 10.0), Align2::LEFT_TOP, "Больше всего", semi(12.5), FG);
+        // переключатель «память · процессор»: пилюля с ползущей подсветкой
+        let seg = Rect::from_min_size(pos2(right.right() - 14.0 - 150.0, right.top() + 8.0), vec2(150.0, 20.0));
+        p.rect_filled(seg, Rounding::same(10.0), rgba(255, 255, 255, 14));
+        let k = ui.ctx().animate_bool_with_time(ui.id().with("procs-seg"), self.procs_by_cpu, 0.18);
+        let half = seg.width() / 2.0;
+        p.rect_filled(Rect::from_min_size(seg.min + vec2(half * k, 0.0), vec2(half, seg.height())), Rounding::same(10.0), rgba(255, 255, 255, 34));
+        for (j, (label, by_cpu)) in [("памяти", false), ("процессора", true)].into_iter().enumerate() {
+            let r = Rect::from_min_size(seg.min + vec2(half * j as f32, 0.0), vec2(half, seg.height()));
+            let resp = ui.interact(r, ui.id().with(("procs-seg", j)), Sense::click());
+            let on = self.procs_by_cpu == by_cpu;
+            p.text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(11.0), if on { FG } else if resp.hovered() { FG.gamma_multiply(0.8) } else { DIM });
+            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !on {
+                self.procs_by_cpu = by_cpu;
+                self.kill_arm = None;
+            }
+        }
+        // строки: имя, доля полоски, подпись справа, красная ли
         let total = (s.mem_total * 1024.0 * 1024.0 * 1024.0).max(1.0);
+        let list: Vec<(String, f32, String, bool)> = if self.procs_by_cpu {
+            let l = self.procs_cpu.lock().unwrap().clone();
+            let top = l.first().map_or(1.0, |x| x.1).max(1e-6);
+            l.into_iter().map(|(name, f)| (name, f / top, if f >= 0.095 { format!("{:.0}%", f * 100.0) } else { format!("{:.1}%", f * 100.0).replace('.', ",") }, f > 0.5)).collect()
+        } else {
+            let l = self.procs.lock().unwrap().clone();
+            let top = l.first().map_or(1, |x| x.1).max(1) as f32;
+            l.into_iter()
+                .map(|(name, bytes)| {
+                    let size = if bytes >= 1 << 30 { format!("{:.1} ГБ", bytes as f64 / (1u64 << 30) as f64).replace('.', ",") } else { format!("{} МБ", bytes >> 20) };
+                    (name, bytes as f32 / top, size, bytes as f64 / total > 0.25)
+                })
+                .collect()
+        };
         let mut kill: Option<String> = None;
-        for (i, (name, bytes)) in list.iter().enumerate() {
+        for (i, (name, frac, size, heavy)) in list.iter().enumerate() {
+            let (frac, size, heavy) = (*frac, size.clone(), *heavy);
             let y = right.top() + 40.0 + i as f32 * 20.5;
-            let size = if *bytes >= 1 << 30 { format!("{:.1} ГБ", *bytes as f64 / (1u64 << 30) as f64).replace('.', ",") } else { format!("{} МБ", bytes >> 20) };
             // строку можно нажать: первый щелчок взводит, второй закрывает программу
             let row_r = Rect::from_min_max(pos2(right.left() + 8.0, y - 10.0), pos2(right.right() - 8.0, y + 10.0));
             let resp = ui.interact(row_r, ui.id().with(("proc", i)), Sense::click());
@@ -5748,9 +5798,8 @@ impl App {
                 .text(pos2(right.left() + 14.0, y), Align2::LEFT_CENTER, name, FontId::proportional(12.5), FG);
             let track = Rect::from_min_max(pos2(right.left() + 130.0, y - 2.5), pos2(right.right() - 74.0, y + 2.5));
             p.rect_filled(track, Rounding::same(2.5), rgba(255, 255, 255, 20));
-            // красным — программа занимает больше четверти всей памяти
-            let heavy = *bytes as f64 / total > 0.25;
-            let fill = Rect::from_min_max(track.min, pos2(track.left() + track.width() * (*bytes as f32 / top).clamp(0.03, 1.0), track.bottom()));
+            // красным — больше четверти всей памяти или больше половины процессора
+            let fill = Rect::from_min_max(track.min, pos2(track.left() + track.width() * frac.clamp(0.03, 1.0), track.bottom()));
             p.rect_filled(fill, Rounding::same(2.5), if heavy { Color32::from_rgb(0xFF, 0x6B, 0x6B) } else { accent() });
             let red = Color32::from_rgb(0xFF, 0x8A, 0x80);
             let (label, color) = if armed { ("ещё раз".to_string(), red) } else if hot { ("закрыть".to_string(), FG) } else { (size, if heavy { red } else { DIM }) };
@@ -5768,7 +5817,8 @@ impl App {
         let up = p.text(net_at, Align2::RIGHT_CENTER, format!("\u{E898} {}", speed(self.net.1)), FontId::proportional(11.0), DIM);
         p.text(pos2(up.left() - 10.0, net_at.y), Align2::RIGHT_CENTER, format!("\u{E896} {}", speed(self.net.0)), FontId::proportional(11.0), FG);
         if list.is_empty() {
-            p.text(right.center(), Align2::CENTER_CENTER, "Считаю…", FontId::proportional(12.0), DIM);
+            let msg = if self.procs_by_cpu && self.cpu_snap.lock().unwrap().is_some() { "Процессор свободен" } else { "Считаю…" };
+            p.text(right.center(), Align2::CENTER_CENTER, msg, FontId::proportional(12.0), DIM);
         }
     }
 
