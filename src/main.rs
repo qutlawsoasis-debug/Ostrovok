@@ -9207,7 +9207,7 @@ fn view_to_image(a: Pos2, b: Pos2, img: Rect, size: (usize, usize)) -> Option<[u
 /// Не вышло (диск полон, нет прав) — временный файл убираем.
 fn save_png_atomic(out: &std::path::Path, px: &[u8], w: usize, h: usize) -> Result<(), String> {
     let (Ok(w32), Ok(h32)) = (u32::try_from(w), u32::try_from(h)) else { return Err("слишком большой снимок".into()) };
-    if w == 0 || h == 0 || px.len() != w * h * 4 {
+    if w == 0 || h == 0 || w.checked_mul(h).and_then(|n| n.checked_mul(4)) != Some(px.len()) {
         return Err("неверный размер снимка".into());
     }
     let tmp = out.with_extension(format!("{}.tmp", std::process::id()));
