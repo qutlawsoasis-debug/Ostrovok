@@ -25,14 +25,12 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const WIN_W: f32 = 780.0;
-const WIN_H: f32 = 680.0;
 const AI_H: f32 = 620.0;
 /// Способ размытия фона по умолчанию: acrylic, blur или off.
 const DEFAULT_BLUR: &str = "off";
 const TOP: f32 = 6.0;
 const PILL_H: f32 = 36.0;
 const PANEL_W: f32 = 700.0;
-const PANEL_H: f32 = 318.0;
 const ROW_H: f32 = 34.0;
 
 const FG: Color32 = Color32::from_rgb(250, 250, 252);
@@ -99,10 +97,6 @@ fn contour(rect: Rect, r: f32, inset: f32, n: usize) -> Vec<(Pos2, Vec2)> {
 fn test_mode() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("OSTROVOK_TEST").is_some())
-}
-
-fn card() -> Color32 {
-    tint(18)
 }
 
 /// Пружина: значение догоняет цель и немного колеблется. Параметры и шаг — как в Atoll (Services/Spring.cs, MIT).
@@ -870,8 +864,6 @@ struct App {
     mode: Mode,
     tab: Tab,
     size: Vec2,
-    lean: Vec2,
-    grow: f32,
     passthrough: Option<bool>,
     hidden: bool,
     outside_since: Option<Instant>,
@@ -1196,8 +1188,6 @@ impl App {
             mode: Mode::Pill,
             tab: Tab::Home,
             size: vec2(150.0, PILL_H),
-            lean: Vec2::ZERO,
-            grow: 0.0,
             passthrough: None,
             hidden: false,
             outside_since: None,
@@ -1962,9 +1952,8 @@ impl App {
                 self.notify("Заметка сохранена");
             }
             Action::Quick(Quick::Remind(text, at)) => {
-                use chrono::TimeZone;
-                // .earliest(): в ночь перевода часов время 02:30 бывает дважды — берём первое
-                match chrono::Local.from_local_datetime(&at).earliest() {
+                // в ночь перевода часов 02:30 бывает дважды (берём первое) или не бывает вовсе (03:30)
+                match resolve_here(at) {
                     Some(t) => {
                         self.cfg.reminders.push(store::Reminder { text, at: t.timestamp(), repeat: 0 });
                         self.cfg.reminders.sort_by_key(|r| r.at);
@@ -2293,7 +2282,7 @@ impl App {
             for r in self.cfg.reminders.iter_mut().filter(|r| r.at <= stamp && r.repeat != 0) {
                 let next = chrono::DateTime::from_timestamp(r.at, 0)
                     .and_then(|d| next_due(d.with_timezone(&chrono::Local).naive_local(), r.repeat, now_local))
-                    .and_then(|n| n.and_local_timezone(chrono::Local).earliest());
+                    .and_then(resolve_here);
                 match next {
                     Some(n) => r.at = n.timestamp(),
                     None => r.repeat = 0,
@@ -3102,7 +3091,7 @@ impl App {
     }
 
     fn add_reminder(&mut self) {
-        use chrono::{Local, NaiveTime, TimeZone};
+        use chrono::{Local, NaiveTime};
         let text = self.remind_text.trim().to_string();
         let spec = self.remind_time.trim().replace(',', ".");
         if text.is_empty() {
@@ -3113,7 +3102,7 @@ impl App {
         let at = if let Ok(time) = NaiveTime::parse_from_str(&spec, "%H:%M") {
             let today = now.date_naive().and_time(time);
             let day = if today <= now.naive_local() { today + chrono::Duration::days(1) } else { today };
-            Local.from_local_datetime(&day).single().map(|d| d.timestamp())
+            resolve_here(day).map(|d| d.timestamp())
         } else {
             spec.trim_start_matches('+').parse::<f64>().ok().filter(|m| *m > 0.0 && *m < 60.0 * 24.0 * 30.0).map(|m| now.timestamp() + (m * 60.0) as i64)
         };
@@ -4557,7 +4546,7 @@ impl App {
                 }
             }
             p.add(egui::Shape::mesh(mesh));
-            p.add(egui::Shape::line(line, Stroke::new(2.2, c)));
+            p.add(egui::Shape::line(line, Stroke::new(2.2_f32, c)));
             for (i, h) in w.hours.iter().enumerate() {
                 let x = px(i as f32);
                 // осадки: столбик тем выше и ярче, чем вероятнее
@@ -6055,7 +6044,7 @@ impl App {
 
     /// Обзор → Календарь: слева месяц (дни с делами отмечены точкой), справа — выбранный день и его напоминания.
     fn ui_calendar(&mut self, ui: &mut egui::Ui) {
-        use chrono::{Datelike, Local, NaiveDate, NaiveTime, TimeZone};
+        use chrono::{Datelike, Local, NaiveDate, NaiveTime};
         const MONTHS: [&str; 12] =
             ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"];
         const OF_MONTH: [&str; 12] =
@@ -6123,12 +6112,12 @@ impl App {
                     p.circle_filled(at, 13.0, accent());
                 } else if is_sel {
                     p.circle_filled(at, 13.0, rgba(255, 255, 255, 26));
-                    p.circle_stroke(at, 13.0, Stroke::new(1.5, accent()));
+                    p.circle_stroke(at, 13.0, Stroke::new(1.5_f32, accent()));
                 } else if hov > 0.0 {
                     p.circle_filled(at, 13.0, rgba(255, 255, 255, (26.0 * hov) as u8));
                 }
                 if is_today && is_sel && self.cal_sel.is_some() {
-                    p.circle_stroke(at, 15.5, Stroke::new(1.2, accent()));
+                    p.circle_stroke(at, 15.5, Stroke::new(1.2_f32, accent()));
                 }
                 let color = if is_today {
                     BG
@@ -6224,7 +6213,7 @@ impl App {
             let text = self.cal_text.trim().to_string();
             let spec = self.cal_time.trim().replace(['.', ',', ' '], ":");
             let time = if spec.is_empty() { NaiveTime::from_hms_opt(9, 0, 0) } else { NaiveTime::parse_from_str(&spec, "%H:%M").ok() };
-            let at = time.and_then(|t| Local.from_local_datetime(&sel.and_time(t)).single()).map(|d| d.timestamp());
+            let at = time.and_then(|t| resolve_here(sel.and_time(t))).map(|d| d.timestamp());
             match at {
                 _ if text.is_empty() => self.notify("Впишите, о чём напомнить"),
                 None => self.notify("Не понял время: напишите, например, 18:30"),
@@ -6328,7 +6317,7 @@ impl App {
         let plot = Rect::from_min_max(left.min + vec2(14.0, 34.0), left.max - vec2(14.0, 26.0));
         for k in 0..=2 {
             let y = plot.bottom() - plot.height() * k as f32 / 2.0;
-            p.line_segment([pos2(plot.left(), y), pos2(plot.right(), y)], Stroke::new(1.0, rgba(255, 255, 255, 14)));
+            p.line_segment([pos2(plot.left(), y), pos2(plot.right(), y)], Stroke::new(1.0_f32, rgba(255, 255, 255, 14)));
         }
         let n = self.load_hist.len();
         if n >= 2 {
@@ -6356,7 +6345,7 @@ impl App {
                     }
                 }
                 p.add(egui::Shape::mesh(mesh));
-                p.add(egui::Shape::line(pts, Stroke::new(1.8, color)));
+                p.add(egui::Shape::line(pts, Stroke::new(1.8_f32, color)));
             }
         } else {
             p.text(plot.center(), Align2::CENTER_CENTER, "Собираю данные…", FontId::proportional(12.0), DIM);
@@ -8032,6 +8021,66 @@ fn timer_minutes_ok(m: f64) -> bool {
 /// Демо отложенного сна: секунд до срока, без ухода в минус при 0 минут.
 fn power_demo_secs(m: u64) -> u64 {
     m.saturating_mul(60).saturating_sub(19)
+}
+
+/// Местное время → момент с учётом перевода часов: в двусмысленный час — первый из двух,
+/// в несуществующий (весной) — на час позже. `lookup` — пояс (обычно `Local`), чтобы тестировать без машины.
+fn resolve_local<T>(n: chrono::NaiveDateTime, lookup: impl Fn(chrono::NaiveDateTime) -> chrono::LocalResult<T>) -> Option<T> {
+    match lookup(n) {
+        chrono::LocalResult::Single(d) => Some(d),
+        chrono::LocalResult::Ambiguous(a, _) => Some(a),
+        chrono::LocalResult::None => lookup(n + chrono::Duration::hours(1)).earliest(),
+    }
+}
+
+/// То же для пояса машины.
+fn resolve_here(n: chrono::NaiveDateTime) -> Option<chrono::DateTime<chrono::Local>> {
+    use chrono::TimeZone;
+    resolve_local(n, |x| chrono::Local.from_local_datetime(&x))
+}
+
+#[cfg(test)]
+mod dst_tests {
+    use super::*;
+    use chrono::{FixedOffset, LocalResult, NaiveDateTime, TimeZone};
+    fn t(y: i32, m: u32, d: u32, h: u32, mi: u32) -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, mi, 0).unwrap()
+    }
+    /// Берлин 2026 без привязки к поясу машины: 29.03 02:00–03:00 нет, 25.10 02:00–03:00 дважды.
+    fn berlin(n: NaiveDateTime) -> LocalResult<chrono::DateTime<FixedOffset>> {
+        let (cet, cest) = (FixedOffset::east_opt(3600).unwrap(), FixedOffset::east_opt(7200).unwrap());
+        let (gap0, gap1) = (t(2026, 3, 29, 2, 0), t(2026, 3, 29, 3, 0));
+        let (amb0, amb1) = (t(2026, 10, 25, 2, 0), t(2026, 10, 25, 3, 0));
+        if n >= gap0 && n < gap1 {
+            LocalResult::None
+        } else if n >= amb0 && n < amb1 {
+            LocalResult::Ambiguous(cest.from_local_datetime(&n).unwrap(), cet.from_local_datetime(&n).unwrap())
+        } else if n >= gap1 && n < amb0 {
+            cest.from_local_datetime(&n)
+        } else {
+            cet.from_local_datetime(&n)
+        }
+    }
+    #[test]
+    fn gap_moves_hour_forward() {
+        let d = resolve_local(t(2026, 3, 29, 2, 30), berlin).unwrap();
+        assert_eq!(d.naive_local(), t(2026, 3, 29, 3, 30));
+    }
+    #[test]
+    fn ambiguous_takes_earliest() {
+        let d = resolve_local(t(2026, 10, 25, 2, 30), berlin).unwrap();
+        assert_eq!(d.offset().local_minus_utc(), 7200);
+        assert_eq!(resolve_local(t(2026, 11, 1, 9, 0), berlin).unwrap().naive_local(), t(2026, 11, 1, 9, 0));
+    }
+    #[test]
+    fn daily_repeat_through_dst_days_survives() {
+        // напоминание каждый день в 02:30: ни 29.03, ни 25.10 не теряются
+        let next = next_due(t(2026, 3, 28, 2, 30), 1, t(2026, 3, 28, 2, 31)).unwrap();
+        let at = resolve_local(next, berlin).unwrap();
+        assert!(at.timestamp() > berlin(t(2026, 3, 28, 2, 31)).single().unwrap().timestamp());
+        let next = next_due(t(2026, 10, 24, 2, 30), 1, t(2026, 10, 24, 2, 31)).unwrap();
+        assert!(resolve_local(next, berlin).is_some());
+    }
 }
 
 #[cfg(test)]

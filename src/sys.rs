@@ -385,6 +385,7 @@ impl CpuMeter {
 
 /// Открывает сайт чата компактным окном без вкладок в браузере пользователя (там уже есть его вход в аккаунт).
 /// Если браузер по умолчанию не умеет такой режим, сайт открывается обычной вкладкой.
+#[allow(dead_code)] // запасной помощник: сейчас не вызывается
 pub fn open_chat_window(url: &str) {
     use winreg::{enums::*, RegKey};
     let exe = (|| -> Option<String> {
@@ -433,6 +434,7 @@ pub fn we_are_foreground() -> bool {
 
 /// Обрезает окно по форме острова (скруглённый прямоугольник, в пикселях окна).
 /// Системное размытие фона и щелчки мыши действуют только внутри этой формы.
+#[allow(dead_code)] // запасной помощник: сейчас не вызывается
 pub fn set_region(hwnd: isize, left: i32, top: i32, right: i32, bottom: i32, radius: i32) {
     unsafe {
         let rgn = CreateRoundRectRgn(left, top, right + 1, bottom + 1, radius * 2, radius * 2);
@@ -535,6 +537,7 @@ pub fn power(action: &str) {
 }
 
 /// Скрывает окно от захвата экрана: остров может «видеть» то, что под ним, и не попадает в собственный снимок.
+#[allow(dead_code)] // запасной помощник: сейчас не вызывается
 pub fn exclude_from_capture(hwnd: isize) -> bool {
     unsafe { SetWindowDisplayAffinity(HWND(hwnd as *mut core::ffi::c_void), WDA_EXCLUDEFROMCAPTURE).is_ok() }
 }
