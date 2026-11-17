@@ -1962,9 +1962,8 @@ impl App {
                 self.notify("Заметка сохранена");
             }
             Action::Quick(Quick::Remind(text, at)) => {
-                use chrono::TimeZone;
-                // .earliest(): в ночь перевода часов время 02:30 бывает дважды — берём первое
-                match chrono::Local.from_local_datetime(&at).earliest() {
+                // в ночь перевода часов 02:30 бывает дважды (берём первое) или не бывает вовсе (03:30)
+                match resolve_here(at) {
                     Some(t) => {
                         self.cfg.reminders.push(store::Reminder { text, at: t.timestamp(), repeat: 0 });
                         self.cfg.reminders.sort_by_key(|r| r.at);
@@ -2293,7 +2292,7 @@ impl App {
             for r in self.cfg.reminders.iter_mut().filter(|r| r.at <= stamp && r.repeat != 0) {
                 let next = chrono::DateTime::from_timestamp(r.at, 0)
                     .and_then(|d| next_due(d.with_timezone(&chrono::Local).naive_local(), r.repeat, now_local))
-                    .and_then(|n| n.and_local_timezone(chrono::Local).earliest());
+                    .and_then(resolve_here);
                 match next {
                     Some(n) => r.at = n.timestamp(),
                     None => r.repeat = 0,
@@ -3102,7 +3101,7 @@ impl App {
     }
 
     fn add_reminder(&mut self) {
-        use chrono::{Local, NaiveTime, TimeZone};
+        use chrono::{Local, NaiveTime};
         let text = self.remind_text.trim().to_string();
         let spec = self.remind_time.trim().replace(',', ".");
         if text.is_empty() {
@@ -3113,7 +3112,7 @@ impl App {
         let at = if let Ok(time) = NaiveTime::parse_from_str(&spec, "%H:%M") {
             let today = now.date_naive().and_time(time);
             let day = if today <= now.naive_local() { today + chrono::Duration::days(1) } else { today };
-            Local.from_local_datetime(&day).single().map(|d| d.timestamp())
+            resolve_here(day).map(|d| d.timestamp())
         } else {
             spec.trim_start_matches('+').parse::<f64>().ok().filter(|m| *m > 0.0 && *m < 60.0 * 24.0 * 30.0).map(|m| now.timestamp() + (m * 60.0) as i64)
         };
@@ -6055,7 +6054,7 @@ impl App {
 
     /// Обзор → Календарь: слева месяц (дни с делами отмечены точкой), справа — выбранный день и его напоминания.
     fn ui_calendar(&mut self, ui: &mut egui::Ui) {
-        use chrono::{Datelike, Local, NaiveDate, NaiveTime, TimeZone};
+        use chrono::{Datelike, Local, NaiveDate, NaiveTime};
         const MONTHS: [&str; 12] =
             ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"];
         const OF_MONTH: [&str; 12] =
@@ -6224,7 +6223,7 @@ impl App {
             let text = self.cal_text.trim().to_string();
             let spec = self.cal_time.trim().replace(['.', ',', ' '], ":");
             let time = if spec.is_empty() { NaiveTime::from_hms_opt(9, 0, 0) } else { NaiveTime::parse_from_str(&spec, "%H:%M").ok() };
-            let at = time.and_then(|t| Local.from_local_datetime(&sel.and_time(t)).single()).map(|d| d.timestamp());
+            let at = time.and_then(|t| resolve_here(sel.and_time(t))).map(|d| d.timestamp());
             match at {
                 _ if text.is_empty() => self.notify("Впишите, о чём напомнить"),
                 None => self.notify("Не понял время: напишите, например, 18:30"),
@@ -8032,6 +8031,66 @@ fn timer_minutes_ok(m: f64) -> bool {
 /// Демо отложенного сна: секунд до срока, без ухода в минус при 0 минут.
 fn power_demo_secs(m: u64) -> u64 {
     m.saturating_mul(60).saturating_sub(19)
+}
+
+/// Местное время → момент с учётом перевода часов: в двусмысленный час — первый из двух,
+/// в несуществующий (весной) — на час позже. `lookup` — пояс (обычно `Local`), чтобы тестировать без машины.
+fn resolve_local<T>(n: chrono::NaiveDateTime, lookup: impl Fn(chrono::NaiveDateTime) -> chrono::LocalResult<T>) -> Option<T> {
+    match lookup(n) {
+        chrono::LocalResult::Single(d) => Some(d),
+        chrono::LocalResult::Ambiguous(a, _) => Some(a),
+        chrono::LocalResult::None => lookup(n + chrono::Duration::hours(1)).earliest(),
+    }
+}
+
+/// То же для пояса машины.
+fn resolve_here(n: chrono::NaiveDateTime) -> Option<chrono::DateTime<chrono::Local>> {
+    use chrono::TimeZone;
+    resolve_local(n, |x| chrono::Local.from_local_datetime(&x))
+}
+
+#[cfg(test)]
+mod dst_tests {
+    use super::*;
+    use chrono::{FixedOffset, LocalResult, NaiveDateTime, TimeZone};
+    fn t(y: i32, m: u32, d: u32, h: u32, mi: u32) -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, mi, 0).unwrap()
+    }
+    /// Берлин 2026 без привязки к поясу машины: 29.03 02:00–03:00 нет, 25.10 02:00–03:00 дважды.
+    fn berlin(n: NaiveDateTime) -> LocalResult<chrono::DateTime<FixedOffset>> {
+        let (cet, cest) = (FixedOffset::east_opt(3600).unwrap(), FixedOffset::east_opt(7200).unwrap());
+        let (gap0, gap1) = (t(2026, 3, 29, 2, 0), t(2026, 3, 29, 3, 0));
+        let (amb0, amb1) = (t(2026, 10, 25, 2, 0), t(2026, 10, 25, 3, 0));
+        if n >= gap0 && n < gap1 {
+            LocalResult::None
+        } else if n >= amb0 && n < amb1 {
+            LocalResult::Ambiguous(cest.from_local_datetime(&n).unwrap(), cet.from_local_datetime(&n).unwrap())
+        } else if n >= gap1 && n < amb0 {
+            cest.from_local_datetime(&n)
+        } else {
+            cet.from_local_datetime(&n)
+        }
+    }
+    #[test]
+    fn gap_moves_hour_forward() {
+        let d = resolve_local(t(2026, 3, 29, 2, 30), berlin).unwrap();
+        assert_eq!(d.naive_local(), t(2026, 3, 29, 3, 30));
+    }
+    #[test]
+    fn ambiguous_takes_earliest() {
+        let d = resolve_local(t(2026, 10, 25, 2, 30), berlin).unwrap();
+        assert_eq!(d.offset().local_minus_utc(), 7200);
+        assert_eq!(resolve_local(t(2026, 11, 1, 9, 0), berlin).unwrap().naive_local(), t(2026, 11, 1, 9, 0));
+    }
+    #[test]
+    fn daily_repeat_through_dst_days_survives() {
+        // напоминание каждый день в 02:30: ни 29.03, ни 25.10 не теряются
+        let next = next_due(t(2026, 3, 28, 2, 30), 1, t(2026, 3, 28, 2, 31)).unwrap();
+        let at = resolve_local(next, berlin).unwrap();
+        assert!(at.timestamp() > berlin(t(2026, 3, 28, 2, 31)).single().unwrap().timestamp());
+        let next = next_due(t(2026, 10, 24, 2, 30), 1, t(2026, 10, 24, 2, 31)).unwrap();
+        assert!(resolve_local(next, berlin).is_some());
+    }
 }
 
 #[cfg(test)]
