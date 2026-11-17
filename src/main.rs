@@ -1462,7 +1462,7 @@ impl App {
             }
             // проверка вида пилюли без плеера: OSTROVOK_TRACK=«название»
             if let (None, Ok(t)) = (&self.media_now, std::env::var("OSTROVOK_TRACK")) {
-                self.media_now = Some(media::Info { title: media::clean_title(&t), artist: "Исполнитель".into(), playing: true, pos: 64.0, dur: 200.0, at: Instant::now() });
+                self.media_now = Some(media::Info { title: media::clean_title(t.split(" — ").next().unwrap_or(&t)), artist: t.split_once(" — ").map_or("Исполнитель".into(), |p| p.1.to_string()), playing: true, pos: 64.0, dur: 200.0, at: Instant::now() });
             }
             if st.thumb_gen != self.thumb_gen {
                 self.thumb_gen = st.thumb_gen;
