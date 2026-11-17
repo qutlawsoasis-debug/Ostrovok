@@ -120,6 +120,9 @@ pub struct Todo {
     pub text: String,
     #[serde(default)]
     pub done: bool,
+    /// срок «ГГГГ-ММ-ДД», если указан
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

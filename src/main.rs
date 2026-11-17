@@ -1394,7 +1394,16 @@ impl App {
             }
         }
         if test_mode() && std::env::var_os("OSTROVOK_TODO").is_some() {
-            app.cfg.todos = [("Купить хлеб и молоко", false), ("Ответить Мирону", false), ("Оплатить интернет", true), ("Записаться к врачу", false)].map(|(t, done)| store::Todo { text: t.to_string(), done }).to_vec();
+            let today = chrono::Local::now().date_naive();
+            app.cfg.todos = [
+                ("Обновить драйверы видеокарты", false, Some(-1)),
+                ("Сделать резервную копию диска D", false, Some(0)),
+                ("Купить SSD на 2 ТБ", false, Some(3)),
+                ("Почистить автозагрузку", false, None),
+                ("Продлить антивирус", true, Some(-3)),
+            ]
+            .map(|(t, done, d): (&str, bool, Option<i64>)| store::Todo { text: t.to_string(), done, due: d.map(|d| (today + chrono::Duration::days(d)).format("%Y-%m-%d").to_string()) })
+            .to_vec();
         }
         if test_mode() && std::env::var_os("OSTROVOK_SHELF").is_some() {
             app.cfg.shelf = ["C:\\Windows\\explorer.exe", "C:\\Windows\\System32\\notepad.exe", "C:\\Windows\\win.ini", "C:\\Windows\\Fonts", "C:\\нет\\такого.txt"].map(String::from).to_vec();
@@ -1811,7 +1820,7 @@ impl App {
                 self.ask(q);
             }
             Action::Quick(Quick::Todo(text)) => {
-                self.cfg.todos.insert(0, store::Todo { text, done: false });
+                self.cfg.todos.insert(0, new_todo(&text));
                 self.cfg.todos.truncate(60);
                 self.cfg.save();
                 self.notify("Дело добавлено");
@@ -2905,7 +2914,7 @@ impl App {
             let r = ui.add(
                 egui::TextEdit::singleline(&mut self.todo_edit)
                     .margin(egui::Margin::symmetric(9.0, 7.0))
-                    .hint_text(RichText::new("Что нужно сделать").color(DIM))
+                    .hint_text(RichText::new("Что сделать · «до пятницы», «завтра», «до 5.12»").color(DIM))
                     .desired_width(ui.available_width() - 112.0),
             );
             let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -2917,7 +2926,7 @@ impl App {
         if add {
             let text = self.todo_edit.trim().to_string();
             if !text.is_empty() {
-                self.cfg.todos.insert(0, store::Todo { text, done: false });
+                self.cfg.todos.insert(0, new_todo(&text));
                 self.cfg.todos.truncate(60);
                 self.todo_edit.clear();
                 self.cfg.save();
@@ -2963,10 +2972,17 @@ impl App {
         let (mut toggle, mut remove) = (None, None);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
-            // сначала несделанные, потом сделанные; внутри — в порядке добавления
-            let order: Vec<usize> = (0..self.cfg.todos.len()).filter(|i| !self.cfg.todos[*i].done).chain((0..self.cfg.todos.len()).filter(|i| self.cfg.todos[*i].done)).collect();
+            // сначала несделанные со сроком (ближайший выше), потом без срока, потом сделанные
+            let today = chrono::Local::now().date_naive();
+            let due_of = |t: &store::Todo| t.due.as_deref().and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+            let mut order: Vec<usize> = (0..self.cfg.todos.len()).collect();
+            order.sort_by_key(|i| {
+                let t = &self.cfg.todos[*i];
+                (t.done, t.done || due_of(t).is_none(), if t.done { None } else { due_of(t) })
+            });
             for i in order {
                 let item = &self.cfg.todos[i];
+                let due = due_of(item).map(|d| due_label(d, today));
                 let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 6.0, 38.0), Sense::click());
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
                 let k = ui.ctx().animate_bool_with_time(ui.id().with(("todo-done", &item.text)), item.done, 0.16);
@@ -2980,11 +2996,24 @@ impl App {
                     p.circle_filled(c, 8.5 * k, a);
                     p.text(c, Align2::CENTER_CENTER, "\u{E73E}", FontId::proportional(9.5), Color32::from_rgba_unmultiplied(16, 14, 28, (k * 255.0) as u8));
                 }
+                // срок — капсула справа: просрочено красным, сегодня оранжевым, остальное тихо
+                let mut text_end = row.right() - 34.0;
+                if let Some((label, level)) = &due {
+                    let col = if item.done { DIM } else {
+                        match level { 2 => Color32::from_rgb(0xFF, 0x6B, 0x6B), 1 => Color32::from_rgb(0xFF, 0xB3, 0x40), _ => mix(DIM, FG, 0.35) }
+                    };
+                    let g = p.layout_no_wrap(label.clone(), FontId::proportional(11.5), col);
+                    let cap = Rect::from_min_size(pos2(text_end - g.size().x - 18.0, row.center().y - 10.0), vec2(g.size().x + 18.0, 20.0));
+                    let a = if *level > 0 && !item.done { 40 } else { 16 };
+                    p.rect_filled(cap, Rounding::same(10.0), Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), a));
+                    p.galley(cap.center() - g.size() / 2.0, g, col);
+                    text_end = cap.left() - 8.0;
+                }
                 let text = p
-                    .with_clip_rect(Rect::from_min_max(pos2(row.left() + 40.0, row.top()), pos2(row.right() - 34.0, row.bottom())))
+                    .with_clip_rect(Rect::from_min_max(pos2(row.left() + 40.0, row.top()), pos2(text_end, row.bottom())))
                     .text(pos2(row.left() + 40.0, row.center().y), Align2::LEFT_CENTER, &item.text, FontId::proportional(13.5), mix(FG, DIM, k));
                 if k > 0.0 {
-                    let end = text.left() + text.width().min(row.right() - 34.0 - text.left()) * k;
+                    let end = text.left() + text.width().min(text_end - text.left()) * k;
                     p.line_segment([pos2(text.left(), row.center().y + 1.0), pos2(end, row.center().y + 1.0)], Stroke::new(1.2_f32, DIM));
                 }
                 let x = Rect::from_center_size(pos2(row.right() - 16.0, row.center().y), vec2(24.0, 24.0));
@@ -7159,6 +7188,107 @@ fn battery_seg(b: Option<(u8, bool)>) -> Option<(u8, bool)> {
 
 fn battery_rgb(pct: u8, charging: bool) -> [u8; 3] {
     if charging { BATT_GREEN } else if pct <= 10 { BATT_RED } else { BATT_ORANGE }
+}
+
+/// Срок в конце текста дела: «сегодня», «завтра», «послезавтра», «до пятницы», «до 5.12».
+/// Возвращает текст без срока и дату; если срока нет — текст как есть.
+fn parse_due(text: &str, today: chrono::NaiveDate) -> (String, Option<chrono::NaiveDate>) {
+    use chrono::Datelike;
+    let plain = (text.trim().to_string(), None);
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let Some(last) = words.last() else { return plain };
+    let low = last.to_lowercase();
+    let low = low.trim_end_matches(['.', '!', ',']);
+    let date = match low {
+        "сегодня" => Some(today),
+        "завтра" => today.succ_opt(),
+        "послезавтра" => today.succ_opt().and_then(|d| d.succ_opt()),
+        _ => {
+            const WD: [&str; 7] = ["понедельника", "вторника", "среды", "четверга", "пятницы", "субботы", "воскресенья"];
+            if let Some(k) = WD.iter().position(|w| *w == low) {
+                let now = today.weekday().num_days_from_monday() as i64;
+                let ahead = (k as i64 - now).rem_euclid(7);
+                Some(today + chrono::Duration::days(if ahead == 0 { 7 } else { ahead }))
+            } else if let Some((dd, mm)) = low.split_once('.') {
+                match (dd.parse::<u32>(), mm.parse::<u32>()) {
+                    (Ok(dd), Ok(mm)) => chrono::NaiveDate::from_ymd_opt(today.year(), mm, dd).map(|d| if d < today { chrono::NaiveDate::from_ymd_opt(today.year() + 1, mm, dd).unwrap_or(d) } else { d }),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+    };
+    let Some(date) = date else { return plain };
+    // числа и дни недели — только после «до»; «сегодня/завтра» можно и без него
+    let needs_do = !matches!(low, "сегодня" | "завтра" | "послезавтра");
+    let mut keep = words.len() - 1;
+    if keep > 0 && words[keep - 1].to_lowercase() == "до" {
+        keep -= 1;
+    } else if needs_do {
+        return plain;
+    }
+    if keep == 0 {
+        return plain;
+    }
+    (words[..keep].join(" "), Some(date))
+}
+
+/// Подпись срока и тревога: 0 — спокойно, 1 — сегодня, 2 — просрочено.
+fn due_label(due: chrono::NaiveDate, today: chrono::NaiveDate) -> (String, u8) {
+    use chrono::Datelike;
+    let days = (due - today).num_days();
+    match days {
+        0 => ("сегодня".into(), 1),
+        d if d < 0 => (format!("просрочено {} д", -d), 2),
+        1 => ("завтра".into(), 0),
+        _ => {
+            const WD: [&str; 7] = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"];
+            const MON: [&str; 12] = ["янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "нояб", "дек"];
+            (format!("{}, {} {}", WD[due.weekday().num_days_from_monday() as usize], due.day(), MON[due.month0() as usize]), 0)
+        }
+    }
+}
+
+/// Новое дело из строки: срок вынимается из текста.
+fn new_todo(text: &str) -> store::Todo {
+    let (text, due) = parse_due(text, chrono::Local::now().date_naive());
+    store::Todo { text, done: false, due: due.map(|d| d.format("%Y-%m-%d").to_string()) }
+}
+
+#[cfg(test)]
+mod due_tests {
+    use super::*;
+    fn d(m: u32, day: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, m, day).unwrap()
+    }
+    // 17 ноября 2026 — вторник
+    #[test]
+    fn parse_words() {
+        let t = d(11, 17);
+        assert_eq!(parse_due("Обновить драйверы сегодня", t), ("Обновить драйверы".into(), Some(t)));
+        assert_eq!(parse_due("Бэкап завтра", t), ("Бэкап".into(), Some(d(11, 18))));
+        assert_eq!(parse_due("Бэкап до послезавтра", t), ("Бэкап".into(), Some(d(11, 19))));
+        assert_eq!(parse_due("Купить SSD до пятницы", t), ("Купить SSD".into(), Some(d(11, 20))));
+        assert_eq!(parse_due("Чистка до вторника", t), ("Чистка".into(), Some(d(11, 24))));
+        assert_eq!(parse_due("Сдать отчёт до 5.12", t), ("Сдать отчёт".into(), Some(d(12, 5))));
+        assert_eq!(parse_due("Продлить домен до 01.03", t), ("Продлить домен".into(), Some(chrono::NaiveDate::from_ymd_opt(2027, 3, 1).unwrap())));
+    }
+    #[test]
+    fn parse_leaves_plain_text() {
+        let t = d(11, 17);
+        assert_eq!(parse_due("Переустановить Windows", t), ("Переустановить Windows".into(), None));
+        assert_eq!(parse_due("завтра", t), ("завтра".into(), None));
+        assert_eq!(parse_due("Разобраться до 31.02", t), ("Разобраться до 31.02".into(), None));
+    }
+    #[test]
+    fn labels() {
+        let t = d(11, 17);
+        assert_eq!(due_label(t, t), ("сегодня".into(), 1));
+        assert_eq!(due_label(d(11, 18), t), ("завтра".into(), 0));
+        assert_eq!(due_label(d(11, 15), t), ("просрочено 2 д".into(), 2));
+        assert_eq!(due_label(d(11, 20), t), ("пт, 20 нояб".into(), 0));
+    }
 }
 
 #[cfg(test)]
