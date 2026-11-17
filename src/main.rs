@@ -5255,10 +5255,11 @@ impl App {
                 }
                 // мини-пилюля: как остров будет выглядеть в теме под курсором (или в выбранной)
                 ui.add_space(6.0);
-                let w = ui.available_width().clamp(96.0, 150.0);
-                let (r, _) = ui.allocate_exact_size(vec2(w, 28.0), Sense::hover());
                 let idx = theme_preview_idx(hovered, cur);
                 let t = &THEMES[idx];
+                // ширина — под самое длинное название, чтобы пилюля не прыгала и не вылезала из колонки
+                let name_w = THEMES.iter().map(|t| ui.painter().layout_no_wrap(t.name.to_string(), semi(11.5), FG).size().x).fold(0.0, f32::max);
+                let (r, _) = ui.allocate_exact_size(vec2(theme_preview_w(name_w).min(ui.available_width()), 28.0), Sense::hover());
                 let fade = |key: &str, v: u8| ui.ctx().animate_value_with_time(ui.id().with(("tp", key)), v as f32, 0.18) as u8;
                 let [gr, gg, gb] = t.glass;
                 let glass = Color32::from_rgb(fade("gr", gr), fade("gg", gg), fade("gb", gb));
@@ -5269,9 +5270,7 @@ impl App {
                 for dx in [11.0, 18.0] {
                     p.rect_filled(Rect::from_center_size(pos2(r.left() + dx, r.center().y), vec2(3.5, 7.0)), Rounding::same(1.8), Color32::WHITE);
                 }
-                let tm = p.text(pos2(r.left() + 28.0, r.center().y), Align2::LEFT_CENTER, "12:34", semi(12.0), FG);
-                p.with_clip_rect(Rect::from_min_max(pos2(tm.right() + 6.0, r.top()), pos2(r.right() - 8.0, r.bottom())))
-                    .text(pos2(r.right() - 10.0, r.center().y), Align2::RIGHT_CENTER, t.name, semi(11.5), a);
+                p.text(pos2(r.left() + 28.0, r.center().y), Align2::LEFT_CENTER, t.name, semi(11.5), a);
             });
             ui.add_space(4.0);
             head(ui, "ПЕРСОНАЖ");
@@ -7439,9 +7438,20 @@ fn glass_shade(g: [u8; 3]) -> [u8; 3] {
     g.map(|c| c.saturating_mul(3))
 }
 
+/// Ширина мини-пилюли: глаза слева (28), название, поле справа (12).
+fn theme_preview_w(name_w: f32) -> f32 {
+    28.0 + name_w + 12.0
+}
+
 #[cfg(test)]
 mod theme_preview_tests {
     use super::*;
+    #[test]
+    fn width_fits_column() {
+        assert_eq!(theme_preview_w(60.0), 100.0);
+        // шесть кружков по 30 + отступы + пилюля для самого длинного названия (~60 px) — меньше половины панели
+        assert!(6.0 * 30.0 + 5.0 * 8.0 + 6.0 + theme_preview_w(60.0) < PANEL_W / 2.0 - 20.0);
+    }
     #[test]
     fn picks_hovered_or_current() {
         assert_eq!(theme_preview_idx(Some(3), 0), 3);
