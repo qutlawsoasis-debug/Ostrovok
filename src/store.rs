@@ -374,11 +374,23 @@ mod check_tests {
         assert_eq!(append_check(""), "- [ ] ");
         assert_eq!(append_check("T\n\n"), "T\n- [ ] ");
     }
+    #[test]
+    fn run_value_quotes_spaces_and_cyrillic() {
+        let p = std::path::Path::new(r"C:\Program Files\Островок\ostrovok.exe");
+        assert_eq!(run_value(p), r#""C:\Program Files\Островок\ostrovok.exe""#);
+    }
 }
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_NAME: &str = "Ostrovok";
 
+/// Значение для ключа Run: путь в кавычках.
+pub fn run_value(exe: &std::path::Path) -> String {
+    format!("\"{}\"", exe.display())
+}
+
+/// Есть ли запись автозапуска. Путь не сверяем: установщик по этой отметке переносит
+/// автозапуск на установленную копию, даже если запущен другой скачанный файл.
 pub fn autostart_enabled() -> bool {
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
     RegKey::predef(HKEY_CURRENT_USER)
@@ -391,7 +403,7 @@ pub fn autostart_enabled() -> bool {
 pub fn set_autostart_path(exe: &std::path::Path) {
     use winreg::{enums::*, RegKey};
     if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE) {
-        let _ = key.set_value(RUN_NAME, &format!("\"{}\"", exe.display()));
+        let _ = key.set_value(RUN_NAME, &run_value(&exe));
     }
 }
 
@@ -403,7 +415,7 @@ pub fn set_autostart(on: bool) {
     };
     if on {
         if let Ok(exe) = std::env::current_exe() {
-            let _ = key.set_value(RUN_NAME, &format!("\"{}\"", exe.display()));
+            let _ = key.set_value(RUN_NAME, &run_value(&exe));
         }
     } else {
         let _ = key.delete_value(RUN_NAME);
