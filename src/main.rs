@@ -159,6 +159,14 @@ struct InboxItem {
     at: chrono::DateTime<chrono::Local>,
 }
 
+fn badge_text(n: usize) -> String {
+    if n > 99 { "99+".into() } else { n.to_string() }
+}
+
+fn badge_w(ctx: &egui::Context, n: usize) -> f32 {
+    (ctx.fonts(|f| f.layout_no_wrap(badge_text(n), semi(11.5), FG).size().x) + 12.0).max(18.0)
+}
+
 /// «5 сообщений», «1 сообщение», «22 сообщения».
 fn count_ru(n: usize, forms: [&str; 3]) -> String {
     let form = match (n % 10, n % 100) {
@@ -333,6 +341,8 @@ enum Seg {
     Track(String),
     Eq,
     Text(String, Color32),
+    /// непрочитанные сообщения: число на цветной капсуле мессенджера
+    Badge(usize, Color32),
 }
 
 struct App {
@@ -443,6 +453,8 @@ struct App {
     live: live::Live,
     /// последние уведомления мессенджеров, новые сверху; живут только в памяти
     inbox: Vec<InboxItem>,
+    /// сколько пришло с тех пор, как открывали страницу «Уведомления»
+    inbox_unread: usize,
     /// запущен из %LOCALAPPDATA%\Programs\Ostrovok
     is_installed: bool,
     call_since: Option<Instant>,
@@ -715,6 +727,7 @@ impl App {
             album: None,
             live,
             inbox: Vec::new(),
+            inbox_unread: 0,
             is_installed: install::installed(),
             call_since: None,
             toast: None,
@@ -820,6 +833,12 @@ impl App {
             }
             if std::env::var_os("OSTROVOK_TOAST").is_some() {
                 app.show_toast("\u{E896}", [0x3A, 0x9B, 0xFF], "Загрузка завершена", "otchet-za-noyabr.pdf", 30, false);
+            }
+        }
+        // для снимков пилюли со значком непрочитанных: OSTROVOK_UNREAD=3
+        if let Some(n) = std::env::var("OSTROVOK_UNREAD").ok().and_then(|v| v.parse::<usize>().ok()).filter(|_| test_mode()) {
+            for _ in 0..n {
+                app.push_inbox(live::Notice { app: "Telegram".into(), title: "Мирон".into(), body: "привет".into() }, [0x2A, 0xAB, 0xEE]);
             }
         }
         if test_mode() && std::env::var_os("OSTROVOK_TODO").is_some() {
@@ -1522,6 +1541,10 @@ impl App {
             v.push(Seg::Track(if m.artist.trim().is_empty() { m.title.clone() } else { format!("{} — {}", m.title, m.artist) }));
         }
         v.push(Seg::Text(chrono::Local::now().format("%H:%M").to_string(), FG));
+        if self.inbox_unread > 0 {
+            let c = self.inbox.first().map_or([0x3A, 0x9B, 0xFF], |i| i.color);
+            v.push(Seg::Badge(self.inbox_unread, Color32::from_rgb(c[0], c[1], c[2])));
+        }
         if let (Some(end), true) = (self.timer_end, self.fx.is_none()) {
             v.push(Seg::Text(fmt_left(end), accent()));
         }
@@ -1546,6 +1569,7 @@ impl App {
                 Seg::Eq => 24.0,
                 Seg::Track(t) => ctx.fonts(|f| f.layout_no_wrap(t.clone(), semi(13.0), FG).size().x).clamp(96.0, 170.0),
                 Seg::Text(t, _) => ctx.fonts(|f| f.layout_no_wrap(t.clone(), semi(13.5), FG).size().x),
+                Seg::Badge(n, _) => badge_w(ctx, *n),
             } + 10.0;
         }
         (w + 6.0).clamp(120.0, 520.0)
@@ -1794,6 +1818,17 @@ impl App {
                 Seg::Text(t, c) => {
                     let r = p.text(pos2(x, cy), Align2::LEFT_CENTER, t, semi(13.5), *c);
                     x += r.width() + 10.0;
+                }
+                Seg::Badge(n, c) => {
+                    let w = badge_w(ui.ctx(), *n);
+                    let r = Rect::from_min_size(pos2(x, cy - 9.0), vec2(w, 18.0));
+                    // неподвижное мягкое свечение: анимация заставляла бы остров перерисовываться без остановки
+                    let glow = 0.6;
+                    p.rect_filled(r.expand(2.0 + glow), Rounding::same(11.0 + glow), Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (26.0 + 30.0 * glow) as u8));
+                    p.rect_filled(r, Rounding::same(9.0), mix(*c, Color32::WHITE, 0.08));
+                    p.rect_filled(Rect::from_min_max(r.min + vec2(4.0, 1.5), pos2(r.right() - 4.0, r.top() + 6.5)), Rounding::same(4.0), rgba(255, 255, 255, 34));
+                    p.text(r.center() + vec2(0.0, 0.5), Align2::CENTER_CENTER, badge_text(*n), semi(11.5), Color32::WHITE);
+                    x += w + 10.0;
                 }
             }
         }
@@ -3297,10 +3332,12 @@ impl App {
     fn push_inbox(&mut self, n: live::Notice, color: [u8; 3]) {
         self.inbox.insert(0, InboxItem { app: n.app, title: n.title, body: n.body, color, at: chrono::Local::now() });
         self.inbox.truncate(50);
+        self.inbox_unread = (self.inbox_unread + 1).min(self.inbox.len());
     }
 
     /// Записи → Уведомления: что пришло в мессенджеры, пока вы были заняты.
     fn ui_inbox(&mut self, ui: &mut egui::Ui) {
+        self.inbox_unread = 0;
         if self.inbox.is_empty() {
             let hint = if self.cfg.mirror {
                 "Здесь соберутся сообщения из Telegram, Discord и других мессенджеров"
