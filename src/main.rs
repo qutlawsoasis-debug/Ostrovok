@@ -8125,7 +8125,6 @@ fn apply_city(cfg: &mut store::Settings, query: &str, lat: f64, lon: f64, name: 
     cfg.city_checked = true;
 }
 
-/// Лента дня: сегодняшние напоминания как доля суток (0..1) и текст, по порядку.
 /// Ключ кэша развёрнутых повторов: окно и (срок, повтор, текст) каждого напоминания.
 fn reminders_key(list: &[store::Reminder], from: i64, to: i64) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -8137,6 +8136,7 @@ fn reminders_key(list: &[store::Reminder], from: i64, to: i64) -> u64 {
     h.finish()
 }
 
+/// Лента дня: сегодняшние напоминания как доля суток (0..1) и текст, по порядку.
 fn day_marks(list: &[store::Reminder], day_start: i64, day_len: i64) -> Vec<(f32, String)> {
     let mut v: Vec<(i64, &store::Reminder)> = list.iter().flat_map(|r| occurrences(r, day_start, day_start + day_len).into_iter().map(move |ts| (ts, r))).collect();
     v.sort_by_key(|(ts, _)| *ts);
