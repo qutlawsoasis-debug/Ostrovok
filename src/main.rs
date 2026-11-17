@@ -2188,7 +2188,30 @@ impl App {
             add = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             add |= jelly(ui, "Добавить").clicked();
         });
-        ui.label(RichText::new("Время — часы и минуты (18:30) или через сколько минут (+15).").color(DIM).size(11.5));
+        // быстрое время: щелчок подставляет время, а если текст уже вписан — сразу добавляет
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            use chrono::Timelike;
+            let now = chrono::Local::now();
+            let to_tomorrow_9 = (24 * 60 - (now.hour() * 60 + now.minute()) as i64 + 9 * 60).max(1);
+            for (label, spec) in [("+5 мин", "+5".to_string()), ("+15 мин", "+15".into()), ("+1 час", "+60".into()), ("вечером 19:00", "19:00".into()), ("завтра 9:00", format!("+{to_tomorrow_9}"))] {
+                let w = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(12.0), FG).size().x + 20.0;
+                let (r, resp) = ui.allocate_exact_size(vec2(w, 26.0), Sense::click());
+                let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
+                let on = self.remind_time == spec;
+                glass_chip(ui.painter(), r, 13.0, if on { 1.1 } else { 0.4 + 0.5 * hov });
+                ui.painter().text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.0), if on { accent() } else { mix(DIM, FG, hov) });
+                if resp.clicked() {
+                    self.remind_time = spec;
+                    if !self.remind_text.trim().is_empty() {
+                        add = true;
+                    }
+                }
+            }
+        });
+        ui.add_space(2.0);
+        ui.label(RichText::new("Можно и из поиска: «напомни 18:30 позвонить» или «напомни через 15 мин чай».").color(DIM).size(11.5));
         if add {
             self.add_reminder();
         }
