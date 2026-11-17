@@ -178,7 +178,7 @@ footer a{color:var(--dim);text-decoration:none}footer a:hover{color:var(--ink)}
     <a class="btn ghost" href="https://github.com/qutlawsoasis-debug/Ostrovok">Исходный код</a>
   </div>
   <p class="note rise">Бесплатно, открытый код, один файл. Права администратора не нужны, обновляется сам.</p>
-  <div class="shot rise" id="shot"><img src="home.png" alt="Раскрытая панель Островка: время, музыка, погода, загрузка компьютера, быстрые действия" width="820" height="422"></div>
+  <div class="shot rise" id="shot"><!-- снимок: home.png --><img src="home.png" alt="Раскрытая панель Островка: время, музыка, погода, загрузка компьютера, быстрые действия" width="820" height="422"></div>
 </header>
 
 <section id="features">
@@ -187,14 +187,18 @@ footer a{color:var(--dim);text-decoration:none}footer a:hover{color:var(--ink)}
     <h2 class="rise">Всё мелкое и нужное — в одном месте</h2>
     <p class="lead rise">Не нужно держать открытыми плеер, погоду, заметки и диспетчер задач. Остров показывает главное и прячется, когда не нужен.</p>
     <div class="grid">
-      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#c6b5ff,#7f63ff)"><svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div><h3>Музыка и живой звук</h3><p>Что играет, управление, текст песни. Эквалайзер показывает настоящий звук компьютера.</p></div>
-      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#9fd8ff,#3a8cf0)"><svg viewBox="0 0 24 24"><path d="M17.5 19H9a7 7 0 1 1 6.7-9h1.8a4.5 4.5 0 0 1 0 9z"/></svg></div><h3>Погода по часам</h3><p>График температуры, осадки, восход и закат. В пилюле идёт дождь, если он идёт за окном.</p></div>
-      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#ffc58f,#f0743a)"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div><h3>Уведомления</h3><p>Сообщения из Telegram, Discord и WhatsApp всплывают в пилюле, пропущенные собираются в список.</p></div>
-      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#9ff0bd,#25b866)"><svg viewBox="0 0 24 24"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></svg></div><h3>Умный буфер</h3><p>История копирования с поиском и булавками. Скопировали ссылку, цвет, пример или фразу на английском — остров предложит открыть, посчитать или перевести.</p></div>
-      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#ffb3d1,#e8508c)"><svg viewBox="0 0 24 24"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2M9 2h6"/></svg></div><h3>Таймер и «Фокус»</h3><p>Таймер, секундомер, режим 25/5, напоминания и список дел с календарём.</p></div>
-      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#c3cbe0,#6b7491)"><svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></div><h3>Система</h3><p>Громкость каждой программы, микрофон, нагрузка, сеть и память. Громкость и раскладка всплывают в пилюле.</p></div>
-      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#a8f0ff,#22a7c7)"><svg viewBox="0 0 24 24"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 12h10"/></svg></div><h3>Снимки и текст с экрана</h3><p>Снимок области, распознавание текста с картинки, пипетка цвета, QR-коды.</p></div>
-      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#e3c8ff,#9b5cf0)"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></div><h3>Строка поиска</h3><p>Alt + Пробел: программы (даже в неправильной раскладке), «5 км в мили», «100 usd в рубли», «напомни 18:30 позвонить».</p></div>
+      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#c6b5ff,#7f63ff)"><svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div><h3>Музыка и живой звук</h3><p>Что играет, текст песни, перемотка щелчком по полосе. Эквалайзер показывает настоящий звук компьютера, а без текста песни — зеркальную волну.</p></div>
+      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#9fd8ff,#3a8cf0)"><svg viewBox="0 0 24 24"><path d="M17.5 19H9a7 7 0 1 1 6.7-9h1.8a4.5 4.5 0 0 1 0 9z"/></svg></div><h3>Погода и подсказки</h3><p>Почасовой график, осадки, Луна и долгота дня. Подсказки на 12 часов: зонт, куртка, сильный ветер.</p></div>
+      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#ffd59a,#e89a2c)"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg></div><h3>Календарь и мировые часы</h3><p>Праздники России, выходные цветом, точки по числу дел. Под календарём — время в других городах.</p></div>
+      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#ffc58f,#f0743a)"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div><h3>Уведомления</h3><p>Telegram, Discord и WhatsApp всплывают в пилюле со значком непрочитанных. Пропущенные — списком с фильтром по мессенджеру.</p></div>
+      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#a8e6ff,#3a9fd8)"><svg viewBox="0 0 24 24"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></svg></div><h3>Умный буфер</h3><p>История с поиском, булавками и миниатюрами картинок. Последнюю запись можно сделать заглавной, одной строкой, транслитом или исправить раскладку.</p></div>
+      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#ffb3d1,#e8508c)"><svg viewBox="0 0 24 24"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2M9 2h6"/></svg></div><h3>Таймер и «Фокус»</h3><p>Циферблат с паузой и временем окончания, секундомер, режим 25/5 и «Неделя фокуса» с серией дней.</p></div>
+      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#9ff0bd,#25b866)"><svg viewBox="0 0 24 24"><path d="m3 17 2 2 4-4M3 7l2 2 4-4M13 6h8M13 12h8M13 18h8"/></svg></div><h3>Дела, заметки, полка</h3><p>Срок прямо в тексте дела: «до пятницы», «завтра». Заметки с чек-листами, полка для файлов с миниатюрами.</p></div>
+      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#ffa8a8,#e85050)"><svg viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg></div><h3>Напоминания</h3><p>Быстрые кнопки времени, повтор каждый день, по будням или раз в неделю. За 10 минут до срока в пилюле идёт отсчёт.</p></div>
+      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#c3cbe0,#6b7491)"><svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></div><h3>Система</h3><p>Громкость каждой программы, кнопка «Тихо» и пресеты, монитор с топом по процессору и памяти. Отложенный сон, батарейка в пилюле при низком заряде.</p></div>
+      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#b8c4ff,#5868e8)"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg></div><h3>Сводка</h3><p>Лента дня: сутки полосой с «сейчас» и напоминаниями. Ряд быстрых действий настраивается под себя.</p></div>
+      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#a8f0ff,#22a7c7)"><svg viewBox="0 0 24 24"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 12h10"/></svg></div><h3>Снимки, текст и QR</h3><p>Снимок области с разметкой рамками — исходник не трогается. Текст с картинки, пипетка, QR-код для ссылки или Wi-Fi.</p></div>
+      <div class="card glass rise"><div class="ic" style="background:linear-gradient(160deg,#e3c8ff,#9b5cf0)"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></div><h3>Строка поиска</h3><p>Alt + Пробел: программы даже в неправильной раскладке, «5 км в мили», «время токио», «до нового года», «напомни 18:30 позвонить». Недавние запросы под рукой.</p></div>
     </div>
   </div>
 </section>
@@ -213,12 +217,19 @@ footer a{color:var(--dim);text-decoration:none}footer a:hover{color:var(--ink)}
     <div class="kicker rise">Как это выглядит</div>
     <h2 class="rise">Стекло, мягкий свет и немного характера</h2>
     <div class="rows">
-      <div class="row rise"><div class="txt"><span class="tag">Обзор</span><h3>Погода, которая не врёт про вечер</h3><p>Почасовой прогноз с графиком, вероятность осадков и пять дней вперёд. В пилюле — живая погода: капли, снег или солнце.</p></div><img src="weather.png" alt="Страница погоды с графиком по часам" loading="lazy"></div>
-      <div class="row rise"><div class="txt"><span class="tag">Записи</span><h3>Ничего не потеряется</h3><p>Пропущенные сообщения мессенджеров собираются в аккуратный список. Хранятся только в памяти и исчезают при перезапуске.</p></div><img src="inbox.png" alt="Список уведомлений из мессенджеров" loading="lazy"></div>
-      <div class="row rise"><div class="txt"><span class="tag">Система</span><h3>Громкость каждой программы</h3><p>Браузер тише, игра громче — колесом мыши, не открывая микшер Windows.</p></div><img src="sound.png" alt="Громкость по программам" loading="lazy"></div>
-      <div class="row rise"><div class="txt"><span class="tag">Монитор</span><h3>Что тормозит компьютер</h3><p>График нагрузки, сеть и программы, которые занимают больше всего памяти.</p></div><img src="system.png" alt="Монитор системы" loading="lazy"></div>
-      <div class="row rise"><div class="txt"><span class="tag">Инструменты</span><h3>Фокус без отдельных приложений</h3><p>Таймер, секундомер и режим «Фокус 25/5», который сам чередует работу и перерыв.</p></div><img src="timer.png" alt="Таймер и режим Фокус" loading="lazy"></div>
-      <div class="row rise"><div class="txt"><span class="tag">Записи</span><h3>Полка для файлов</h3><p>Перетащите файл на остров — он подождёт на полке, пока не понадобится.</p></div><img src="shelf.png" alt="Полка с файлами" loading="lazy"></div>
+      <div class="row rise"><div class="txt"><span class="tag">Обзор</span><h3>Погода, которая не врёт про вечер</h3><p>Почасовой прогноз с графиком, вероятность осадков и дни с диапазоном температур. Подсказки на 12 часов — зонт, куртка, ветер; внизу Луна и долгота дня. В пилюле — живая погода: капли, снег или солнце.</p></div><!-- снимок: weather.png --><img src="weather.png" alt="Страница погоды с графиком по часам" loading="lazy"></div>
+      <div class="row rise"><div class="txt"><span class="tag">Записи</span><h3>Ничего не потеряется</h3><p>Пропущенные сообщения собираются в список, фишки сверху оставляют один мессенджер. В пилюле — значок с числом непрочитанных. Всё хранится только в памяти и исчезает при перезапуске.</p></div><img src="inbox.png" alt="Список уведомлений из мессенджеров" loading="lazy"></div>
+      <div class="row rise"><div class="txt"><span class="tag">Система</span><h3>Громкость каждой программы</h3><p>Браузер тише, игра громче — колесом мыши, не открывая микшер Windows. Кнопка «Тихо» убавляет до 20&nbsp;%, повторный щелчок возвращает как было; пресеты 25, 50, 75 и 100&nbsp;%.</p></div><img src="sound.png" alt="Громкость по программам" loading="lazy"></div>
+      <div class="row rise"><div class="txt"><span class="tag">Монитор</span><h3>Что тормозит компьютер</h3><p>График нагрузки, сеть и два топа программ — по процессору и по памяти. Щелчок по карточке открывает диспетчер задач.</p></div><!-- снимок: system.png --><img src="system.png" alt="Монитор системы" loading="lazy"></div>
+      <div class="row rise"><div class="txt"><span class="tag">Обзор</span><h3>Календарь с праздниками</h3><p>Выходные цветом, точки по числу дел, праздники России со звёздочкой. Под календарём — мировые часы, а в поиске «до нового года» посчитает дни.</p></div><!-- снимок: calendar.png --><img src="calendar.png" alt="Календарь с делами и праздниками" loading="lazy"></div>
+      <div class="row rise"><div class="txt"><span class="tag">Инструменты</span><h3>Фокус и пауза без отдельных приложений</h3><p>Циферблат с делениями и временем окончания, пауза в любой момент. «Фокус 25/5» сам чередует работу и перерыв, а «Неделя фокуса» показывает серию дней.</p></div><!-- снимок: timer.png --><img src="timer.png" alt="Таймер и режим Фокус" loading="lazy"></div>
+      <div class="row rise"><div class="txt"><span class="tag">Записи</span><h3>Полка для файлов</h3><p>Перетащите файл на остров — он подождёт на полке, пока не понадобится. Картинки видны миниатюрами, а не значками.</p></div><!-- снимок: shelf.png --><img src="shelf.png" alt="Полка с файлами" loading="lazy"></div>
+      <div class="row rise"><div class="txt"><span class="tag">Записи</span><h3>Дела со сроком в тексте</h3><p>Напишите «купить подарок до пятницы» — у дела появится срок, а список сам отсортируется по нему.</p></div><!-- снимок: todo.png --><img src="todo.png" alt="Список дел со сроками" loading="lazy"></div>
+      <!-- снимок: markup.png -->
+      <!-- снимок: notes.png -->
+      <!-- снимок: qr-wifi.png -->
+      <!-- снимок: clipboard.png -->
+      <!-- снимок: search.png -->
     </div>
   </div>
 </section>
@@ -236,16 +247,20 @@ footer a{color:var(--dim);text-decoration:none}footer a:hover{color:var(--ink)}
   <div class="wrap">
     <div class="kicker rise">Приватность</div>
     <h2 class="rise">Ничего не отправляется разработчику</h2>
-    <p class="lead rise">Наружу идут только запросы, которые вы сами включили. Звук и речь обрабатываются на компьютере.</p>
+    <p class="lead rise">Наружу идут только запросы из списка ниже — каждый вы запускаете сами или можете выключить. Звук и речь обрабатываются на компьютере.</p>
     <div class="priv">
       <div class="glass rise"><h3>Что уходит в интернет</h3><ul>
-        <li>название города — на open-meteo.com, для погоды;</li>
-        <li>запрос курса — на open.er-api.com, когда вы спрашиваете про валюту;</li>
-        <li>название трека — на lrclib.net, если включён текст песен;</li>
-        <li>проверка обновлений — в релизы на GitHub.</li>
+        <li>город и его координаты — на open-meteo.com, если вы указали город для погоды;</li>
+        <li>запрос свежих курсов — на open.er-api.com, когда вы спрашиваете про валюту; суммы не уходят;</li>
+        <li>исполнитель и название трека — на lrclib.net, если включён текст песен;</li>
+        <li>проверка обновлений — в релизы на GitHub, раз в минуту; выключается в настройках;</li>
+        <li>переписка во вкладке «ИИ» — в выбранный вами сервис, если вы указали ключ;</li>
+        <li>вопросы Джарвиса и то, что он прочитал по вашей просьбе, например буфер, — только если указан облачный мозг; ответы для озвучки — в Fish Audio, если указан его ключ;</li>
+        <li>модели Джарвиса — скачиваются с GitHub и Hugging Face, когда вы нажмёте «Скачать»;</li>
+        <li>фраза для перевода — в Google Переводчик, только когда вы нажмёте «Перевести».</li>
       </ul></div>
       <div class="glass rise no"><h3>Что остаётся у вас</h3><ul>
-        <li>буфер обмена, заметки, дела и файлы на полке;</li>
+        <li>буфер обмена, заметки, дела и файлы на полке — кроме того, что вы сами отправили из списка «Что уходит»;</li>
         <li>уведомления — только в памяти, до перезапуска;</li>
         <li>звук для эквалайзера — анализируется на месте;</li>
         <li>речь для Джарвиса — распознаётся на компьютере.</li>
