@@ -1411,7 +1411,7 @@ impl App {
                 }
                 "notes" => {
                     // для снимков: образцы заметок (в проверочном запуске они не сохраняются)
-                    app.notes = ["Покупки\n- [x] хлеб\n- [x] молоко\n- [ ] сыр\n- [ ] корм коту", "Идеи для острова\nгромкость по приложениям колесом\nвиджет курса валют", "Пароль от вайфая у соседей\nспросить в субботу", "Сервер\nперезагружать по вторникам"].map(String::from).to_vec();
+                    app.notes = ["Перед катками\n- [x] обновить драйвер видеокарты\n- [x] почистить диск C\n- [ ] закрыть лишние вкладки\n- [ ] проверить микрофон в Discord", "Идеи для острова\nгромкость по приложениям колесом\nвиджет загрузки видеокарты", "Сборка ПК\nвзять второй SSD на 1 ТБ\nпоменять термопасту", "Сервер Minecraft\nперезагружать по вторникам"].map(String::from).to_vec();
                     Tab::Notes
                 }
                 "jarvis" => Tab::Jarvis,
@@ -4759,7 +4759,7 @@ impl App {
                 shown += 1;
                 let mut lines = n.lines().map(str::trim).filter(|l| !l.is_empty());
                 let title = lines.next().unwrap_or("Новая заметка").to_string();
-                let more = lines.next().unwrap_or("").to_string();
+                let more = store::preview_line(lines.next().unwrap_or(""));
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::click());
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
                 let on = i == self.note_sel;
@@ -4800,6 +4800,9 @@ impl App {
                 let k = ui.ctx().animate_value_with_time(Id::new(("chk-bar", sel)), done as f32 / total as f32, 0.25);
                 ui.painter().rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * k, 3.0)), 2.0, accent());
                 ui.add_space(4.0);
+                // редактору под пунктами оставляем не меньше ~4 строк, лишние пункты прокручиваются
+                let cap = (right.height() - 30.0 - 30.0 - 4.0 * 18.0 - 30.0).max(52.0);
+                egui::ScrollArea::vertical().id_salt(("notes-checks", sel)).max_height(cap).auto_shrink([false, true]).show(ui, |ui| {
                 for c in &items {
                     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
                     let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
@@ -4824,6 +4827,7 @@ impl App {
                         toggle = Some(c.line);
                     }
                 }
+                });
                 ui.label(RichText::new(format!("Готово {done} из {total}")).color(DIM).size(11.0));
                 ui.add_space(6.0);
             }

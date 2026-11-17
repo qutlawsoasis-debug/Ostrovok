@@ -295,6 +295,11 @@ pub fn toggle_check(note: &str, line: usize) -> String {
     out.join("\n")
 }
 
+/// Строка для превью в списке: у пункта чек-листа без разметки «- [ ]».
+pub fn preview_line(line: &str) -> String {
+    parse_check(line).map_or_else(|| line.trim().to_string(), |(_, label)| label.to_string())
+}
+
 /// Добавляет пустой пункт в конец заметки.
 pub fn append_check(note: &str) -> String {
     let base = note.trim_end_matches(['\n', '\r', ' ']);
@@ -327,6 +332,14 @@ mod check_tests {
         assert_eq!(toggle_check(n, 99), n);
         assert_eq!(toggle_check("- [ ] а\r\nб", 0), "- [x] а\r\nб");
         assert_eq!(toggle_check("  * [X] а [x]", 0), "  * [ ] а [x]");
+    }
+
+    #[test]
+    fn preview_strips_markup() {
+        assert_eq!(preview_line("- [x] хлеб"), "хлеб");
+        assert_eq!(preview_line("  * [ ] сыр "), "сыр");
+        assert_eq!(preview_line("просто текст"), "просто текст");
+        assert_eq!(preview_line("- [ ]"), "");
     }
 
     #[test]
