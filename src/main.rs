@@ -5287,6 +5287,10 @@ impl App {
 
     /// Показывает карточку снимка: миниатюра и что с ним можно сделать.
     fn show_shot(&mut self, ctx: &egui::Context, w: usize, h: usize, px: Vec<u8>, path: String) {
+        // пустой снимок 0×N: миниатюра из него не строится, а деление на 0 даёт бесконечность
+        if w == 0 || h == 0 {
+            return;
+        }
         // миниатюра — не больше 640 точек по длинной стороне
         let k = (640.0 / w.max(h) as f32).min(1.0);
         let (tw, th) = (((w as f32 * k) as u32).max(1), ((h as f32 * k) as u32).max(1));
@@ -5403,7 +5407,7 @@ impl App {
                 }
                 // исходник не трогаем: размеченное — отдельным файлом рядом. Проверочный запуск ничего не пишет на диск
                 let out = marked_path(&path, |p| p.exists());
-                let saved = !test_mode() && image::save_buffer(&out, &px, size.0 as u32, size.1 as u32, image::ExtendedColorType::Rgba8).is_ok();
+                let saved = !test_mode() && save_png_atomic(&out, &px, size.0, size.1).is_ok();
                 self.clip_skip = true;
                 let data = arboard::ImageData { width: size.0, height: size.1, bytes: std::borrow::Cow::Borrowed(&px) };
                 let copied = self.clipboard.as_mut().is_some_and(|cb| cb.set_image(data).is_ok());
@@ -9239,6 +9243,23 @@ fn view_to_image(a: Pos2, b: Pos2, img: Rect, size: (usize, usize)) -> Option<[u
     Some([sx(r.left()), sy(r.top()), sx(r.right()), sy(r.bottom())])
 }
 
+/// PNG без обрезков: пишем во временный файл рядом и только целый переименовываем в итоговый.
+/// Не вышло (диск полон, нет прав) — временный файл убираем.
+fn save_png_atomic(out: &std::path::Path, px: &[u8], w: usize, h: usize) -> Result<(), String> {
+    let (Ok(w32), Ok(h32)) = (u32::try_from(w), u32::try_from(h)) else { return Err("слишком большой снимок".into()) };
+    if w == 0 || h == 0 || w.checked_mul(h).and_then(|n| n.checked_mul(4)) != Some(px.len()) {
+        return Err("неверный размер снимка".into());
+    }
+    let tmp = out.with_extension(format!("{}.tmp", std::process::id()));
+    let res = image::save_buffer_with_format(&tmp, px, w32, h32, image::ExtendedColorType::Rgba8, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())
+        .and_then(|_| std::fs::rename(&tmp, out).map_err(|e| e.to_string()));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
 /// Куда сохранить размеченную копию снимка: «<имя> (разметка).png» рядом, при занятом — «(разметка 2)» и т.д.
 fn marked_path(path: &str, exists: impl Fn(&std::path::Path) -> bool) -> std::path::PathBuf {
     let p = std::path::Path::new(path);
@@ -9252,8 +9273,12 @@ fn marked_path(path: &str, exists: impl Fn(&std::path::Path) -> bool) -> std::pa
 
 /// Рисует прямоугольную рамку толщиной t прямо в RGBA-снимке w×h; всё за краем пропускается.
 fn draw_frame_rgba(px: &mut [u8], w: usize, h: usize, r: [u32; 4], t: usize, color: [u8; 3]) {
-    let (x0, y0) = (r[0] as usize, r[1] as usize);
-    let (x1, y1) = ((r[2] as usize).min(w), (r[3] as usize).min(h));
+    // рамку могли получить перевёрнутой или за краями — упорядочиваем и обрезаем по снимку
+    let (x0, x1) = ((r[0].min(r[2]) as usize).min(w), (r[0].max(r[2]) as usize).min(w));
+    let (y0, y1) = ((r[1].min(r[3]) as usize).min(h), (r[1].max(r[3]) as usize).min(h));
+    if px.len() < w.saturating_mul(h).saturating_mul(4) {
+        return;
+    }
     for y in y0..y1 {
         for x in x0..x1 {
             let edge = x < x0 + t || x >= x1.saturating_sub(t) || y < y0 + t || y >= y1.saturating_sub(t);
@@ -9278,6 +9303,42 @@ mod shot_mark_tests {
         assert_eq!(view_to_image(pos2(200.0, 90.0), pos2(60.0, 0.0), img, (1000, 500)), Some([500, 0, 1000, 500]));
         assert_eq!(view_to_image(pos2(20.0, 30.0), pos2(20.5, 30.2), img, (1000, 500)), None, "просто щелчок — не рамка");
         assert_eq!(view_to_image(pos2(0.0, 0.0), pos2(5.0, 5.0), img, (1000, 500)), None, "целиком мимо снимка");
+    }
+
+    #[test]
+    fn frame_inverted_outside_and_empty() {
+        let (w, h) = (10, 8);
+        let count = |px: &[u8]| px.chunks(4).filter(|c| c[0] == 255).count();
+        // перевёрнутая рамка рисуется так же, как прямая
+        let mut a = vec![0u8; w * h * 4];
+        let mut b = a.clone();
+        draw_frame_rgba(&mut a, w, h, [1, 1, 6, 5], 1, [255, 0, 0]);
+        draw_frame_rgba(&mut b, w, h, [6, 5, 1, 1], 1, [255, 0, 0]);
+        assert_eq!(a, b);
+        assert_eq!(count(&a), 14);
+        // целиком за краями и нулевая — ничего, без паники
+        let mut c = vec![0u8; w * h * 4];
+        draw_frame_rgba(&mut c, w, h, [50, 50, 4000000000, 4000000000], 3, [255, 0, 0]);
+        draw_frame_rgba(&mut c, w, h, [3, 3, 3, 3], 3, [255, 0, 0]);
+        assert_eq!(count(&c), 0);
+        // буфер короче заявленного размера — тоже без паники
+        let mut d = vec![0u8; 10];
+        draw_frame_rgba(&mut d, w, h, [0, 0, 10, 8], 2, [255, 0, 0]);
+    }
+
+    #[test]
+    fn png_saved_whole_or_not_at_all() {
+        let dir = std::env::temp_dir().join(format!("ostrovok-png-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("a (разметка).png");
+        save_png_atomic(&out, &[255u8; 2 * 2 * 4], 2, 2).unwrap();
+        assert_eq!(image::open(&out).unwrap().width(), 2);
+        assert!(save_png_atomic(&dir.join("b.png"), &[0u8; 3], 2, 2).is_err());
+        assert!(save_png_atomic(&dir.join("c.png"), &[], 0, 0).is_err());
+        let bad = dir.join("нет такой папки").join("d.png");
+        assert!(save_png_atomic(&bad, &[0u8; 16], 2, 2).is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "временных файлов не осталось");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
