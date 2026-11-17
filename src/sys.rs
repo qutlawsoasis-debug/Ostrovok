@@ -912,9 +912,15 @@ fn audio_sessions(mut f: impl FnMut(String, bool, &windows::Win32::Media::Audio:
                 continue; // системные звуки
             }
             let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { continue };
-            let mut buf = [0u16; 512];
+            let mut buf = vec![0u16; 512];
             let mut len = buf.len() as u32;
-            let ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+            let mut ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+            if !ok && windows::Win32::Foundation::GetLastError() == windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER {
+                // длинный путь (\\?\…) не влез — повторяем с наибольшим буфером
+                buf = vec![0u16; 32768];
+                len = buf.len() as u32;
+                ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+            }
             let _ = windows::Win32::Foundation::CloseHandle(process);
             if !ok {
                 continue;
@@ -927,26 +933,97 @@ fn audio_sessions(mut f: impl FnMut(String, bool, &windows::Win32::Media::Audio:
     }
 }
 
-/// Программы со звуком: сначала те, что играют прямо сейчас.
+/// Показываемое имя программы по пути: короткие (vlc) — заглавными, прочие — с заглавной буквы.
+pub fn app_display_name(path: &str) -> String {
+    let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    let stem = file.rsplit_once('.').map_or(file, |s| s.0);
+    if stem.chars().count() <= 4 {
+        stem.to_uppercase()
+    } else {
+        let mut c = stem.chars();
+        c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+    }
+}
+
+/// Склеивает ещё одну звуковую сессию той же программы: уровень — у играющей сессии (иначе наибольший),
+/// заглушена программа, только если заглушены все её сессии.
+fn merge_app(seen: &mut AppVol, other: AppVol) {
+    if other.active && !seen.active {
+        seen.level = other.level;
+    } else if other.active == seen.active {
+        seen.level = seen.level.max(other.level);
+    }
+    seen.muted &= other.muted;
+    seen.active |= other.active;
+}
+
+/// Одинаковые имена у разных программ различает папкой: «Game (One)», «Game (Two)».
+fn disambiguate(apps: &mut [AppVol]) {
+    let folder = |p: &str| -> String {
+        let mut parts = p.rsplit(['\\', '/']);
+        parts.next();
+        parts.next().unwrap_or("").to_string()
+    };
+    let clash: Vec<bool> = apps
+        .iter()
+        .map(|a| apps.iter().any(|b| b.name.to_lowercase() == a.name.to_lowercase() && !b.path.eq_ignore_ascii_case(&a.path)))
+        .collect();
+    for (a, c) in apps.iter_mut().zip(clash) {
+        let f = folder(&a.path);
+        if c && !f.is_empty() {
+            a.name = format!("{} ({f})", a.name);
+        }
+    }
+}
+
+/// Программы со звуком: сначала те, что играют прямо сейчас. Сессии одного exe склеены.
 pub fn app_volumes() -> Vec<AppVol> {
     let mut out: Vec<AppVol> = Vec::new();
     audio_sessions(|path, active, vol| unsafe {
-        if let Some(seen) = out.iter_mut().find(|a| a.path.eq_ignore_ascii_case(&path)) {
-            seen.active |= active;
-            return;
-        }
-        let file = path.rsplit('\\').next().unwrap_or(&path);
-        let stem = file.rsplit_once('.').map_or(file, |s| s.0).to_string();
-        let name = if stem.chars().count() <= 4 {
-            stem.to_uppercase()
-        } else {
-            let mut c = stem.chars();
-            c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+        let app = AppVol {
+            name: app_display_name(&path),
+            level: vol.GetMasterVolume().unwrap_or(1.0),
+            muted: vol.GetMute().map(|m| m.as_bool()).unwrap_or(false),
+            active,
+            path,
         };
-        out.push(AppVol { name, path, level: vol.GetMasterVolume().unwrap_or(1.0), muted: vol.GetMute().map(|m| m.as_bool()).unwrap_or(false), active });
+        match out.iter_mut().find(|a| a.path.eq_ignore_ascii_case(&app.path)) {
+            Some(seen) => merge_app(seen, app),
+            None => out.push(app),
+        }
     });
+    disambiguate(&mut out);
     out.sort_by(|a, b| b.active.cmp(&a.active).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     out
+}
+
+/// UNC-путь к сетевой папке (\\srv\x, \\?\UNC\srv\x); \\?\C:\ и \\.\ — локальные.
+pub fn unc_path(p: &str) -> bool {
+    if let Some(rest) = p.strip_prefix(r"\\?\") {
+        return rest.get(..4).is_some_and(|s| s.eq_ignore_ascii_case(r"UNC\"));
+    }
+    p.starts_with(r"\\") && !p.starts_with(r"\\.\")
+}
+
+/// Корень диска пути: "d:\x" → "D:\".
+pub fn drive_root(p: &str) -> Option<String> {
+    let p = p.strip_prefix(r"\\?\").unwrap_or(p);
+    let mut c = p.chars();
+    match (c.next(), c.next()) {
+        (Some(d), Some(':')) if d.is_ascii_alphabetic() => Some(format!("{}:\\", d.to_ascii_uppercase())),
+        _ => None,
+    }
+}
+
+/// Сетевой ли путь (UNC или подключённый сетевой диск). Может тормозить — звать только в фоновом потоке.
+pub fn is_remote_path(p: &str) -> bool {
+    if unc_path(p) {
+        return true;
+    }
+    let Some(root) = drive_root(p) else { return false };
+    let wide: Vec<u16> = root.encode_utf16().chain(Some(0)).collect();
+    const DRIVE_REMOTE: u32 = 4;
+    unsafe { windows::Win32::Storage::FileSystem::GetDriveTypeW(windows::core::PCWSTR(wide.as_ptr())) == DRIVE_REMOTE }
 }
 
 pub fn set_app_volume(path: &str, level: f32) {
@@ -1320,5 +1397,86 @@ mod scan_tests {
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].0, "a");
+    }
+}
+
+#[cfg(test)]
+mod remote_and_mixer_tests {
+    use super::*;
+
+    fn av(name: &str, path: &str, level: f32, muted: bool, active: bool) -> AppVol {
+        AppVol { name: name.into(), path: path.into(), level, muted, active }
+    }
+
+    #[test]
+    fn unc_paths() {
+        assert!(unc_path(r"\\srv\x"));
+        assert!(unc_path(r"\\?\UNC\srv\x"));
+        assert!(!unc_path(r"\\?\C:\a"));
+        assert!(!unc_path(r"\\.\C:\a"));
+        assert!(!unc_path(r"C:\a"));
+        assert!(!unc_path(""));
+    }
+
+    #[test]
+    fn drive_roots() {
+        assert_eq!(drive_root("d:\\x").as_deref(), Some("D:\\"));
+        assert_eq!(drive_root("C:").as_deref(), Some("C:\\"));
+        assert_eq!(drive_root(r"\\?\e:\a").as_deref(), Some("E:\\"));
+        assert_eq!(drive_root(r"\\srv\x"), None);
+        assert_eq!(drive_root("x"), None);
+        assert_eq!(drive_root(""), None);
+        assert_eq!(drive_root("ё:\\"), None);
+    }
+
+    #[test]
+    fn remote_unc_without_disk_query() {
+        assert!(is_remote_path(r"\\srv\share\a.exe"));
+        assert!(!is_remote_path(""));
+    }
+
+    #[test]
+    fn display_names() {
+        assert_eq!(app_display_name(r"C:\Program Files\VideoLAN\vlc.exe"), "VLC");
+        assert_eq!(app_display_name(r"C:\x\chrome.exe"), "Chrome");
+        assert_eq!(app_display_name(""), "");
+        assert_eq!(app_display_name(r"C:\x\spotify"), "Spotify");
+        assert_eq!(app_display_name(r"C:\Игры\ёлочка.exe"), "Ёлочка");
+        assert_eq!(app_display_name(r"C:\x\ёж.exe"), "ЁЖ");
+    }
+
+    #[test]
+    fn merge_prefers_active_level_and_all_muted() {
+        let mut a = av("A", "p", 0.2, true, false);
+        merge_app(&mut a, av("A", "p", 0.7, false, true));
+        assert_eq!(a.level, 0.7);
+        assert!(!a.muted, "заглушена не вся программа");
+        assert!(a.active);
+        // активная уже есть — неактивная уровень не перебивает
+        merge_app(&mut a, av("A", "p", 0.9, true, false));
+        assert_eq!(a.level, 0.7);
+        // обе неактивные — берём максимум; все заглушены — muted
+        let mut b = av("B", "q", 0.3, true, false);
+        merge_app(&mut b, av("B", "q", 0.6, true, false));
+        assert_eq!(b.level, 0.6);
+        assert!(b.muted);
+        assert!(!b.active);
+    }
+
+    #[test]
+    fn disambiguate_same_names() {
+        let mut v = vec![
+            av("Game", r"C:\One\game.exe", 1.0, false, false),
+            av("Game", r"D:\Two\Game.exe", 1.0, false, false),
+            av("VLC", r"C:\v\vlc.exe", 1.0, false, false),
+        ];
+        disambiguate(&mut v);
+        assert_eq!(v[0].name, "Game (One)");
+        assert_eq!(v[1].name, "Game (Two)");
+        assert_eq!(v[2].name, "VLC");
+        // один и тот же путь в разном регистре — не трогаем
+        let mut w = vec![av("A", r"C:\a\a.exe", 1.0, false, false), av("A", r"c:\A\A.EXE", 1.0, false, false)];
+        disambiguate(&mut w);
+        assert_eq!(w[0].name, "A");
     }
 }

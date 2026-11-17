@@ -378,6 +378,8 @@ enum Msg {
     Lyrics(String, Vec<(f64, String)>),
     /// значок программы для строки поиска, загруженный в фоне: путь и точки
     Icon(u64, String, Option<(usize, usize, Vec<u8>)>),
+    /// воркер значков взялся за путь: (поколение, путь, сетевой ли)
+    IconStart(u64, String, bool),
     /// картинка из буфера обмена, прочитанная в фоне
     ClipImg(usize, usize, Vec<u8>),
 }
@@ -1028,6 +1030,8 @@ struct App {
     bin: (i64, i64),
     light_theme: Option<bool>,
     mixer: Vec<sys::AppVol>,
+    /// когда последний раз слали громкость программы и что ещё не отправлено (путь, уровень)
+    mix_push: (Option<Instant>, Option<(String, f32)>),
     /// живой звук компьютера: источник и сглаженные столбики эквалайзера
     sound: sound::Sound,
     bars: [f32; sound::BANDS],
@@ -1067,7 +1071,10 @@ struct App {
     icon_pending: std::collections::HashSet<String>,
     icon_failed: std::collections::HashMap<String, Instant>,
     icon_gen: u64,
-    icon_busy_since: Option<Instant>,
+    /// путь, над которым сейчас работает воркер: с какого момента и сколько ему ждать
+    icon_current: Option<(String, Instant, Duration)>,
+    /// сколько раз воркер зависал на пути
+    icon_strikes: std::collections::HashMap<String, u8>,
     /// пути, на которых завис поток значков, — больше не запрашиваем; и сколько потоков брошено
     icon_stuck: std::collections::HashSet<String>,
     icon_abandoned: usize,
@@ -1351,6 +1358,7 @@ impl App {
             timer_paused: None,
             ctl_at: now,
             mixer: Vec::new(),
+            mix_push: (None, None),
             sound: sound::Sound::spawn(),
             bars: [0.0; sound::BANDS],
             beat: 0.0,
@@ -1383,7 +1391,8 @@ impl App {
             icon_pending: Default::default(),
             icon_failed: Default::default(),
             icon_gen: 0,
-            icon_busy_since: None,
+            icon_current: None,
+            icon_strikes: Default::default(),
             icon_stuck: Default::default(),
             icon_abandoned: 0,
             jelly: Spr::new(1.0, 420.0, 12.0, 0.0015),
@@ -2118,6 +2127,12 @@ impl App {
                     let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
                 }
                 for path in req_rx {
+                    // сначала дешёвая проверка UNC; опрос диска сам может тормозить, поэтому он уже под таймаутом
+                    let unc = sys::unc_path(&path);
+                    let _ = tx.send(Msg::IconStart(generation, path.clone(), unc));
+                    if !unc && sys::is_remote_path(&path) {
+                        let _ = tx.send(Msg::IconStart(generation, path.clone(), true));
+                    }
                     let icon = sys::icon_rgba(&path);
                     let _ = tx.send(Msg::Icon(generation, path, icon));
                     ctx.request_repaint();
@@ -2128,9 +2143,6 @@ impl App {
         if worker.send(path.to_string()).is_ok() {
             self.icon_failed.remove(path);
             self.icon_pending.insert(path.to_string());
-            if self.icon_busy_since.is_none() {
-                self.icon_busy_since = Some(now);
-            }
         } else {
             // поток значков упал — пересоздадим при следующем запросе
             self.reset_icon_worker();
@@ -2138,18 +2150,26 @@ impl App {
         None
     }
 
-    /// Бросает зависший/упавший поток значков: его ответы станут чужим поколением, ожидающие — в отложенные.
+    /// Бросает зависший/упавший поток значков: его ответы станут чужим поколением.
+    /// Штраф получает только путь, на котором поток завис; прочие ожидающие просто перезапросятся.
     fn reset_icon_worker(&mut self) {
         let now = Instant::now();
         self.icon_tx = None;
         self.icon_gen += 1;
-        // поток бросаем: пути, на которых он завис, больше не запрашиваем, иначе зависшие потоки копятся
-        self.icon_abandoned += 1;
-        for p in self.icon_pending.drain() {
-            self.icon_failed.insert(p.clone(), now);
-            self.icon_stuck.insert(p);
+        self.icon_pending.clear();
+        if let Some((path, _, _)) = self.icon_current.take() {
+            // брошенный поток висит дальше — копить их нельзя, поэтому и предел icon_abandoned
+            self.icon_abandoned += 1;
+            let strikes = self.icon_strikes.entry(path.clone()).or_insert(0);
+            *strikes = strikes.saturating_add(1);
+            let strikes = *strikes;
+            // icon_failed хранит «время неудачи»: сдвигаем его так, чтобы повтор был через icon_retry_after
+            let failed_at = now.checked_add(icon_retry_after(strikes).saturating_sub(ICON_RETRY)).unwrap_or(now);
+            self.icon_failed.insert(path.clone(), failed_at);
+            if icon_should_ban(strikes) {
+                self.icon_stuck.insert(path);
+            }
         }
-        self.icon_busy_since = None;
     }
 
     fn run(&mut self, action: Action) {
@@ -2212,6 +2232,15 @@ impl App {
 
     /// Фоновые дела: сообщения потоков, буфер обмена, таймер, погода, заметки.
     fn pump(&mut self, ctx: &egui::Context, now: Instant) {
+        // последнее значение громкости уходит, даже если панель микшера закрыли сразу после перетаскивания
+        if self.mix_push.1.is_some() && should_push(self.mix_push.0, now, !ctx.input(|i| i.pointer.any_down())) {
+            if let Some((path, v)) = self.mix_push.1.take() {
+                sys::set_app_volume(&path, v);
+                self.mix_push.0 = Some(now);
+            }
+        } else if self.mix_push.1.is_some() {
+            ctx.request_repaint_after(MIX_PUSH_EVERY);
+        }
         if self.palette_demo {
             self.mode = Mode::Palette;
             self.sticky = true;
@@ -2278,9 +2307,21 @@ impl App {
                 Msg::Download(name) => self.show_toast("\u{E896}", [0x3A, 0x9B, 0xFF], "Загрузка завершена", &name, 6, false),
                 Msg::ClipImg(w, h, px) => self.push_clip_img(ctx, w, h, px),
                 Msg::Icon(generation, _, _) if generation != self.icon_gen => {}
+                Msg::IconStart(generation, _, _) if generation != self.icon_gen => {}
+                Msg::IconStart(_, path, remote) => {
+                    let limit = icon_limit(remote);
+                    match &mut self.icon_current {
+                        // повторный IconStart того же пути — диск оказался сетевым: время то же, предел больше
+                        Some((p, _, l)) if *p == path => *l = limit,
+                        cur => *cur = Some((path, Instant::now(), limit)),
+                    }
+                }
                 Msg::Icon(_, path, icon) => {
                     self.icon_pending.remove(&path);
-                    self.icon_busy_since = if self.icon_pending.is_empty() { None } else { Some(Instant::now()) };
+                    if self.icon_current.as_ref().is_some_and(|c| c.0 == path) {
+                        self.icon_current = None;
+                    }
+                    self.icon_strikes.remove(&path);
                     match icon {
                         Some((w, h, px)) => {
                             let tex = ctx.load_texture(icon_tex_name(&path), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR);
@@ -2341,11 +2382,15 @@ impl App {
                 }
             }
         }
-        if icon_worker_stalled(self.icon_pending.len(), self.icon_busy_since, Instant::now(), ICON_STALL) {
+        let icon_now = Instant::now();
+        if self.icon_current.as_ref().is_some_and(|(_, started, limit)| icon_overdue(*started, icon_now, *limit)) {
             self.reset_icon_worker();
         }
-        if !self.icon_pending.is_empty() {
-            ctx.request_repaint_after(ICON_STALL);
+        if let Some((_, started, limit)) = &self.icon_current {
+            // проснуться ровно к сроку текущего пути
+            ctx.request_repaint_after(limit.saturating_sub(icon_now.saturating_duration_since(*started)));
+        } else if !self.icon_pending.is_empty() {
+            ctx.request_repaint_after(ICON_STALL_LOCAL);
         }
         if self.hotkey.swap(false, Ordering::Relaxed) {
             self.toggle_palette(ctx);
@@ -4722,7 +4767,7 @@ impl App {
                     p.line_segment([pos2(row.left() + 36.0, row.top()), pos2(row.right(), row.top())], Stroke::new(1.0_f32, rgba(255, 255, 255, 14)));
                 }
                 let icon_r = Rect::from_center_size(pos2(row.left() + 14.0, row.center().y), vec2(22.0, 22.0));
-                let resp = ui.interact(icon_r.expand(6.0), ui.id().with(("mix-mute", i)), Sense::click()).on_hover_text(if app.muted { "Включить звук программы" } else { "Заглушить программу" });
+                let resp = ui.interact(icon_r.expand(6.0), ui.id().with(("mix-mute", &mix_paths[i])), Sense::click()).on_hover_text(if app.muted { "Включить звук программы" } else { "Заглушить программу" });
                 let icon = &mix_icons[i];
                 match icon {
                     Some(tex) => rounded_image(p, tex, icon_r, 0.0),
@@ -4743,14 +4788,27 @@ impl App {
                 let mut v = app.level;
                 let track = Rect::from_min_max(pos2(row.left() + 174.0, row.center().y - 6.0), pos2(row.right() - 44.0, row.center().y + 6.0));
                 let tone = if app.active { accent() } else { Color32::from_rgb(150, 150, 166) };
-                if slim_slider(ui, ui.id().with(("mix", i)), track, &mut v, tone, app.muted) {
+                if slim_slider(ui, ui.id().with(("mix", &mix_paths[i])), track, &mut v, tone, app.muted) {
                     set = Some((i, v));
                 }
             }
         });
         if let Some((i, v)) = set {
-            sys::set_app_volume(&self.mixer[i].path, v);
             self.mixer[i].level = v;
+            self.mix_push.1 = Some((self.mixer[i].path.clone(), v));
+        }
+        // перебор всех звуковых сессий дорог: пока тянут — не чаще раза в 40 мс, при отпускании — последнее значение
+        if self.mix_push.1.is_some() {
+            let now = Instant::now();
+            let released = !ui.input(|i| i.pointer.any_down());
+            if should_push(self.mix_push.0, now, released) {
+                if let Some((path, v)) = self.mix_push.1.take() {
+                    sys::set_app_volume(&path, v);
+                    self.mix_push.0 = Some(now);
+                }
+            } else {
+                ui.ctx().request_repaint_after(MIX_PUSH_EVERY);
+            }
         }
         if let Some(i) = mute {
             let on = !self.mixer[i].muted;
@@ -8170,12 +8228,45 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 const ICON_LIMIT: usize = 512;
 /// через сколько повторить загрузку значка, который не удалось получить
 const ICON_RETRY: Duration = Duration::from_secs(60);
-/// сколько ждать ответа воркера значков, прежде чем счесть его зависшим
-const ICON_STALL: Duration = Duration::from_secs(5);
+/// сколько ждать значок локального файла, прежде чем счесть воркер зависшим
+const ICON_STALL_LOCAL: Duration = Duration::from_secs(5);
+/// сетевому пути даём больше времени
+const ICON_STALL_REMOTE: Duration = Duration::from_secs(15);
 
-/// Завис ли воркер значков: есть ожидающие, а ответа нет дольше limit.
-fn icon_worker_stalled(pending: usize, busy_since: Option<Instant>, now: Instant, limit: Duration) -> bool {
-    pending > 0 && busy_since.is_some_and(|t| now.saturating_duration_since(t) >= limit)
+/// Сколько ждать значок одного пути.
+fn icon_limit(remote: bool) -> Duration {
+    if remote {
+        ICON_STALL_REMOTE
+    } else {
+        ICON_STALL_LOCAL
+    }
+}
+
+/// Просрочен ли текущий запрос значка.
+fn icon_overdue(started: Instant, now: Instant, limit: Duration) -> bool {
+    now.saturating_duration_since(started) >= limit
+}
+
+/// Путь, на котором воркер завис столько раз, больше не запрашиваем до перезапуска.
+fn icon_should_ban(strikes: u8) -> bool {
+    strikes >= 2
+}
+
+/// Через сколько снова пробовать путь после зависания: первый раз — минута, дальше — 5 минут.
+fn icon_retry_after(strikes: u8) -> Duration {
+    if strikes <= 1 {
+        ICON_RETRY
+    } else {
+        Duration::from_secs(300)
+    }
+}
+
+/// не чаще этого шлём громкость программы в Windows, пока тянут ползунок
+const MIX_PUSH_EVERY: Duration = Duration::from_millis(40);
+
+/// Пора ли отправить громкость: прошло 40 мс с прошлой отправки или ползунок отпустили.
+fn should_push(last: Option<Instant>, now: Instant, released: bool) -> bool {
+    released || last.map_or(true, |t| now.saturating_duration_since(t) >= MIX_PUSH_EVERY)
 }
 /// как часто перечитывать список программ
 const REINDEX_EVERY: Duration = Duration::from_secs(600);
@@ -10089,14 +10180,42 @@ mod bg_tests {
     }
 
     #[test]
-    fn icon_worker_stalled_rules() {
+    fn icon_limit_local_and_remote() {
+        assert_eq!(icon_limit(false), ICON_STALL_LOCAL);
+        assert_eq!(icon_limit(true), ICON_STALL_REMOTE);
+        assert_eq!(ICON_STALL_LOCAL, Duration::from_secs(5));
+        assert_eq!(ICON_STALL_REMOTE, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn icon_overdue_rules() {
         let t = Instant::now();
-        let lim = ICON_STALL;
-        assert!(!icon_worker_stalled(0, Some(t), t + Duration::from_secs(60), lim));
-        assert!(!icon_worker_stalled(3, None, t + Duration::from_secs(60), lim));
-        assert!(!icon_worker_stalled(1, Some(t), t + Duration::from_millis(4900), lim));
-        assert!(icon_worker_stalled(1, Some(t), t + Duration::from_secs(5), lim));
-        assert!(!icon_worker_stalled(1, Some(t + Duration::from_secs(1)), t, lim));
+        let lim = Duration::from_secs(5);
+        assert!(!icon_overdue(t, t + Duration::from_millis(4900), lim));
+        assert!(icon_overdue(t, t + lim, lim));
+        assert!(!icon_overdue(t + Duration::from_secs(1), t, lim), "часы назад — не просрочка");
+        assert!(!icon_overdue(t, t + Duration::from_secs(14), ICON_STALL_REMOTE));
+    }
+
+    #[test]
+    fn icon_ban_and_retry() {
+        assert!(!icon_should_ban(0));
+        assert!(!icon_should_ban(1));
+        assert!(icon_should_ban(2));
+        assert!(icon_should_ban(255));
+        assert_eq!(icon_retry_after(1), Duration::from_secs(60));
+        assert_eq!(icon_retry_after(2), Duration::from_secs(300));
+        assert_eq!(icon_retry_after(9), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn mixer_push_throttle() {
+        let t = Instant::now();
+        assert!(should_push(None, t, false));
+        assert!(!should_push(Some(t), t + Duration::from_millis(39), false));
+        assert!(should_push(Some(t), t + Duration::from_millis(40), false));
+        assert!(should_push(Some(t), t + Duration::from_millis(1), true), "отпускание шлёт последнее значение");
+        assert!(!should_push(Some(t + Duration::from_secs(1)), t, false));
     }
 
     #[test]
