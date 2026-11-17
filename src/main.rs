@@ -363,7 +363,7 @@ enum Emotion {
 
 enum Msg {
     Note(String),
-    City(u64, u64, f64, f64, String),
+    City(u64, u64, f64, f64, String, String),
     /// неудача поиска города: (номер запроса, текст)
     CityFailed(u64, String),
     Weather(u64, weather::Now),
@@ -1794,7 +1794,7 @@ impl App {
             std::thread::spawn(move || {
                 if let Ok(Some((la, lo, name))) = weather::geocode(&city) {
                     if weather::fits_zone(lo, weather::local_offset_hours()) {
-                        let _ = tx.send(Msg::City(gen, req, la, lo, name));
+                        let _ = tx.send(Msg::City(gen, req, la, lo, name, city));
                         ctx.request_repaint();
                     }
                 }
@@ -1830,11 +1830,11 @@ impl App {
             self.notify("Погода отключена");
             return;
         }
-        self.cfg.city = city.clone();
+        // название сохраним, только когда геокодер найдёт город: иначе остаётся прежнее
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let msg = match weather::geocode(&city) {
-                Ok(Some((lat, lon, name))) => Msg::City(gen, req, lat, lon, name),
+                Ok(Some((lat, lon, name))) => Msg::City(gen, req, lat, lon, name, city.clone()),
                 Ok(None) => Msg::CityFailed(req, "Город не найден".into()),
                 Err(_) => Msg::CityFailed(req, "Нет связи с сервером погоды".into()),
             };
@@ -2179,7 +2179,7 @@ impl App {
                         self.notify(&text);
                     }
                 }
-                Msg::City(gen, req, lat, lon, name) => {
+                Msg::City(gen, req, lat, lon, name, query) => {
                     if !weather::city_reply_accept(gen, self.weather_gen, req, self.city_req) {
                         continue;
                     }
@@ -2189,10 +2189,7 @@ impl App {
                         self.weather_err = None;
                         self.weather_fails = 0;
                     }
-                    self.cfg.city_checked = true;
-                    self.cfg.lat = Some(lat);
-                    self.cfg.lon = Some(lon);
-                    self.cfg.city_name = name.clone();
+                    apply_city(&mut self.cfg, &query, lat, lon, &name);
                     self.cfg.save();
                     self.notify(&format!("Город: {name}"));
                     self.refresh_weather(ctx);
@@ -3996,8 +3993,10 @@ impl App {
         let (strip, sresp) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::click());
         let now = chrono::Local::now();
         let midnight = now.date_naive().and_hms_opt(0, 0, 0).and_then(|m| m.and_local_timezone(chrono::Local).earliest()).map_or(now.timestamp() - 43_200, |m| m.timestamp());
-        let marks = day_marks(&self.cfg.reminders, midnight);
-        let frac_now = ((now.timestamp() - midnight) as f32 / 86_400.0).clamp(0.0, 1.0);
+        // в день перевода часов сутки длятся 23 или 25 часов
+        let day_len = now.date_naive().succ_opt().and_then(|d| d.and_hms_opt(0, 0, 0)).and_then(resolve_here).map(|m| m.timestamp() - midnight).filter(|l| *l > 0).unwrap_or(86_400);
+        let marks = day_marks(&self.cfg.reminders, midnight, day_len);
+        let frac_now = ((now.timestamp() - midnight) as f32 / day_len as f32).clamp(0.0, 1.0);
         let left_n = marks.iter().filter(|m| m.0 > frac_now).count();
         let shov = ui.ctx().animate_bool_with_time(sresp.id.with("hov"), sresp.hovered(), 0.12);
         p.text(pos2(strip.left() + 2.0, strip.center().y), Align2::LEFT_CENTER, "Сегодня", semi(11.5), mix(DIM, FG, shov));
@@ -7950,10 +7949,19 @@ fn moon_disc(p: &egui::Painter, c: Pos2, r: f32, illum: f32, waxing: bool) {
 }
 
 /// Лента дня: сегодняшние напоминания как доля суток (0..1) и текст, по порядку.
-fn day_marks(list: &[store::Reminder], day_start: i64) -> Vec<(f32, String)> {
-    let mut v: Vec<&store::Reminder> = list.iter().filter(|r| r.at >= day_start && r.at < day_start + 86_400).collect();
+/// Принять найденный геокодером город: название, координаты, отметка проверки.
+fn apply_city(cfg: &mut store::Settings, query: &str, lat: f64, lon: f64, name: &str) {
+    cfg.city = query.to_string();
+    cfg.lat = Some(lat);
+    cfg.lon = Some(lon);
+    cfg.city_name = name.to_string();
+    cfg.city_checked = true;
+}
+
+fn day_marks(list: &[store::Reminder], day_start: i64, day_len: i64) -> Vec<(f32, String)> {
+    let mut v: Vec<&store::Reminder> = list.iter().filter(|r| r.at >= day_start && r.at < day_start + day_len).collect();
     v.sort_by_key(|r| r.at);
-    v.into_iter().map(|r| ((r.at - day_start) as f32 / 86_400.0, r.text.clone())).collect()
+    v.into_iter().map(|r| ((r.at - day_start) as f32 / day_len as f32, r.text.clone())).collect()
 }
 
 /// «1 дело», «3 дела», «5 дел».
@@ -8696,12 +8704,33 @@ mod day_strip_tests {
     fn marks_only_today_sorted() {
         let day = 1_000_000;
         let list = [r("завтра", day + 86_400), r("вечер", day + 64_800), r("вчера", day - 1), r("утро", day + 21_600), r("полночь", day)];
-        let m = day_marks(&list, day);
+        let m = day_marks(&list, day, 86_400);
         assert_eq!(m.len(), 3);
         assert_eq!(m[0], (0.0, "полночь".to_string()));
         assert_eq!(m[1], (0.25, "утро".to_string()));
         assert_eq!(m[2], (0.75, "вечер".to_string()));
-        assert!(day_marks(&[], day).is_empty());
+        assert!(day_marks(&[], day, 86_400).is_empty());
+    }
+    #[test]
+    fn marks_on_25_hour_day() {
+        let day = 1_000_000;
+        let len = 90_000;
+        let list = [r("поздно", day + 86_400 + 1_800), r("середина", day + 45_000), r("завтра", day + 90_000)];
+        let m = day_marks(&list, day, len);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0], (0.5, "середина".to_string()));
+        assert_eq!(m[1], (0.98, "поздно".to_string()));
+    }
+    #[test]
+    fn apply_city_sets_all() {
+        let mut cfg = store::Settings::default();
+        cfg.city = "Старый".into();
+        apply_city(&mut cfg, "Минден", 52.3, 8.9, "Minden, DE");
+        assert_eq!(cfg.city, "Минден");
+        assert_eq!(cfg.lat, Some(52.3));
+        assert_eq!(cfg.lon, Some(8.9));
+        assert_eq!(cfg.city_name, "Minden, DE");
+        assert!(cfg.city_checked);
     }
     #[test]
     fn russian_plural() {
