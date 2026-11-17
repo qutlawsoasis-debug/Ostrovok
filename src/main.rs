@@ -1799,14 +1799,14 @@ impl App {
     }
 
     fn save_city(&mut self, ctx: &egui::Context) {
-        // новый выбор города делает все прежние запросы погоды устаревшими
-        self.weather_gen += 1;
-        let gen = self.weather_gen;
+        // ответ о новом городе придёт с поколением +1 и только тогда сделает прежние запросы устаревшими:
+        // если город не найдётся, текущая погода и её повторы продолжают работать
+        let gen = self.weather_gen + 1;
         let city = self.city_edit.trim().to_string();
-        // новый город — со свежим счётчиком сбоев, без чужой ошибки
-        self.weather_err = None;
-        self.weather_fails = 0;
         if city.is_empty() {
+            self.weather_gen = gen;
+            self.weather_err = None;
+            self.weather_fails = 0;
             self.cfg.city.clear();
             self.cfg.city_name.clear();
             self.cfg.lat = None;
@@ -2139,8 +2139,14 @@ impl App {
                     }
                 }
                 Msg::City(gen, lat, lon, name) => {
-                    if !weather::reply_fresh(gen, self.weather_gen) {
+                    if !weather::city_reply_fresh(gen, self.weather_gen) {
                         continue;
+                    }
+                    if gen != self.weather_gen {
+                        // принят новый город: свежий счётчик сбоев, без чужой ошибки
+                        self.weather_gen = gen;
+                        self.weather_err = None;
+                        self.weather_fails = 0;
                     }
                     self.cfg.city_checked = true;
                     self.cfg.lat = Some(lat);

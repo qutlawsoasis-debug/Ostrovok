@@ -108,7 +108,7 @@ pub fn spawn() -> (Arc<Mutex<State>>, mpsc::Sender<Cmd>) {
                     shared.lock().unwrap().info = Some(info);
                     if !have_thumb {
                         // обложка могла прийти от прошлого трека — берём только с меткой текущего
-                        if let Some((t, _, _)) = session.as_ref().and_then(|s| thumbnail(s).ok()).filter(|(_, ti, ar)| thumb_matches(&key, ti, ar)) {
+                        if let Some((t, _, _)) = session.as_ref().and_then(|s| thumbnail(s, &key).ok()) {
                             have_thumb = true;
                             let mut st = shared.lock().unwrap();
                             st.accent = dominant(&t.2);
@@ -182,11 +182,15 @@ pub fn track_frac(pos: f64, elapsed: f64, dur: f64, playing: bool) -> f32 {
 }
 
 /// Обложка вместе с заголовком и исполнителем из тех же свойств.
-fn thumbnail(s: &Session) -> Result<(Thumb, String, String), String> {
+fn thumbnail(s: &Session, key: &str) -> Result<(Thumb, String, String), String> {
     let e = |e: windows::core::Error| e.to_string();
     let p = s.TryGetMediaPropertiesAsync().map_err(e)?.get().map_err(e)?;
     let title = p.Title().map(|t| t.to_string()).unwrap_or_default();
     let artist = p.Artist().map(|a| a.to_string()).unwrap_or_default();
+    // свойства ещё от прошлого трека — не читаем и не декодируем картинку зря
+    if !thumb_matches(key, &title, &artist) {
+        return Err("обложка другого трека".into());
+    }
     let stream = p.Thumbnail().map_err(e)?.OpenReadAsync().map_err(e)?.get().map_err(e)?;
     let size = stream.Size().map_err(e)? as u32;
     if size == 0 || size > 8_000_000 {

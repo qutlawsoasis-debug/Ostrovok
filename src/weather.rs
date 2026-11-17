@@ -260,6 +260,21 @@ pub fn retry_after(fails: u32) -> std::time::Duration {
 }
 
 /// Ответ фонового запроса погоды актуален, только если с тех пор не сменили город.
+/// Ответ о городе: перепроверка текущего (то же поколение) или выбор нового (следующее).
+pub fn city_reply_fresh(reply: u64, current: u64) -> bool {
+    reply == current || Some(reply) == current.checked_add(1)
+}
+
+#[cfg(test)]
+#[test]
+fn city_reply_generations() {
+    assert!(city_reply_fresh(3, 3));
+    assert!(city_reply_fresh(4, 3));
+    assert!(!city_reply_fresh(2, 3));
+    assert!(!city_reply_fresh(5, 3));
+    assert!(!city_reply_fresh(0, u64::MAX));
+}
+
 pub fn reply_fresh(reply: u64, current: u64) -> bool {
     reply == current
 }
