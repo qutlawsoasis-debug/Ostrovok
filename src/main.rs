@@ -328,6 +328,92 @@ enum Action {
     Copy(String),
     Timer(f64),
     Ask(String),
+    Quick(Quick),
+}
+
+/// Быстрые команды строки поиска: «дело …», «заметка …», «напомни 18:30 …».
+#[derive(Clone, Debug, PartialEq)]
+enum Quick {
+    Todo(String),
+    Note(String),
+    Remind(String, chrono::NaiveDateTime),
+}
+
+/// Разбирает быструю команду. `now` — местное время (передаётся снаружи, чтобы проверять тестами).
+fn parse_quick(q: &str, now: chrono::NaiveDateTime) -> Option<Quick> {
+    let q = q.trim();
+    let low = q.to_lowercase();
+    let after = |prefixes: &[&str]| prefixes.iter().find_map(|p| low.strip_prefix(p).map(|_| q[p.len()..].trim().to_string()));
+    if let Some(t) = after(&["дело ", "todo "]).filter(|t| !t.is_empty()) {
+        return Some(Quick::Todo(t));
+    }
+    if let Some(t) = after(&["заметка ", "note "]).filter(|t| !t.is_empty()) {
+        return Some(Quick::Note(t));
+    }
+    let rest = after(&["напомни мне ", "напомнить ", "напомни "])?;
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    let clock = |w: &str| chrono::NaiveTime::parse_from_str(&w.replace('.', ":"), "%H:%M").ok();
+    let at_clock = |t: chrono::NaiveTime| {
+        let today = now.date().and_time(t);
+        if today <= now { today + chrono::Duration::days(1) } else { today }
+    };
+    let unit = |w: &str| -> Option<i64> {
+        let w = w.to_lowercase();
+        if w.starts_with("мин") || w == "м" {
+            Some(1)
+        } else if w.starts_with('ч') {
+            Some(60)
+        } else {
+            None
+        }
+    };
+    let text_of = |skip: std::ops::Range<usize>| words.iter().enumerate().filter(|(i, _)| !skip.contains(i)).map(|(_, w)| *w).collect::<Vec<_>>().join(" ");
+    for i in 0..words.len() {
+        let w = words[i].to_lowercase();
+        // «в 18:30» или «18:30»
+        let (start, t) = if w == "в" && i + 1 < words.len() { (i, clock(words[i + 1]).map(|t| (t, i + 2))) } else { (i, clock(&w).map(|t| (t, i + 1))) };
+        if let Some((t, end)) = t {
+            let text = text_of(start..end);
+            return (!text.is_empty()).then(|| Quick::Remind(text, at_clock(t)));
+        }
+        // «через 15 мин», «через час», «через 2 часа»
+        if w == "через" && i + 1 < words.len() {
+            let (n, unit_at) = match words[i + 1].replace(',', ".").parse::<f64>() {
+                Ok(n) => (n, i + 2),
+                Err(_) => (1.0, i + 1),
+            };
+            if let Some(mul) = words.get(unit_at).and_then(|u| unit(u)) {
+                let text = text_of(i..unit_at + 1);
+                let mins = (n * mul as f64).round() as i64;
+                return (!text.is_empty() && mins > 0).then(|| Quick::Remind(text, now + chrono::Duration::minutes(mins)));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod quick_tests {
+    use super::*;
+    fn at(h: u32, m: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 11, 17).unwrap().and_hms_opt(h, m, 0).unwrap()
+    }
+    #[test]
+    fn quick_commands() {
+        let now = at(15, 0);
+        assert_eq!(parse_quick("дело купить хлеб", now), Some(Quick::Todo("купить хлеб".into())));
+        assert_eq!(parse_quick("Заметка Идея: тёмная тема", now), Some(Quick::Note("Идея: тёмная тема".into())));
+        assert_eq!(parse_quick("напомни 18:30 позвонить маме", now), Some(Quick::Remind("позвонить маме".into(), at(18, 30))));
+        assert_eq!(parse_quick("напомни позвонить маме в 18:30", now), Some(Quick::Remind("позвонить маме".into(), at(18, 30))));
+        assert_eq!(parse_quick("напомни через 15 мин чай", now), Some(Quick::Remind("чай".into(), at(15, 15))));
+        assert_eq!(parse_quick("напомни через час выйти", now), Some(Quick::Remind("выйти".into(), at(16, 0))));
+        assert_eq!(parse_quick("напомни выключить духовку через 2 часа", now), Some(Quick::Remind("выключить духовку".into(), at(17, 0))));
+        // время уже прошло — завтра
+        assert_eq!(parse_quick("напомни 9:00 зарядка", now), Some(Quick::Remind("зарядка".into(), at(9, 0) + chrono::Duration::days(1))));
+        assert_eq!(parse_quick("напомни 18:30", now), None);
+        assert_eq!(parse_quick("дело", now), None);
+        assert_eq!(parse_quick("делать нечего", now), None);
+    }
 }
 
 struct Item {
@@ -1109,6 +1195,19 @@ impl App {
         }
         let low = q.to_lowercase();
 
+        if let Some(cmd) = parse_quick(&q, chrono::Local::now().naive_local()) {
+            let today = chrono::Local::now().date_naive();
+            let title = match &cmd {
+                Quick::Todo(t) => format!("Добавить дело: {t}"),
+                Quick::Note(t) => format!("Новая заметка: {t}"),
+                Quick::Remind(t, at) => {
+                    let day = if at.date() == today { "сегодня".to_string() } else if at.date() == today.succ_opt().unwrap_or(today) { "завтра".to_string() } else { at.format("%d.%m").to_string() };
+                    format!("Напомнить {day} в {}: {t}", at.format("%H:%M"))
+                }
+            };
+            self.results.push(Item { title, sub: "Enter".into(), action: Action::Quick(cmd) });
+        }
+
         for prefix in ["таймер ", "timer "] {
             if let Some(rest) = low.strip_prefix(prefix) {
                 if let Ok(m) = rest.trim().replace(',', ".").parse::<f64>() {
@@ -1202,6 +1301,35 @@ impl App {
                 self.tab = Tab::Ai;
                 self.sticky = true;
                 self.ask(q);
+            }
+            Action::Quick(Quick::Todo(text)) => {
+                self.cfg.todos.insert(0, store::Todo { text, done: false });
+                self.cfg.todos.truncate(60);
+                self.cfg.save();
+                self.notify("Дело добавлено");
+            }
+            Action::Quick(Quick::Note(text)) => {
+                // пустую заметку в начале списка заменяем, иначе добавляем новую сверху
+                if self.notes.first().is_some_and(|n| n.trim().is_empty()) {
+                    self.notes[0] = text;
+                } else {
+                    self.notes.insert(0, text);
+                }
+                self.note_sel = 0;
+                self.notes_dirty = Some(Instant::now());
+                self.notify("Заметка сохранена");
+            }
+            Action::Quick(Quick::Remind(text, at)) => {
+                use chrono::TimeZone;
+                match chrono::Local.from_local_datetime(&at).single() {
+                    Some(t) => {
+                        self.cfg.reminders.push(store::Reminder { text, at: t.timestamp() });
+                        self.cfg.reminders.sort_by_key(|r| r.at);
+                        self.cfg.save();
+                        self.notify(&format!("Напомню в {}", at.format("%H:%M")));
+                    }
+                    None => self.notify("Не понял время"),
+                }
             }
         }
     }
@@ -4619,6 +4747,9 @@ impl App {
                 Action::Copy(_) => ("\u{E8EF}", Color32::from_rgb(0xB9, 0xA4, 0xFF)),
                 Action::Timer(_) => ("\u{E916}", Color32::from_rgb(0xFF, 0xB3, 0x40)),
                 Action::Ask(_) => ("\u{E8BD}", Color32::from_rgb(0xE3, 0xA8, 0xFF)),
+                Action::Quick(Quick::Todo(_)) => ("\u{E73E}", Color32::from_rgb(0x7B, 0xE0, 0x9A)),
+                Action::Quick(Quick::Note(_)) => ("\u{E70B}", Color32::from_rgb(0xFF, 0xD0, 0x60)),
+                Action::Quick(Quick::Remind(..)) => ("\u{E823}", Color32::from_rgb(0xFF, 0x8A, 0x7A)),
             };
             let tex = match &it.action {
                 Action::Launch(path) => icons
