@@ -1846,6 +1846,33 @@ impl App {
                 f.eye(cx - 3.8, base - hh * 0.42, 2.5, 2.9, ink, white, true);
                 f.eye(cx + 3.8, base - hh * 0.42, 2.5, 2.9, ink, white, true);
             }
+            5 => {
+                // лисёнок: рыжая мордочка, большие уши с тёмными кончиками, белые щёки и чёрный нос
+                let fox = Color32::from_rgb(0xFF, 0x9A, 0x4D);
+                let tip = Color32::from_rgb(0x5A, 0x34, 0x2A);
+                let perk = if (t * 1.1 + 2.0).sin() > 0.96 { 1.0 } else { 0.0 };
+                for side in [-1.0f32, 1.0] {
+                    let base_out = pos2(cx + side * 9.5, y - 1.0);
+                    let base_in = pos2(cx + side * 2.5, y - 6.0);
+                    let top = pos2(cx + side * 9.0, y - 12.0 - if side < 0.0 { perk } else { 0.0 });
+                    p.add(egui::Shape::convex_polygon(vec![base_out, top, base_in], fox, Stroke::NONE));
+                    // тёмный кончик уха
+                    let k = 0.38;
+                    let a = pos2(top.x + (base_out.x - top.x) * k, top.y + (base_out.y - top.y) * k);
+                    let b = pos2(top.x + (base_in.x - top.x) * k, top.y + (base_in.y - top.y) * k);
+                    p.add(egui::Shape::convex_polygon(vec![a, top, b], tip, Stroke::NONE));
+                }
+                // голова — широкий овал, книзу сужается в мордочку
+                p.add(egui::Shape::ellipse_filled(pos2(cx, y + 0.5), vec2(10.5, 7.8), fox));
+                p.add(egui::Shape::convex_polygon(vec![pos2(cx - 7.0, y + 2.0), pos2(cx + 7.0, y + 2.0), pos2(cx, y + 8.6)], fox, Stroke::NONE));
+                // белые щёки
+                p.add(egui::Shape::ellipse_filled(pos2(cx - 4.6, y + 4.0), vec2(4.2, 3.0), white));
+                p.add(egui::Shape::ellipse_filled(pos2(cx + 4.6, y + 4.0), vec2(4.2, 3.0), white));
+                p.add(egui::Shape::convex_polygon(vec![pos2(cx - 3.5, y + 4.5), pos2(cx + 3.5, y + 4.5), pos2(cx, y + 8.2)], white, Stroke::NONE));
+                f.eye(cx - 4.0, y - 0.6, 2.3, 2.8, ink, white, true);
+                f.eye(cx + 4.0, y - 0.6, 2.3, 2.8, ink, white, true);
+                p.add(egui::Shape::ellipse_filled(pos2(cx, y + 6.6), vec2(1.5, 1.1), ink));
+            }
             _ => {
                 // глазки: два больших глаза с бликами в зрачках
                 f.eye(cx - 6.4, y - 0.5, 5.9, 6.5, white, ink, false);
@@ -3969,9 +3996,9 @@ impl App {
             });
             ui.add_space(4.0);
             head(ui, "ПЕРСОНАЖ");
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 5.0;
-                for (i, name) in ["Глазки", "Робот", "Кот", "Призрак", "Слайм"].into_iter().enumerate() {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(5.0, 5.0);
+                for (i, name) in ["Глазки", "Робот", "Кот", "Призрак", "Слайм", "Лисёнок"].into_iter().enumerate() {
                     let on = self.cfg.character == i as u8;
                     let width = ui.painter().layout_no_wrap(name.to_string(), semi(12.5), FG).size().x + 20.0;
                     let (r, resp) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
