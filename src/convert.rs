@@ -338,7 +338,7 @@ impl Rates {
             let mut st = me.state.lock().unwrap();
             st.2 = false;
             if let Some((text, map)) = fetched.and_then(|t| parse(&t).map(|m| (t, m))) {
-                let _ = std::fs::write(&cache, text);
+                let _ = crate::store::write_atomic(&cache, text.as_bytes());
                 st.0 = Some(map);
                 st.1 = Some(Instant::now());
                 me.failed.store(false, std::sync::atomic::Ordering::Relaxed);
