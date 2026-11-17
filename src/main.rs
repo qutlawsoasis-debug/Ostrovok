@@ -1050,6 +1050,10 @@ struct App {
     power_pick: &'static str,
     was_foreground: bool,
     qr_text: String,
+    /// последний закодированный QR, чтобы не кодировать каждый кадр
+    qr_cache: Option<QrCache>,
+    /// палитра была открыта в прошлом кадре (чистка значков при закрытии)
+    palette_was_open: bool,
     /// QR для Wi-Fi: режим, сеть, пароль (только в памяти, пока открыта страница), показать ли пароль, с паролем ли сеть
     qr_wifi: bool,
     wifi_ssid: String,
@@ -1181,7 +1185,7 @@ impl App {
             let apps = apps.clone();
             std::thread::spawn(move || {
                 let list = sys::index_apps();
-                *apps.lock().unwrap() = list;
+                *lock(&apps) = list;
             });
         }
 
@@ -1345,6 +1349,8 @@ impl App {
             power_pick: "sleep",
             was_foreground: false,
             qr_text: String::new(),
+            qr_cache: None,
+            palette_was_open: false,
             qr_wifi: false,
             wifi_ssid: String::new(),
             wifi_pass: String::new(),
@@ -1901,7 +1907,7 @@ impl App {
         }
 
         {
-            let apps = self.apps.lock().unwrap();
+            let apps = lock(&self.apps);
             let rank = |low: &str, bias: u8| {
                 let low = low.to_string();
                 move |a: &(String, String)| {
@@ -1947,9 +1953,31 @@ impl App {
         self.results.truncate(7);
     }
 
+    /// Не даёт кэшу значков расти без конца; заодно сбрасывает неудачные (None) — попробуем снова.
+    fn prune_icons(&mut self) {
+        self.app_icons.retain(|_, v| v.is_some());
+        let apps = lock(&self.apps);
+        let mut keep: std::collections::HashSet<&str> = apps.iter().map(|a| a.1.as_str()).collect();
+        keep.extend(self.cfg.shelf.iter().map(String::as_str));
+        keep.extend(self.cfg.apps.iter().map(|a| a.path.as_str()));
+        keep.extend(self.mixer.iter().map(|a| a.path.as_str()));
+        keep.extend(self.results.iter().filter_map(|r| if let Action::Launch(p) = &r.action { Some(p.as_str()) } else { None }));
+        let gone = icon_keys_to_drop(self.app_icons.keys().map(String::as_str), &keep, ICON_LIMIT);
+        drop(apps);
+        for k in gone {
+            self.app_icons.remove(&k);
+        }
+    }
+
     fn run(&mut self, action: Action) {
         self.mode = Mode::Pill;
         match action {
+            Action::Launch(p) if !p.starts_with("\\\\") && !std::path::Path::new(&p).exists() => {
+                // ярлык удалили после индексации — убираем его из поиска
+                lock(&self.apps).retain(|a| a.1 != p);
+                self.app_icons.remove(&p);
+                self.notify("Ярлык удалён");
+            }
             Action::Launch(p) | Action::Url(p) => sys::open(&p),
             Action::Copy(s) if s.is_empty() => {}
             Action::Copy(s) => {
@@ -2949,10 +2977,9 @@ impl App {
             empty_at(ui.painter(), area.center(), "\u{ED14}", "Кода пока нет", hint);
             return;
         }
-        match qr_encode(text) {
-            Some(code) => {
-                let n = code.width();
-                let colors = code.to_colors();
+        // кодируем только при смене текста; копия клеток дешевле кодирования
+        match qr_cached(&mut self.qr_cache, text).cloned() {
+            Some((n, colors)) => {
                 let side = 168.0;
                 let sq = Rect::from_center_size(area.center() - vec2(90.0, 0.0), vec2(side, side));
                 let p = ui.painter();
@@ -2963,7 +2990,7 @@ impl App {
                 let finder = |x: usize, y: usize| (x < 7 && y < 7) || (x >= n - 7 && y < 7) || (x < 7 && y >= n - 7);
                 for (i, c) in colors.iter().enumerate() {
                     let (x, y) = (i % n, i / n);
-                    if *c == qrcode::Color::Dark && !finder(x, y) {
+                    if *c && !finder(x, y) {
                         let at = sq.min + vec2((x as f32 + 0.5) * cell, (y as f32 + 0.5) * cell);
                         p.circle_filled(at, cell * 0.49, ink);
                     }
@@ -2998,7 +3025,7 @@ impl App {
                     let size = (n as u32 + quiet * 2) * scale;
                     let img = image::RgbaImage::from_fn(size, size, |px, py| {
                         let (x, y) = ((px / scale) as i64 - quiet as i64, (py / scale) as i64 - quiet as i64);
-                        let dark = x >= 0 && y >= 0 && (x as usize) < n && (y as usize) < n && colors[y as usize * n + x as usize] == qrcode::Color::Dark;
+                        let dark = x >= 0 && y >= 0 && (x as usize) < n && (y as usize) < n && colors[y as usize * n + x as usize];
                         if dark { image::Rgba([0, 0, 0, 255]) } else { image::Rgba([255, 255, 255, 255]) }
                     });
                     if save {
@@ -3312,7 +3339,7 @@ impl App {
             });
         });
         // забираем миниатюры, прочитанные в фоне
-        for (path, px) in std::mem::take(&mut *self.shelf_thumb_q.lock().unwrap()) {
+        for (path, px) in std::mem::take(&mut *lock(&self.shelf_thumb_q)) {
             if !self.cfg.shelf.contains(&path) {
                 continue;
             }
@@ -3348,7 +3375,7 @@ impl App {
                         let (q, p, ctx) = (self.shelf_thumb_q.clone(), path.clone(), ui.ctx().clone());
                         std::thread::spawn(move || {
                             let px = load_thumb(&p);
-                            q.lock().unwrap().push((p, px));
+                            lock(&q).push((p, px));
                             ctx.request_repaint();
                         });
                     }
@@ -3413,6 +3440,7 @@ impl App {
             self.shelf_meta.remove(&path);
             self.shelf_thumbs.remove(&path);
             self.cfg.save();
+            self.prune_icons();
         }
     }
 
@@ -3863,7 +3891,7 @@ impl App {
             if !q.is_empty() {
                 let low = q.to_lowercase();
                 let found = {
-                    let apps = self.apps.lock().unwrap();
+                    let apps = lock(&self.apps);
                     let mut hits: Vec<&(String, String)> = apps.iter().filter(|a| a.0.to_lowercase().contains(&low)).collect();
                     hits.sort_by_key(|a| (!a.0.to_lowercase().starts_with(&low), a.0.len()));
                     hits.first().map(|a| (a.0.clone(), a.1.clone()))
@@ -6510,7 +6538,7 @@ impl App {
         }
         // демо-запрос строится до того, как в фоне загрузился список программ, — пересобираем один раз
         static DEMO_APPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if self.palette_demo && !DEMO_APPS.load(Ordering::Relaxed) && !self.apps.lock().unwrap().is_empty() {
+        if self.palette_demo && !DEMO_APPS.load(Ordering::Relaxed) && !lock(&self.apps).is_empty() {
             DEMO_APPS.store(true, Ordering::Relaxed);
             self.build_results();
         }
@@ -6673,7 +6701,7 @@ impl App {
                             });
                             Mutex::new(req_tx)
                         });
-                        let _ = worker.lock().unwrap().send(path.clone());
+                        let _ = lock(worker).send(path.clone());
                         None
                     })
                     .clone(),
@@ -6728,6 +6756,11 @@ impl eframe::App for App {
         let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.05);
         let time = ctx.input(|i| i.time);
         self.pump(ctx, now);
+        let palette_open = self.mode == Mode::Palette;
+        if self.palette_was_open && !palette_open {
+            self.prune_icons();
+        }
+        self.palette_was_open = palette_open;
         // ── обновление как представление: шкала в пилюле → остров сжимается в каплю и втягивается за верхний
         // край экрана → новая версия падает оттуда же и разворачивается обратно
         self.upd_shape = None;
@@ -7881,9 +7914,39 @@ fn qr_encode(text: &str) -> Option<qrcode::QrCode> {
     qrcode::QrCode::new(text.as_bytes()).ok()
 }
 
+/// Кэш QR: текст и (ширина, тёмные клетки) либо None, если не помещается.
+type QrCache = (String, Option<(usize, Vec<bool>)>);
+
+/// QR из кэша; пересчитывает только при смене текста.
+fn qr_cached<'a>(cache: &'a mut Option<QrCache>, text: &str) -> Option<&'a (usize, Vec<bool>)> {
+    if cache.as_ref().is_none_or(|(t, _)| t != text) {
+        let v = qr_encode(text).map(|c| (c.width(), c.to_colors().into_iter().map(|c| c == qrcode::Color::Dark).collect()));
+        *cache = Some((text.to_string(), v));
+    }
+    cache.as_ref().and_then(|(_, v)| v.as_ref())
+}
+
+/// Мьютекс без паники: отравленный (поток упал под замком) всё равно читаем.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Предел числа значков в памяти.
+const ICON_LIMIT: usize = 512;
+
+/// Какие ключи значков выбросить: если их больше limit — все вне keep.
+fn icon_keys_to_drop<'a>(keys: impl Iterator<Item = &'a str>, keep: &std::collections::HashSet<&str>, limit: usize) -> Vec<String> {
+    let keys: Vec<&str> = keys.collect();
+    if keys.len() <= limit {
+        return Vec::new();
+    }
+    keys.into_iter().filter(|k| !keep.contains(k)).map(str::to_string).collect()
+}
+
 /// Подпись вида содержимого кода.
 fn qr_kind(text: &str) -> &'static str {
-    if text.starts_with("http://") || text.starts_with("https://") {
+    let has = |pre: &str| text.get(..pre.len()).is_some_and(|h| h.eq_ignore_ascii_case(pre));
+    if has("http://") || has("https://") {
         "Ссылка"
     } else if text.starts_with("WIFI:") {
         "Wi‑Fi"
@@ -9622,5 +9685,59 @@ mod clip_transform_tests {
         assert_eq!(clip_transform(ClipTx::Layout, "Ghbdtn"), "Привет");
         assert_eq!(clip_transform(ClipTx::Layout, "руддщ цщкдв"), "hello world");
         assert_eq!(clip_transform(ClipTx::Layout, "123 - !"), "123 - !");
+    }
+}
+
+#[cfg(test)]
+mod cache_lock_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn qr_cache_reuses_and_recomputes() {
+        let mut c: Option<QrCache> = None;
+        assert!(qr_cached(&mut c, "abc").is_some());
+        // подменяем данные: повтор с тем же текстом не должен пересчитывать
+        if let Some((_, Some((_, v)))) = c.as_mut() {
+            v.clear();
+        }
+        assert!(qr_cached(&mut c, "abc").unwrap().1.is_empty());
+        assert!(!qr_cached(&mut c, "другое").unwrap().1.is_empty());
+        let long: String = std::iter::repeat('я').take(3000).collect();
+        assert!(qr_cached(&mut c, &long).is_none());
+        assert_eq!(c.as_ref().map(|(t, v)| (t == &long, v.is_none())), Some((true, true)));
+    }
+
+    #[test]
+    fn qr_kind_case_insensitive_and_safe() {
+        assert_eq!(qr_kind("HTTPS://A.RU"), "Ссылка");
+        assert_eq!(qr_kind("Http://x"), "Ссылка");
+        assert_eq!(qr_kind("httpsx"), "Текст");
+        assert_eq!(qr_kind("приветмир"), "Текст");
+        assert_eq!(qr_kind("пр"), "Текст");
+        assert_eq!(qr_kind(""), "Текст");
+    }
+
+    #[test]
+    fn lock_reads_poisoned_mutex() {
+        let m = Arc::new(Mutex::new(5));
+        let m2 = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("отравляем");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        assert_eq!(*lock(&m), 5);
+    }
+
+    #[test]
+    fn icon_keys_drop_only_over_limit() {
+        let keys: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        let keep: HashSet<&str> = ["a"].into_iter().collect();
+        assert!(icon_keys_to_drop(keys.iter().map(|s| s.as_str()), &keep, 3).is_empty());
+        let mut d = icon_keys_to_drop(keys.iter().map(|s| s.as_str()), &keep, 2);
+        d.sort();
+        assert_eq!(d, vec!["b".to_string(), "c".to_string()]);
     }
 }

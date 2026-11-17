@@ -212,28 +212,26 @@ pub fn ocr(w: usize, h: usize, rgba: &[u8]) -> Result<String, String> {
 
 /// Ярлыки из меню «Пуск» и с рабочего стола для поиска.
 pub fn index_apps() -> Vec<(String, String)> {
-    fn walk(dir: &Path, depth: u8, out: &mut Vec<(String, String)>, seen: &mut std::collections::HashSet<String>) {
+    fn walk(dir: &Path, depth: u8, out: &mut Vec<(String, String, String)>) {
         let Ok(rd) = std::fs::read_dir(dir) else { return };
         for entry in rd.flatten() {
             let path = entry.path();
             if path.is_dir() {
                 if depth < 5 {
-                    walk(&path, depth + 1, out, seen);
+                    walk(&path, depth + 1, out);
                 }
             } else if path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
                 let Some(name) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-                let low = name.to_lowercase();
-                if low.contains("uninstall") || low.contains("удал") {
+                if is_uninstaller(name) {
                     continue;
                 }
-                if seen.insert(low) {
-                    out.push((name.to_string(), path.display().to_string()));
-                }
+                let lnk = path.display().to_string();
+                let target = lnk_target(&lnk).filter(|t| !t.is_empty()).unwrap_or_else(|| lnk.clone());
+                out.push((name.to_string(), lnk, target));
             }
         }
     }
     let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
     let mut roots = Vec::new();
     if let Ok(a) = std::env::var("APPDATA") {
         roots.push(format!(r"{a}\Microsoft\Windows\Start Menu"));
@@ -245,9 +243,22 @@ pub fn index_apps() -> Vec<(String, String)> {
         roots.push(format!(r"{u}\Desktop"));
     }
     for r in roots {
-        walk(Path::new(&r), 0, &mut out, &mut seen);
+        walk(Path::new(&r), 0, &mut out);
     }
-    out
+    dedup_apps(out)
+}
+
+/// Ярлык деинсталлятора — в поиск не берём.
+pub fn is_uninstaller(name: &str) -> bool {
+    let low = name.to_lowercase();
+    low.contains("uninstall") || low.contains("деинстал") || low.starts_with("удалить") || low.starts_with("удаление") || low.contains(" удалить") || low.contains(" удаление")
+}
+
+/// Убирает повторы по (имя, цель) без учёта регистра; первый побеждает.
+/// Вход: (имя, путь .lnk, цель), выход: (имя, путь .lnk).
+pub fn dedup_apps(list: Vec<(String, String, String)>) -> Vec<(String, String)> {
+    let mut seen = std::collections::HashSet::new();
+    list.into_iter().filter(|(n, _, t)| seen.insert((n.to_lowercase(), t.to_lowercase()))).map(|(n, l, _)| (n, l)).collect()
 }
 
 /// Простой калькулятор: + - * / скобки и унарный минус.
@@ -1189,5 +1200,28 @@ mod cpu_top_tests {
         assert_eq!(pretty_name("GAME.EXE"), "GAME");
         assert_eq!(pretty_name("ёлка.exe"), "Ёлка");
         assert_eq!(pretty_name(""), "");
+    }
+}
+
+#[cfg(test)]
+mod apps_index_tests {
+    use super::*;
+
+    #[test]
+    fn uninstaller_names() {
+        assert!(is_uninstaller("Uninstall Foo"));
+        assert!(is_uninstaller("Удалить Foo"));
+        assert!(is_uninstaller("Удаление программы"));
+        assert!(is_uninstaller("Деинсталлятор"));
+        assert!(!is_uninstaller("Удалённый рабочий стол"));
+        assert!(!is_uninstaller("Firefox"));
+    }
+
+    #[test]
+    fn dedup_by_name_and_target_first_wins() {
+        let s = |a: &str, b: &str, c: &str| (a.to_string(), b.to_string(), c.to_string());
+        let v = vec![s("Foo", "a.lnk", "C:\\X.exe"), s("foo", "b.lnk", "c:\\x.exe"), s("Foo", "c.lnk", "C:\\Y.exe"), s("Bar", "d.lnk", "C:\\X.exe")];
+        let p = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(dedup_apps(v), vec![p("Foo", "a.lnk"), p("Foo", "c.lnk"), p("Bar", "d.lnk")]);
     }
 }
