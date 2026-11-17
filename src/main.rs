@@ -4500,13 +4500,20 @@ impl App {
     }
 
     fn ui_palette(&mut self, ui: &mut egui::Ui) {
-        let te = ui.add(
-            egui::TextEdit::singleline(&mut self.query)
-                .hint_text(RichText::new("Программа, сайт, пример, «5 км в мили», «100 usd в рубли» или «таймер 5»").color(DIM))
-                .desired_width(f32::INFINITY)
-                .frame(false)
-                .font(FontId::proportional(17.0)),
-        );
+        let te = ui
+            .allocate_ui_with_layout(vec2(ui.available_width(), 28.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add_space(2.0);
+                ui.label(RichText::new("\u{E721}").size(15.0).color(accent()));
+                ui.add_space(2.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.query)
+                        .hint_text(RichText::new("Программа, сайт, пример, «5 км в мили», «100 usd в рубли» или «таймер 5»").color(DIM))
+                        .desired_width(f32::INFINITY)
+                        .frame(false)
+                        .font(FontId::proportional(17.0)),
+                )
+            })
+            .inner;
         if self.focus_query {
             te.request_focus();
             self.focus_query = false;
@@ -4514,6 +4521,12 @@ impl App {
         if te.changed() {
             self.build_results();
             self.sel = 0;
+        }
+        // демо-запрос строится до того, как в фоне загрузился список программ, — пересобираем один раз
+        static DEMO_APPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if self.palette_demo && !DEMO_APPS.load(Ordering::Relaxed) && !self.apps.lock().unwrap().is_empty() {
+            DEMO_APPS.store(true, Ordering::Relaxed);
+            self.build_results();
         }
         // спросили про валюту — подгружаем курсы и, когда они придут, пересчитываем ответ
         if convert::wants_rates(&self.query) {
@@ -4552,15 +4565,45 @@ impl App {
         }
         ui.add_space(4.0);
         ui.spacing_mut().item_spacing.y = 2.0;
+        let icons = &mut self.app_icons;
         for (i, it) in self.results.iter().enumerate() {
             let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H - 2.0), Sense::click());
             if resp.hovered() || i == self.sel {
                 let a = if i == self.sel { 34 } else { 16 };
                 ui.painter().rect_filled(r, Rounding::same(9.0), tint(a));
+                if i == self.sel {
+                    // выбранная строка — тонкая полоска акцента слева
+                    let bar = Rect::from_min_max(pos2(r.left() + 3.0, r.top() + 8.0), pos2(r.left() + 5.5, r.bottom() - 8.0));
+                    ui.painter().rect_filled(bar, Rounding::same(1.5), accent());
+                }
+            }
+            // значок по типу результата; у программ — их собственный значок
+            let ic = Rect::from_center_size(pos2(r.left() + 24.0, r.center().y), vec2(20.0, 20.0));
+            let (glyph, color) = match &it.action {
+                Action::Launch(_) => ("\u{E8FC}", Color32::from_rgb(0xC6, 0xCB, 0xDD)),
+                Action::Url(_) if it.sub == "Google" => ("\u{E721}", Color32::from_rgb(0x8F, 0xCB, 0xFF)),
+                Action::Url(_) => ("\u{E774}", Color32::from_rgb(0x7F, 0xC8, 0xFF)),
+                Action::Copy(_) => ("\u{E8EF}", Color32::from_rgb(0xB9, 0xA4, 0xFF)),
+                Action::Timer(_) => ("\u{E916}", Color32::from_rgb(0xFF, 0xB3, 0x40)),
+                Action::Ask(_) => ("\u{E8BD}", Color32::from_rgb(0xE3, 0xA8, 0xFF)),
+            };
+            let tex = match &it.action {
+                Action::Launch(path) => icons
+                    .entry(path.clone())
+                    .or_insert_with(|| sys::icon_rgba(path).map(|(w, h, px)| ui.ctx().load_texture(format!("pal-{path}"), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR)))
+                    .clone(),
+                _ => None,
+            };
+            match tex {
+                Some(t) => rounded_image(ui.painter(), &t, ic, 0.0),
+                None => {
+                    ui.painter().circle_filled(ic.center(), 12.0, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 26));
+                    ui.painter().text(ic.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(12.5), color);
+                }
             }
             let p = ui.painter().with_clip_rect(r);
             p.text(pos2(r.right() - 12.0, r.center().y), Align2::RIGHT_CENTER, &it.sub, FontId::proportional(11.5), DIM);
-            p.text(pos2(r.left() + 12.0, r.center().y), Align2::LEFT_CENTER, &it.title, FontId::proportional(14.0), FG);
+            p.text(pos2(r.left() + 44.0, r.center().y), Align2::LEFT_CENTER, &it.title, FontId::proportional(14.0), FG);
             if resp.clicked() {
                 run = Some(i);
             }
