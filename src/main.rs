@@ -1491,7 +1491,7 @@ impl App {
                 }
                 "clip" => {
                     // для снимков: образцы записей, чтобы страница не была пустой
-                    app.clips = ["https://github.com/qutlawsoasis-debug/Ostrovok", "#7C5CFF", "128 * 4 + 16", "Купить хлеб и молоко по дороге домой", r"C:\Windows\System32", "hello@example.org"].map(String::from).to_vec();
+                    app.clips = ["ghbdtn, rfr ltkf?", "https://github.com/qutlawsoasis-debug/Ostrovok", "#7C5CFF", "128 * 4 + 16", "Купить SSD на 2 ТБ и термопасту", r"C:\Windows\System32"].map(String::from).to_vec();
                     // и несколько «снимков» — градиенты разных пропорций
                     for (k, (w, h)) in [(1920usize, 1080usize), (800, 800), (1280, 720), (600, 900)].into_iter().enumerate() {
                         let (a, b) = (hue(0.12 + k as f32 * 0.21, 1.0), hue(0.45 + k as f32 * 0.17, 1.0));
@@ -2982,7 +2982,8 @@ impl App {
             });
             for i in order {
                 let item = &self.cfg.todos[i];
-                let due = due_of(item).map(|d| due_label(d, today));
+                // у сделанного дела «просрочено» бессмысленно — показываем просто дату
+                let due = due_of(item).map(|d| if item.done { due_date_label(d) } else { due_label(d, today) });
                 let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 6.0, 38.0), Sense::click());
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
                 let k = ui.ctx().animate_bool_with_time(ui.id().with(("todo-done", &item.text)), item.done, 0.16);
@@ -7267,12 +7268,16 @@ fn due_label(due: chrono::NaiveDate, today: chrono::NaiveDate) -> (String, u8) {
         0 => ("сегодня".into(), 1),
         d if d < 0 => (format!("просрочено {} д", -d), 2),
         1 => ("завтра".into(), 0),
-        _ => {
-            const WD: [&str; 7] = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"];
-            const MON: [&str; 12] = ["янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "нояб", "дек"];
-            (format!("{}, {} {}", WD[due.weekday().num_days_from_monday() as usize], due.day(), MON[due.month0() as usize]), 0)
-        }
+        _ => due_date_label(due),
     }
+}
+
+/// «пт, 20 нояб» — дата срока без оценки.
+fn due_date_label(due: chrono::NaiveDate) -> (String, u8) {
+    use chrono::Datelike;
+    const WD: [&str; 7] = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"];
+    const MON: [&str; 12] = ["янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "нояб", "дек"];
+    (format!("{}, {} {}", WD[due.weekday().num_days_from_monday() as usize], due.day(), MON[due.month0() as usize]), 0)
 }
 
 /// Новое дело из строки: срок вынимается из текста.
@@ -7714,6 +7719,12 @@ fn smart_hint(text: &str) -> Option<Hint> {
             }
         }
     }
+    // «ghbdtn, rfr ltkf?» — русский текст в английской раскладке: гласных почти нет
+    if wrong_layout(t) {
+        // аккуратный перевод раскладки из «Буфера»: запятая после слова остаётся запятой
+        let fixed = clip_transform(ClipTx::Layout, t);
+        return Some(Hint { glyph: "\u{E8D3}", label: format!("→ {}", fixed.chars().take(28).collect::<String>()), color: [0x7B, 0xE0, 0x9A], act: HintAct::Copy(fixed) });
+    }
     if foreign_phrase(t) {
         let url = format!("https://translate.google.com/?sl=auto&tl=ru&op=translate&text={}", weather::encode(t));
         return Some(Hint { glyph: "\u{E774}", label: "Перевести".into(), color: [0x7F, 0xC8, 0xFF], act: HintAct::Open(url) });
@@ -7735,6 +7746,16 @@ fn swap_layout(s: &str) -> String {
             from.iter().position(|x| *x == l).map_or(c, |i| to[i])
         })
         .collect()
+}
+
+/// Латиница, в которой почти нет гласных, — скорее всего русский текст, набранный в английской раскладке.
+fn wrong_layout(t: &str) -> bool {
+    let letters: Vec<char> = t.chars().filter(|c| c.is_ascii_alphabetic()).map(|c| c.to_ascii_lowercase()).collect();
+    if letters.len() < 4 || t.chars().any(|c| ('\u{400}'..='\u{4FF}').contains(&c)) || t.contains("://") || t.contains('@') {
+        return false;
+    }
+    let vowels = letters.iter().filter(|c| "aeiouy".contains(**c)).count();
+    vowels * 100 / letters.len() < 15 && swap_layout(t).chars().filter(|c| ('\u{400}'..='\u{4FF}').contains(c)).count() >= letters.len()
 }
 
 /// Фраза на иностранном языке, которую стоит предложить перевести: хотя бы два слова, почти все буквы
@@ -7761,6 +7782,10 @@ mod hint_tests {
         assert!(!foreign_phrase("cargo build --release_mode"));
         assert!(!foreign_phrase("12 34 56 ab"));
         assert!(matches!(smart_hint("good morning everyone").map(|h| h.label), Some(l) if l == "Перевести"));
+        assert!(wrong_layout("ghbdtn, rfr ltkf?"));
+        assert!(!wrong_layout("Hello, how are you?"));
+        assert!(!wrong_layout("https://x.org"));
+        assert!(matches!(smart_hint("ghbdtn, rfr ltkf?").map(|h| h.label), Some(l) if l.starts_with("→ привет, как")));
         assert_eq!(swap_layout("тщеузфв"), "notepad");
         assert_eq!(swap_layout("ghbdtn"), "привет");
         assert_eq!(swap_layout("Ntktuhfv"), "телеграм");
