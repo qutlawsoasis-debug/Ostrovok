@@ -196,6 +196,50 @@ pub fn temp_rgb(t: f64) -> [u8; 3] {
     [c(0), c(1), c(2)]
 }
 
+/// Вид подсказки — по нему интерфейс выбирает значок и цвет.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Tip {
+    Rain,
+    Snow,
+    Cold,
+    Hot,
+    Wind,
+}
+
+/// Короткие подсказки «что надеть и взять» на ближайшие 12 часов: осадки, холод или жара, ветер. Не больше двух.
+pub fn advice(feels: f64, wind: f64, hours: &[Hour]) -> Vec<String> {
+    advice_tips(feels, wind, hours).into_iter().map(|t| t.1).collect()
+}
+
+/// То же, что advice, но с видом каждой подсказки.
+pub fn advice_tips(feels: f64, wind: f64, hours: &[Hour]) -> Vec<(Tip, String)> {
+    let soon = &hours[..hours.len().min(12)];
+    let mut out = Vec::new();
+    if let Some((i, h)) = soon.iter().enumerate().find(|(_, h)| h.rain >= 50.0) {
+        let snow = matches!(h.code, 71..=77 | 85 | 86);
+        let text = match (snow, i == 0) {
+            (true, true) => "Сейчас снег — обувь, которая не промокнет".into(),
+            (true, false) => format!("Снег около {:02}:00 — обувь, которая не промокнет", h.hour),
+            (false, true) => "Сейчас дождь — возьмите зонт".into(),
+            (false, false) => format!("Дождь около {:02}:00 — возьмите зонт", h.hour),
+        };
+        out.push((if snow { Tip::Snow } else { Tip::Rain }, text));
+    }
+    let cold = soon.iter().map(|h| h.temp).fold(feels, f64::min);
+    if cold <= -10.0 {
+        out.push((Tip::Cold, format!("Мороз до {}° — шапка и тёплая куртка", (cold.round() as i64).to_string().replace('-', "−"))));
+    } else if cold <= 5.0 {
+        out.push((Tip::Cold, "Прохладно — возьмите куртку".into()));
+    } else if feels >= 27.0 {
+        out.push((Tip::Hot, "Жарко — вода и лёгкая одежда".into()));
+    }
+    if wind >= 10.0 {
+        out.push((Tip::Wind, format!("Сильный ветер {wind:.0} м/с")));
+    }
+    out.truncate(2);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +260,38 @@ mod tests {
         assert!(fits_zone(37.6, 3.0)); // Москва
         assert!(fits_zone(131.9, 10.0)); // Владивосток
         assert!(fits_zone(179.0, -11.0) || fits_zone(179.0, 12.0)); // через линию смены дат
+    }
+
+    fn hours(spec: &[(u32, f64, f64, i64)]) -> Vec<Hour> {
+        spec.iter().map(|&(hour, temp, rain, code)| Hour { hour, temp, rain, code }).collect()
+    }
+
+    #[test]
+    fn advice_rain_later_and_now() {
+        let h = hours(&[(14, 12.0, 0.0, 3), (15, 12.0, 20.0, 3), (16, 11.0, 70.0, 61), (17, 10.0, 80.0, 63)]);
+        assert_eq!(advice(12.0, 3.0, &h), vec!["Дождь около 16:00 — возьмите зонт".to_string()]);
+        let h = hours(&[(9, 12.0, 60.0, 61), (10, 12.0, 60.0, 61)]);
+        assert_eq!(advice(12.0, 3.0, &h), vec!["Сейчас дождь — возьмите зонт".to_string()]);
+        let h = hours(&[(9, -3.0, 0.0, 3), (10, -3.0, 65.0, 73)]);
+        assert_eq!(advice(-3.0, 2.0, &h)[0], "Снег около 10:00 — обувь, которая не промокнет");
+    }
+
+    #[test]
+    fn advice_temperature_wind_and_limits() {
+        // дождь дальше 12 часов не считается
+        let mut h = hours(&[(0, 18.0, 0.0, 1); 13]);
+        h.push(Hour { hour: 13, temp: 18.0, rain: 90.0, code: 61 });
+        assert!(advice(18.0, 2.0, &h).is_empty(), "погода комфортная — молчим");
+        assert_eq!(advice(-15.0, 2.0, &hours(&[(8, -12.0, 0.0, 0), (9, -16.0, 0.0, 0)])), vec!["Мороз до −16° — шапка и тёплая куртка".to_string()]);
+        assert_eq!(advice(4.0, 2.0, &[]), vec!["Прохладно — возьмите куртку".to_string()]);
+        assert_eq!(advice(29.0, 2.0, &[]), vec!["Жарко — вода и лёгкая одежда".to_string()]);
+        assert_eq!(advice(15.0, 12.4, &[]), vec!["Сильный ветер 12 м/с".to_string()]);
+        // не больше двух подсказок
+        let h = hours(&[(9, 2.0, 80.0, 61)]);
+        assert_eq!(advice(-12.0, 15.0, &h).len(), 2);
+        let kinds: Vec<Tip> = advice_tips(-12.0, 15.0, &h).into_iter().map(|t| t.0).collect();
+        assert_eq!(kinds, vec![Tip::Rain, Tip::Cold]);
+        assert_eq!(advice_tips(30.0, 11.0, &[]).iter().map(|t| t.0).collect::<Vec<_>>(), vec![Tip::Hot, Tip::Wind]);
     }
 }
 

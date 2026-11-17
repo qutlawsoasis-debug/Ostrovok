@@ -4341,6 +4341,33 @@ impl App {
         });
         ui.add_space(6.0);
 
+        // что надеть и взять: до двух подсказок по ближайшим 12 часам
+        let tips = weather::advice_tips(w.feels, w.wind, &w.hours);
+        if !tips.is_empty() {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (kind, tip) in &tips {
+                    // значок и цвет по виду подсказки (Segoe MDL2 Assets)
+                    let (glyph, tint) = match kind {
+                        weather::Tip::Rain => ("\u{E9C1}", Color32::from_rgb(0x8F, 0xCB, 0xFF)),
+                        weather::Tip::Snow => ("\u{E9C8}", Color32::from_rgb(0xA8, 0xD8, 0xFF)),
+                        weather::Tip::Cold => ("\u{E9CA}", Color32::from_rgb(0xA8, 0xD8, 0xFF)),
+                        weather::Tip::Hot => ("\u{E9CA}", Color32::from_rgb(0xFF, 0xB3, 0x6B)),
+                        weather::Tip::Wind => ("\u{E9CB}", Color32::from_rgb(0xC8, 0xD4, 0xE0)),
+                    };
+                    let font = FontId::proportional(12.5);
+                    let tw = ui.painter().layout_no_wrap(tip.clone(), font.clone(), FG).size().x;
+                    let (r, _) = ui.allocate_exact_size(vec2(tw + 38.0, 26.0), Sense::hover());
+                    let p = ui.painter();
+                    p.rect_filled(r, Rounding::same(13.0), tint.gamma_multiply(0.16));
+                    p.rect_stroke(r, Rounding::same(13.0), Stroke::new(1.0_f32, tint.gamma_multiply(0.45)));
+                    p.text(pos2(r.left() + 16.0, r.center().y), Align2::CENTER_CENTER, glyph, FontId::proportional(13.0), tint);
+                    p.text(pos2(r.left() + 28.0, r.center().y), Align2::LEFT_CENTER, tip, font, FG);
+                }
+            });
+            ui.add_space(6.0);
+        }
+
         // ближайшие сутки: плавная кривая температуры, под ней — вероятность осадков
         if w.hours.len() >= 4 {
             let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 132.0), Sense::hover());
@@ -7254,6 +7281,11 @@ impl App {
         (ys.clamp(top_b, bot_b), bot_b, ys > top_b + 0.3 && ys < bot_b - 0.3)
     }
 
+    fn weather_tips_h(&self) -> f32 {
+        let has = self.weather.as_ref().is_some_and(|w| !weather::advice(w.feels, w.wind, &w.hours).is_empty());
+        if has { 32.0 } else { 0.0 }
+    }
+
     fn panel_height(&self) -> f32 {
         // навигация теперь в одну строку
         let saved = if matches!(self.tab, Tab::Ai | Tab::Settings) { 0.0 } else { 24.0 };
@@ -7272,8 +7304,9 @@ impl App {
             Tab::Ai => 420.0,
             Tab::Jarvis => 462.0,
             // +74 — карточка Луны и солнца под прогнозом
-            Tab::Weather if self.weather.as_ref().is_some_and(|w| w.hours.len() >= 4) => 398.0 + 74.0,
-            Tab::Weather if self.weather.is_some() => 292.0 + 74.0,
+            // +32 — строка подсказок «что надеть», когда есть что сказать
+            Tab::Weather if self.weather.as_ref().is_some_and(|w| w.hours.len() >= 4) => 398.0 + 74.0 + self.weather_tips_h(),
+            Tab::Weather if self.weather.is_some() => 292.0 + 74.0 + self.weather_tips_h(),
             Tab::Weather => 250.0,
             Tab::Timer => 348.0,
             // +52 — ряд мировых часов под календарём
