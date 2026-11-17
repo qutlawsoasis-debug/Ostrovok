@@ -1416,7 +1416,7 @@ impl App {
             }
         }
         // для снимков идущего таймера: OSTROVOK_TIMER=25 — таймер на 25 минут, прошло чуть больше трети
-        if let Some(m) = std::env::var("OSTROVOK_TIMER").ok().and_then(|v| v.parse::<f64>().ok()).filter(|_| test_mode()) {
+        if let Some(m) = std::env::var("OSTROVOK_TIMER").ok().and_then(|v| v.parse::<f64>().ok()).filter(|m| test_mode() && timer_minutes_ok(*m)) {
             app.start_timer(m);
             app.timer_end = Some(Instant::now() + Duration::from_secs_f64(m * 60.0 * 0.62));
             app.note = None;
@@ -1489,7 +1489,7 @@ impl App {
         }
         // для снимков отложенного сна на «Управлении»: OSTROVOK_POWERTIMER=30 (в тестовом режиме по истечении ничего не делает)
         if let Some(m) = std::env::var("OSTROVOK_POWERTIMER").ok().and_then(|v| v.parse::<u64>().ok()).filter(|_| test_mode()) {
-            app.power_timer = Some(("sleep", Instant::now() + Duration::from_secs(m * 60 - 19), false));
+            app.power_timer = Some(("sleep", Instant::now() + Duration::from_secs(power_demo_secs(m)), false));
         }
         // для снимков страницы «Звук» во включённом тихом режиме: OSTROVOK_QUIET=1 (системную громкость не трогает)
         if test_mode() && std::env::var_os("OSTROVOK_QUIET").is_some() {
@@ -1680,7 +1680,7 @@ impl App {
     }
 
     fn start_timer(&mut self, minutes: f64) {
-        if minutes <= 0.0 || minutes > 24.0 * 60.0 {
+        if !timer_minutes_ok(minutes) {
             return;
         }
         self.timer_end = Some(Instant::now() + Duration::from_secs_f64(minutes * 60.0));
@@ -4782,8 +4782,13 @@ impl App {
             }
         });
         if let Some(m) = start {
-            self.focus = None;
-            self.start_timer(m);
+            // неверное время не должно сбрасывать идущий фокус или паузу
+            if timer_minutes_ok(m) {
+                self.focus = None;
+                self.start_timer(m);
+            } else {
+                self.notify("Время таймера — от доли минуты до суток");
+            }
         }
         ui.add_space(6.0);
         let (card, _) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::hover());
@@ -8013,6 +8018,35 @@ fn wifi_payload(ssid: &str, pass: &str, secure: bool) -> String {
         format!("WIFI:T:WPA;S:{};P:{};;", wifi_escape(ssid), wifi_escape(pass))
     } else {
         format!("WIFI:T:nopass;S:{};;", wifi_escape(ssid))
+    }
+}
+
+/// Допустимое время таймера: больше нуля и не больше суток (NaN — нет: «nan» парсится как число).
+fn timer_minutes_ok(m: f64) -> bool {
+    m.is_finite() && m > 0.0 && m <= 24.0 * 60.0
+}
+
+/// Демо отложенного сна: секунд до срока, без ухода в минус при 0 минут.
+fn power_demo_secs(m: u64) -> u64 {
+    m.saturating_mul(60).saturating_sub(19)
+}
+
+#[cfg(test)]
+mod review_fix_tests {
+    use super::*;
+    #[test]
+    fn demo_power_timer_never_underflows() {
+        assert_eq!(power_demo_secs(0), 0);
+        assert_eq!(power_demo_secs(30), 30 * 60 - 19);
+    }
+    #[test]
+    fn timer_minutes_validation() {
+        assert!(!timer_minutes_ok(0.0));
+        assert!(!timer_minutes_ok(-3.0));
+        assert!(!timer_minutes_ok(f64::NAN));
+        assert!(!timer_minutes_ok(24.0 * 60.0 + 1.0));
+        assert!(timer_minutes_ok(0.5));
+        assert!(timer_minutes_ok(24.0 * 60.0));
     }
 }
 
