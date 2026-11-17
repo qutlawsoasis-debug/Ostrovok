@@ -176,6 +176,14 @@ pub fn autostart_enabled() -> bool {
         .is_ok()
 }
 
+/// Переносит автозапуск на другой файл (после установки в свою папку).
+pub fn set_autostart_path(exe: &std::path::Path) {
+    use winreg::{enums::*, RegKey};
+    if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE) {
+        let _ = key.set_value(RUN_NAME, &format!("\"{}\"", exe.display()));
+    }
+}
+
 /// Меняется только по галочке в настройках.
 pub fn set_autostart(on: bool) {
     use winreg::{enums::*, RegKey};

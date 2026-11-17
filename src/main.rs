@@ -6,6 +6,7 @@ mod fx;
 mod convert;
 mod ears;
 mod glass;
+mod install;
 mod jarvis;
 mod jarvis_ui;
 mod setup;
@@ -442,6 +443,8 @@ struct App {
     live: live::Live,
     /// последние уведомления мессенджеров, новые сверху; живут только в памяти
     inbox: Vec<InboxItem>,
+    /// запущен из %LOCALAPPDATA%\Programs\Ostrovok
+    is_installed: bool,
     call_since: Option<Instant>,
     toast: Option<Toast>,
     last_track: String,
@@ -712,6 +715,7 @@ impl App {
             album: None,
             live,
             inbox: Vec::new(),
+            is_installed: install::installed(),
             call_since: None,
             toast: None,
             last_track: String::new(),
@@ -3709,6 +3713,36 @@ impl App {
                     self.save_key();
                 }
             });
+            ui.add_space(8.0);
+            // ── установка: карточка, пока остров запущен не из своей папки
+            if !self.is_installed {
+                let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 62.0), Sense::hover());
+                let p = ui.painter();
+                glass_chip(p, r, 16.0, 0.7);
+                icon_disc(p, pos2(r.left() + 30.0, r.center().y), 17.0, [150, 200, 255], [70, 120, 230], "\u{E896}", 15.0);
+                p.text(pos2(r.left() + 58.0, r.top() + 14.0), Align2::LEFT_TOP, "Установить Островок", semi(13.5), FG);
+                p.text(pos2(r.left() + 58.0, r.top() + 34.0), Align2::LEFT_TOP, "ярлык в меню «Пуск»", FontId::proportional(11.5), DIM);
+                let b = Rect::from_min_max(pos2(r.right() - 104.0, r.top() + 15.0), pos2(r.right() - 12.0, r.bottom() - 15.0));
+                let resp = ui
+                    .interact(b, ui.id().with("install"), Sense::click())
+                    .on_hover_text("Остров переедет в %LOCALAPPDATA%\\Programs\\Ostrovok, появится в меню «Пуск», автозапуск переедет вместе с ним");
+                let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
+                let p = ui.painter();
+                p.rect_filled(b, Rounding::same(11.0), mix(accent(), Color32::WHITE, 0.12 * hov));
+                p.text(b.center(), Align2::CENTER_CENTER, "Установить", semi(12.5), Color32::from_rgb(20, 18, 32));
+                if resp.clicked() {
+                    match if test_mode() { Err("В проверочном запуске установка отключена".to_string()) } else { install::install() } {
+                        Ok(new) => {
+                            store::save_notes(&self.notes);
+                            match std::process::Command::new(&new).arg("--updated").spawn() {
+                                Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                                Err(e) => self.notify(&format!("Скопировал, но не запустил: {e}")),
+                            }
+                        }
+                        Err(e) => self.notify(&e),
+                    }
+                }
+            }
 
             // ── справа: поведение
             let ui = &mut c[1];
@@ -3773,7 +3807,6 @@ impl App {
                     self.intro = Some((0, Instant::now() + Duration::from_millis(600)));
                     self.mode = Mode::Pill;
                 }
-                ui.label(RichText::new(format!("версия {}", env!("CARGO_PKG_VERSION"))).color(DIM));
             });
         });
         if check_update {
@@ -3787,7 +3820,7 @@ impl App {
                 store::save_notes(&self.notes);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            ui.label(RichText::new(format!("Поиск открывается по {}. Щелчок по персонажу меняет его настроение.", self.hotkey_name)).color(DIM).size(11.5));
+            ui.label(RichText::new(format!("Островок {} · поиск по {} · щелчок по персонажу меняет настроение", env!("CARGO_PKG_VERSION"), self.hotkey_name)).color(DIM).size(11.5));
         });
     }
 
@@ -5310,7 +5343,7 @@ impl App {
             Tab::Notes => 340.0,
             Tab::Todo => 340.0,
             Tab::System => if self.stats.battery.is_some() { 416.0 } else { 394.0 },
-            Tab::Settings => 506.0,
+            Tab::Settings => 528.0,
         }
     }
 
@@ -5827,6 +5860,19 @@ fn setup_style(ctx: &egui::Context) {
 
 fn main() -> eframe::Result<()> {
     let test = test_mode();
+    // «Ostrovok.exe --install»: установить и запустить установленную копию без окна настроек
+    if std::env::args().any(|a| a == "--install") {
+        match install::install() {
+            Ok(new) => {
+                println!("установлено: {}", new.display());
+                if !test {
+                    let _ = std::process::Command::new(&new).spawn();
+                }
+            }
+            Err(e) => eprintln!("{e}"),
+        }
+        return Ok(());
+    }
     let updated = std::env::args().any(|a| a == "--updated");
     if !test && !(if updated { sys::wait_single_instance() } else { sys::single_instance() }) {
         return Ok(());
