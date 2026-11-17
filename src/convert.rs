@@ -200,7 +200,7 @@ fn parse(q: &str) -> Option<(f64, Unit, Option<Unit>)> {
         return None;
     }
     // запятая — десятичная; точка тоже, если она одна
-    let value: f64 = num.replace(',', ".").parse().ok()?;
+    let value: f64 = num.replace(',', ".").parse::<f64>().ok().filter(|v| v.is_finite())?;
     let rest = q[end..].trim();
     let mut parts = rest.split_whitespace();
     let from = unit(parts.next()?)?;
@@ -359,6 +359,17 @@ mod tests {
 
     fn one(q: &str) -> String {
         convert(q, None).into_iter().next().map(|r| r.0).unwrap_or_default()
+    }
+
+    #[test]
+    fn strange_input() {
+        let big = format!("{} км в м", "9".repeat(400));
+        assert!(convert(&big, None).is_empty());
+        for q in ["", "$", "€🙂", "₽,", "- км", "1e5 км", "5 🙂", "😀 км в м", "1,2,3 км"] {
+            let _ = convert(q, None);
+            let _ = wants_rates(q);
+        }
+        assert_eq!(fmt(f64::MAX).is_empty(), false);
     }
 
     #[test]
