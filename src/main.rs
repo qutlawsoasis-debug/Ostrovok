@@ -7262,7 +7262,9 @@ impl App {
             Tab::Control => 276.0,
             Tab::Sound => 322.0,
             Tab::Music => 388.0,
-            Tab::Remind => 320.0,
+            // напоминания: страница растёт по их числу (до шести без прокрутки)
+            Tab::Remind if self.cfg.reminders.is_empty() => 320.0,
+            Tab::Remind => 200.0 + self.cfg.reminders.len().clamp(3, 6) as f32 * 42.0,
             Tab::Qr => 350.0,
             // полка растёт по рядам значков (в ряду помещается шесть)
             Tab::Shelf => (150.0 + ((self.cfg.shelf.len().max(1) + 5) / 6) as f32 * 118.0).clamp(270.0, 400.0),
