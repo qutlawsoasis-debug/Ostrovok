@@ -20,7 +20,7 @@ mod voice;
 mod weather;
 
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Id, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -978,6 +978,11 @@ struct App {
     rx: mpsc::Receiver<Msg>,
 
     apps: Arc<Mutex<Vec<(String, String)>>>,
+    /// готовый новый список программ (поколение, список) — применяем, когда палитра закрыта
+    apps_next: Arc<Mutex<Option<(u64, Vec<(String, String)>)>>>,
+    apps_gen: Arc<AtomicU64>,
+    apps_building: Arc<AtomicBool>,
+    apps_at: Instant,
     query: String,
     results: Vec<Item>,
     sel: usize,
@@ -1053,6 +1058,10 @@ struct App {
     toast: Option<Toast>,
     last_track: String,
     app_icons: std::collections::HashMap<String, Option<egui::TextureHandle>>,
+    /// очередь фоновой загрузки значков (поток создаётся при первом запросе)
+    icon_tx: Option<mpsc::Sender<String>>,
+    icon_pending: std::collections::HashSet<String>,
+    icon_failed: std::collections::HashMap<String, Instant>,
     // «жидкая» физика
     jelly: Spr,
     reach: Spr,
@@ -1087,6 +1096,8 @@ struct App {
     qr_cache: Option<QrCache>,
     /// палитра была открыта в прошлом кадре (чистка значков при закрытии)
     palette_was_open: bool,
+    /// страница QR была открыта в прошлом кадре
+    qr_was_open: bool,
     /// QR для Wi-Fi: режим, сеть, пароль (только в памяти, пока открыта страница), показать ли пароль, с паролем ли сеть
     qr_wifi: bool,
     wifi_ssid: String,
@@ -1214,13 +1225,6 @@ impl App {
         let (tx, rx) = mpsc::channel();
 
         let apps = Arc::new(Mutex::new(Vec::new()));
-        {
-            let apps = apps.clone();
-            std::thread::spawn(move || {
-                let list = sys::index_apps();
-                *lock(&apps) = list;
-            });
-        }
 
         let dl: Arc<Mutex<Option<(u64, f32)>>> = Default::default();
         if std::env::var_os("OSTROVOK_DL").is_some() {
@@ -1305,6 +1309,10 @@ impl App {
             tx,
             rx,
             apps,
+            apps_next: Default::default(),
+            apps_gen: Default::default(),
+            apps_building: Default::default(),
+            apps_at: Instant::now(),
             query: String::new(),
             results: Vec::new(),
             sel: 0,
@@ -1361,6 +1369,9 @@ impl App {
             toast: None,
             last_track: String::new(),
             app_icons: std::collections::HashMap::new(),
+            icon_tx: None,
+            icon_pending: Default::default(),
+            icon_failed: Default::default(),
             jelly: Spr::new(1.0, 420.0, 12.0, 0.0015),
             reach: Spr::new(0.0, 210.0, 17.0, 0.004),
             lean_s: Spr::new(0.0, 190.0, 16.0, 0.03),
@@ -1388,6 +1399,7 @@ impl App {
             qr_text: String::new(),
             qr_cache: None,
             palette_was_open: false,
+            qr_was_open: false,
             qr_wifi: false,
             wifi_ssid: String::new(),
             wifi_pass: String::new(),
@@ -1705,7 +1717,61 @@ impl App {
             };
             app.tab_seen = app.tab;
         }
+        app.spawn_index(ctx, true);
         app
+    }
+
+    /// Перечитывает список программ в фоне. quick — сначала быстрый список без целей ярлыков.
+    /// Готовый список кладётся в apps_next и применяется в update одним присваиванием.
+    fn spawn_index(&mut self, ctx: &egui::Context, quick: bool) {
+        self.apps_at = Instant::now();
+        self.apps_building.store(true, Ordering::Relaxed);
+        let gen = self.apps_gen.fetch_add(1, Ordering::Relaxed) + 1;
+        let (cur, building, next, ctx) = (self.apps_gen.clone(), self.apps_building.clone(), self.apps_next.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let offer = |list: Vec<(String, String)>| {
+                if cur.load(Ordering::Relaxed) == gen {
+                    *lock(&next) = Some((gen, list));
+                    ctx.request_repaint();
+                }
+            };
+            // при панике потока флаг сборки всё равно снимается, иначе переиндексация встанет навсегда
+            struct Done(Arc<AtomicU64>, Arc<AtomicBool>, u64);
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    if self.0.load(Ordering::Relaxed) == self.2 {
+                        self.1.store(false, Ordering::Relaxed);
+                    }
+                }
+            }
+            let _done = Done(cur.clone(), building, gen);
+            let raw = sys::scan_lnks();
+            if quick {
+                offer(raw.clone());
+            }
+            offer(sys::resolve_apps(raw));
+        });
+    }
+
+    /// Применяет готовый список программ (не во время открытой палитры) и раз в 10 минут запускает переиндексацию.
+    fn tick_index(&mut self, ctx: &egui::Context, now: Instant) {
+        let palette_open = self.mode == Mode::Palette;
+        let mut next = lock(&self.apps_next);
+        let empty = lock(&self.apps).is_empty();
+        if next.as_ref().is_some_and(|(gen, _)| should_publish(*gen, self.apps_gen.load(Ordering::Relaxed), palette_open, empty)) {
+            let (_, list) = next.take().unwrap();
+            drop(next);
+            *lock(&self.apps) = list;
+            if palette_open {
+                // первый список пришёл при открытой палитре — сразу пересобираем выдачу
+                self.build_results();
+            }
+        } else {
+            drop(next);
+        }
+        if should_reindex(self.apps_building.load(Ordering::Relaxed), self.apps_at, now) {
+            self.spawn_index(ctx, false);
+        }
     }
 
     fn notify(&mut self, text: &str) {
@@ -2001,17 +2067,55 @@ impl App {
     /// Не даёт кэшу значков расти без конца; заодно сбрасывает неудачные (None) — попробуем снова.
     fn prune_icons(&mut self) {
         self.app_icons.retain(|_, v| v.is_some());
+        let now = Instant::now();
+        self.icon_failed.retain(|_, t| now.saturating_duration_since(*t) < ICON_RETRY);
         let apps = lock(&self.apps);
         let mut keep: std::collections::HashSet<&str> = apps.iter().map(|a| a.1.as_str()).collect();
         keep.extend(self.cfg.shelf.iter().map(String::as_str));
         keep.extend(self.cfg.apps.iter().map(|a| a.path.as_str()));
         keep.extend(self.mixer.iter().map(|a| a.path.as_str()));
         keep.extend(self.results.iter().filter_map(|r| if let Action::Launch(p) = &r.action { Some(p.as_str()) } else { None }));
+        keep.extend(self.icon_pending.iter().map(String::as_str));
         let gone = icon_keys_to_drop(self.app_icons.keys().map(String::as_str), &keep, ICON_LIMIT);
         drop(apps);
         for k in gone {
             self.app_icons.remove(&k);
         }
+    }
+
+    /// Значок файла/программы: из кэша или ставит в очередь фоновой загрузки (пока грузится — None).
+    fn request_icon(&mut self, ctx: &egui::Context, path: &str) -> Option<egui::TextureHandle> {
+        if let Some(Some(t)) = self.app_icons.get(path) {
+            return Some(t.clone());
+        }
+        let now = Instant::now();
+        if !should_request(path, false, self.icon_pending.contains(path), self.icon_failed.get(path).copied(), now) {
+            return None;
+        }
+        // один фоновый поток грузит значки по очереди: оболочка Windows не любит параллельных запросов
+        let worker = self.icon_tx.get_or_insert_with(|| {
+            let (req_tx, req_rx) = mpsc::channel::<String>();
+            let (tx, ctx) = (self.tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                unsafe {
+                    let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+                }
+                for path in req_rx {
+                    let icon = sys::icon_rgba(&path);
+                    let _ = tx.send(Msg::Icon(path, icon));
+                    ctx.request_repaint();
+                }
+            });
+            req_tx
+        });
+        if worker.send(path.to_string()).is_ok() {
+            self.icon_failed.remove(path);
+            self.icon_pending.insert(path.to_string());
+        } else {
+            // поток значков упал — пересоздадим при следующем запросе
+            self.icon_tx = None;
+        }
+        None
     }
 
     fn run(&mut self, action: Action) {
@@ -2020,6 +2124,9 @@ impl App {
             Action::Launch(p) if !p.starts_with("\\\\") && !std::path::Path::new(&p).exists() => {
                 // ярлык удалили после индексации — убираем его из поиска
                 lock(&self.apps).retain(|a| a.1 != p);
+                if let Some((_, list)) = lock(&self.apps_next).as_mut() {
+                    list.retain(|a| a.1 != p);
+                }
                 self.app_icons.remove(&p);
                 self.notify("Ярлык удалён");
             }
@@ -2137,8 +2244,18 @@ impl App {
                 Msg::Download(name) => self.show_toast("\u{E896}", [0x3A, 0x9B, 0xFF], "Загрузка завершена", &name, 6, false),
                 Msg::ClipImg(w, h, px) => self.push_clip_img(ctx, w, h, px),
                 Msg::Icon(path, icon) => {
-                    let tex = icon.map(|(w, h, px)| ctx.load_texture(format!("pal-{path}"), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR));
-                    self.app_icons.insert(path, tex);
+                    self.icon_pending.remove(&path);
+                    match icon {
+                        Some((w, h, px)) => {
+                            let tex = ctx.load_texture(icon_tex_name(&path), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR);
+                            self.icon_failed.remove(&path);
+                            self.app_icons.insert(path, Some(tex));
+                        }
+                        None => {
+                            self.app_icons.remove(&path);
+                            self.icon_failed.insert(path, Instant::now());
+                        }
+                    }
                 }
                 Msg::Lyrics(key, lines) => {
                     if key == self.lyrics_key {
@@ -2454,13 +2571,17 @@ impl App {
         if fg != 0 {
             self.last_fg = fg;
         }
+        // пароль Wi‑Fi и закодированный QR живут только пока открыта страница QR
+        let qr_open = qr_page_open(self.mode, self.tab);
+        if qr_left(self.qr_was_open, qr_open) {
+            self.qr_cache = None;
+            wipe_string(&mut self.wifi_pass);
+            self.wifi_show = false;
+        }
+        self.qr_was_open = qr_open;
+        self.tick_index(ctx, now);
         if now.duration_since(self.stats_at) >= Duration::from_millis(1500) {
             self.stats_at = now;
-            // пароль Wi‑Fi живёт только пока открыта страница QR
-            if !(self.mode == Mode::Panel && self.tab == Tab::Qr) && !self.wifi_pass.is_empty() {
-                self.wifi_pass.clear();
-                self.wifi_show = false;
-            }
             // отложенная блокировка или сон со страницы «Управление»
             if let Some((action, at, warned)) = self.power_timer {
                 let left = at.saturating_duration_since(now).as_secs();
@@ -3414,6 +3535,8 @@ impl App {
         }
         let mut drag: Option<String> = None;
         let (mut open, mut remove) = (None, None);
+        let shelf_ctx = ui.ctx().clone();
+        let shelf_icons: Vec<_> = self.cfg.shelf.clone().iter().map(|p| self.request_icon(&shelf_ctx, p)).collect();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
@@ -3432,9 +3555,7 @@ impl App {
                     }
                     // размер файла узнаём один раз; None — файла уже нет на месте
                     let size = *self.shelf_meta.entry(path.clone()).or_insert_with(|| std::fs::metadata(path).ok().map(|m| if m.is_dir() { u64::MAX } else { m.len() }));
-                    let icon = self.app_icons.entry(path.clone()).or_insert_with(|| {
-                        sys::icon_rgba(path).map(|(w, h, px)| ui.ctx().load_texture(format!("shelf-{path}"), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR))
-                    });
+                    let icon = &shelf_icons[i];
                     // картинки: читаем в фоне один раз, пока читается — обычный значок
                     if shelf_thumb_ok(path, size) && !self.shelf_thumbs.contains_key(path) {
                         self.shelf_thumbs.insert(path.clone(), None);
@@ -3894,6 +4015,9 @@ impl App {
         // любимые приложения с их настоящими значками: щелчок запускает, правый щелчок убирает
         ui.add_space(2.0);
         let (mut launch, mut remove, mut add) = (None, None, None);
+        let pin_ctx = ui.ctx().clone();
+        let pin_paths: Vec<String> = self.cfg.apps.iter().map(|a| a.path.clone()).collect();
+        let pin_icons: Vec<_> = pin_paths.iter().map(|p| self.request_icon(&pin_ctx, p)).collect();
         ui.horizontal(|ui| {
             for (i, app) in self.cfg.apps.iter().enumerate() {
                 let (r, resp) = ui.allocate_exact_size(vec2(38.0, 38.0), Sense::click());
@@ -3901,9 +4025,7 @@ impl App {
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
                 let down = ui.ctx().animate_bool_with_time(resp.id.with("down"), resp.is_pointer_button_down_on(), 0.06);
                 glass_chip(ui.painter(), r, 12.0, 0.45 + 0.55 * hov);
-                let icon = self.app_icons.entry(app.path.clone()).or_insert_with(|| {
-                    sys::icon_rgba(&app.path).map(|(w, h, px)| ui.ctx().load_texture(format!("app-{i}"), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR))
-                });
+                let icon = &pin_icons[i];
                 let size = 24.0 + 2.0 * hov - 2.0 * down;
                 match icon {
                     Some(tex) => rounded_image(ui.painter(), tex, Rect::from_center_size(r.center(), vec2(size, size)), 0.0),
@@ -4542,6 +4664,9 @@ impl App {
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(list));
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(&mut child, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
+            let mix_ctx = ui.ctx().clone();
+            let mix_paths: Vec<String> = self.mixer.iter().map(|a| a.path.clone()).collect();
+            let mix_icons: Vec<_> = mix_paths.iter().map(|p| self.request_icon(&mix_ctx, p)).collect();
             for i in 0..self.mixer.len() {
                 let app = &self.mixer[i];
                 let (row, _) = ui.allocate_exact_size(vec2(ui.available_width() - 6.0, 38.0), Sense::hover());
@@ -4551,9 +4676,7 @@ impl App {
                 }
                 let icon_r = Rect::from_center_size(pos2(row.left() + 14.0, row.center().y), vec2(22.0, 22.0));
                 let resp = ui.interact(icon_r.expand(6.0), ui.id().with(("mix-mute", i)), Sense::click()).on_hover_text(if app.muted { "Включить звук программы" } else { "Заглушить программу" });
-                let icon = self.app_icons.entry(app.path.clone()).or_insert_with(|| {
-                    sys::icon_rgba(&app.path).map(|(w, h, px)| ui.ctx().load_texture(format!("mix-{}", app.name), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR))
-                });
+                let icon = &mix_icons[i];
                 match icon {
                     Some(tex) => rounded_image(p, tex, icon_r, 0.0),
                     None => {
@@ -6730,7 +6853,9 @@ impl App {
                 self.focus_query = true;
             }
         }
-        let icons = &mut self.app_icons;
+        let pal_ctx = ui.ctx().clone();
+        let pal_paths: Vec<Option<String>> = self.results.iter().map(|r| if let Action::Launch(p) = &r.action { Some(p.clone()) } else { None }).collect();
+        let pal_icons: Vec<Option<egui::TextureHandle>> = pal_paths.iter().map(|p| p.as_deref().and_then(|p| self.request_icon(&pal_ctx, p))).collect();
         for (i, it) in self.results.iter().enumerate() {
             let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H - 2.0), Sense::click());
             if resp.hovered() || i == self.sel {
@@ -6756,33 +6881,7 @@ impl App {
                 Action::Quick(Quick::Remind(..)) => ("\u{E823}", Color32::from_rgb(0xFF, 0x8A, 0x7A)),
             };
             // значок грузится в фоне: ярлык на отключённый сетевой диск не должен подвешивать поиск
-            let tex = match &it.action {
-                Action::Launch(path) => icons
-                    .entry(path.clone())
-                    .or_insert_with(|| {
-                        // один фоновый поток грузит значки по очереди: оболочка Windows не любит параллельных запросов
-                        static WORKER: std::sync::OnceLock<Mutex<mpsc::Sender<String>>> = std::sync::OnceLock::new();
-                        let worker = WORKER.get_or_init(|| {
-                            let (req_tx, req_rx) = mpsc::channel::<String>();
-                            let (tx, ctx) = (self.tx.clone(), ui.ctx().clone());
-                            std::thread::spawn(move || {
-                                unsafe {
-                                    let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
-                                }
-                                for path in req_rx {
-                                    let icon = sys::icon_rgba(&path);
-                                    let _ = tx.send(Msg::Icon(path, icon));
-                                    ctx.request_repaint();
-                                }
-                            });
-                            Mutex::new(req_tx)
-                        });
-                        let _ = lock(worker).send(path.clone());
-                        None
-                    })
-                    .clone(),
-                _ => None,
-            };
+            let tex = pal_icons[i].clone();
             match tex {
                 Some(t) => rounded_image(ui.painter(), &t, ic, 0.0),
                 None => {
@@ -8009,6 +8108,41 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Предел числа значков в памяти.
 const ICON_LIMIT: usize = 512;
+/// через сколько повторить загрузку значка, который не удалось получить
+const ICON_RETRY: Duration = Duration::from_secs(60);
+/// как часто перечитывать список программ
+const REINDEX_EVERY: Duration = Duration::from_secs(600);
+
+/// Открыта ли страница QR-кода.
+fn qr_page_open(mode: Mode, tab: Tab) -> bool {
+    mode == Mode::Panel && tab == Tab::Qr
+}
+
+/// Ушли со страницы QR в этом кадре.
+fn qr_left(was_open: bool, open: bool) -> bool {
+    was_open && !open
+}
+
+/// Имя текстуры значка: одно на путь, где бы значок ни показывался.
+fn icon_tex_name(path: &str) -> String {
+    format!("icon-{path}")
+}
+
+/// Нужно ли отправить значок в фоновую загрузку.
+fn should_request(path: &str, cached: bool, pending: bool, failed_at: Option<Instant>, now: Instant) -> bool {
+    !path.is_empty() && !cached && !pending && failed_at.map_or(true, |t| now.saturating_duration_since(t) >= ICON_RETRY)
+}
+
+/// Пора ли перечитать список программ.
+fn should_reindex(building: bool, last: Instant, now: Instant) -> bool {
+    !building && now.saturating_duration_since(last) >= REINDEX_EVERY
+}
+
+/// Можно ли применить готовый список: он от последнего запуска и палитра закрыта
+/// (или текущий список пуст — тогда ждать закрытия палитры незачем).
+fn should_publish(gen: u64, current: u64, palette_open: bool, apps_empty: bool) -> bool {
+    gen == current && (!palette_open || apps_empty)
+}
 
 /// Какие ключи значков выбросить: если их больше limit — все вне keep.
 fn icon_keys_to_drop<'a>(keys: impl Iterator<Item = &'a str>, keep: &std::collections::HashSet<&str>, limit: usize) -> Vec<String> {
@@ -9816,5 +9950,79 @@ mod cache_lock_tests {
         let mut d = icon_keys_to_drop(keys.iter().map(|s| s.as_str()), &keep, 2);
         d.sort();
         assert_eq!(d, vec!["b".to_string(), "c".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod bg_tests {
+    use super::*;
+
+    #[test]
+    fn qr_page_open_only_panel_qr() {
+        assert!(qr_page_open(Mode::Panel, Tab::Qr));
+        assert!(!qr_page_open(Mode::Panel, Tab::Home));
+        assert!(!qr_page_open(Mode::Pill, Tab::Qr));
+        assert!(!qr_page_open(Mode::Palette, Tab::Qr));
+    }
+
+    #[test]
+    fn qr_left_detects_leaving_only() {
+        assert!(qr_left(true, false));
+        assert!(!qr_left(true, true));
+        assert!(!qr_left(false, false));
+        assert!(!qr_left(false, true));
+    }
+
+    #[test]
+    fn icon_tex_name_uses_path() {
+        assert_eq!(icon_tex_name(r"C:\a.exe"), r"icon-C:\a.exe");
+    }
+
+    #[test]
+    fn should_request_rules() {
+        let now = Instant::now();
+        assert!(should_request("a", false, false, None, now));
+        assert!(!should_request("", false, false, None, now));
+        assert!(!should_request("a", true, false, None, now));
+        assert!(!should_request("a", false, true, None, now));
+        assert!(!should_request("a", false, false, Some(now), now));
+        assert!(!should_request("a", false, false, Some(now), now + ICON_RETRY - Duration::from_secs(1)));
+        assert!(should_request("a", false, false, Some(now), now + ICON_RETRY));
+    }
+
+    #[test]
+    fn should_reindex_rules() {
+        let now = Instant::now();
+        assert!(!should_reindex(true, now, now + REINDEX_EVERY * 2));
+        assert!(!should_reindex(false, now, now + REINDEX_EVERY - Duration::from_secs(1)));
+        assert!(should_reindex(false, now, now + REINDEX_EVERY));
+    }
+
+    #[test]
+    fn should_publish_rules() {
+        assert!(should_publish(3, 3, false, false));
+        assert!(!should_publish(2, 3, false, false));
+        assert!(!should_publish(3, 3, true, false));
+        assert!(should_publish(3, 3, true, true));
+        assert!(!should_publish(2, 3, true, true));
+    }
+}
+
+/// Затирает байты строки нулями перед очисткой (пароль Wi-Fi не остаётся в памяти).
+fn wipe_string(s: &mut String) {
+    let mut v = std::mem::take(s).into_bytes();
+    for b in v.iter_mut() {
+        // volatile, чтобы компилятор не выкинул запись
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+}
+
+#[cfg(test)]
+mod wipe_tests {
+    #[test]
+    fn wipe_clears() {
+        let mut s = String::from("пароль123");
+        super::wipe_string(&mut s);
+        assert!(s.is_empty());
     }
 }
