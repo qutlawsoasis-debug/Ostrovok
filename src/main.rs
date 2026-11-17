@@ -439,6 +439,159 @@ fn parse_quick(q: &str, now: chrono::NaiveDateTime) -> Option<Quick> {
     None
 }
 
+/// Правило летнего времени.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Dst {
+    No,
+    /// ЕС: с последнего воскресенья марта по последнее воскресенье октября, переход в 01:00 UTC
+    Eu,
+    /// США и Канада: со второго воскресенья марта по первое воскресенье ноября, в 02:00 местного
+    Us,
+    /// юго-восток Австралии: с первого воскресенья октября (02:00) по первое воскресенье апреля (03:00 летнего)
+    Au,
+}
+
+/// Город для мировых часов: как его можно назвать, как показывать, смещение от UTC зимой в минутах.
+struct City {
+    names: &'static [&'static str],
+    show: &'static str,
+    offset: i32,
+    dst: Dst,
+}
+
+const CITIES: &[City] = &[
+    City { names: &["москва", "moscow", "мск"], show: "Москва", offset: 180, dst: Dst::No },
+    City { names: &["санкт-петербург", "петербург", "питер", "spb", "saint petersburg"], show: "Петербург", offset: 180, dst: Dst::No },
+    City { names: &["калининград", "kaliningrad"], show: "Калининград", offset: 120, dst: Dst::No },
+    City { names: &["екатеринбург", "yekaterinburg"], show: "Екатеринбург", offset: 300, dst: Dst::No },
+    City { names: &["новосибирск", "novosibirsk"], show: "Новосибирск", offset: 420, dst: Dst::No },
+    City { names: &["владивосток", "vladivostok"], show: "Владивосток", offset: 600, dst: Dst::No },
+    City { names: &["киев", "київ", "kyiv", "kiev"], show: "Киев", offset: 120, dst: Dst::Eu },
+    City { names: &["минск", "minsk"], show: "Минск", offset: 180, dst: Dst::No },
+    City { names: &["алматы", "almaty"], show: "Алматы", offset: 300, dst: Dst::No },
+    City { names: &["ташкент", "tashkent"], show: "Ташкент", offset: 300, dst: Dst::No },
+    City { names: &["тбилиси", "tbilisi"], show: "Тбилиси", offset: 240, dst: Dst::No },
+    City { names: &["стамбул", "istanbul"], show: "Стамбул", offset: 180, dst: Dst::No },
+    City { names: &["дубай", "dubai"], show: "Дубай", offset: 240, dst: Dst::No },
+    City { names: &["лондон", "london"], show: "Лондон", offset: 0, dst: Dst::Eu },
+    City { names: &["берлин", "berlin", "германия"], show: "Берлин", offset: 60, dst: Dst::Eu },
+    City { names: &["париж", "paris"], show: "Париж", offset: 60, dst: Dst::Eu },
+    City { names: &["варшава", "warsaw"], show: "Варшава", offset: 60, dst: Dst::Eu },
+    City { names: &["дели", "delhi", "индия", "мумбаи"], show: "Дели", offset: 330, dst: Dst::No },
+    City { names: &["пекин", "beijing", "шанхай", "китай"], show: "Пекин", offset: 480, dst: Dst::No },
+    City { names: &["токио", "tokyo", "япония"], show: "Токио", offset: 540, dst: Dst::No },
+    City { names: &["сеул", "seoul"], show: "Сеул", offset: 540, dst: Dst::No },
+    City { names: &["сидней", "sydney", "мельбурн", "melbourne"], show: "Сидней", offset: 600, dst: Dst::Au },
+    City { names: &["нью-йорк", "нью йорк", "new york", "nyc"], show: "Нью-Йорк", offset: -300, dst: Dst::Us },
+    City { names: &["чикаго", "chicago"], show: "Чикаго", offset: -360, dst: Dst::Us },
+    City { names: &["лос-анджелес", "лос анджелес", "los angeles", "la"], show: "Лос-Анджелес", offset: -480, dst: Dst::Us },
+    City { names: &["торонто", "toronto"], show: "Торонто", offset: -300, dst: Dst::Us },
+    City { names: &["utc", "гринвич", "gmt"], show: "UTC", offset: 0, dst: Dst::No },
+];
+
+/// Сколько городов помещается в ряд под календарём.
+const WORLD_MAX: usize = 3;
+
+fn find_city(q: &str) -> Option<&'static City> {
+    let q = q.trim().to_lowercase().replace('ё', "е");
+    if q.is_empty() {
+        return None;
+    }
+    CITIES.iter().find(|c| c.names.iter().any(|n| *n == q) || c.show.to_lowercase() == q)
+}
+
+fn nth_sunday(y: i32, m: u32, n: u32) -> chrono::NaiveDate {
+    use chrono::Datelike;
+    let first = chrono::NaiveDate::from_ymd_opt(y, m, 1).unwrap();
+    let shift = (7 - first.weekday().num_days_from_sunday()) % 7;
+    first + chrono::Duration::days((shift + 7 * (n - 1)) as i64)
+}
+
+fn last_sunday(y: i32, m: u32) -> chrono::NaiveDate {
+    use chrono::Datelike;
+    let next = if m == 12 { chrono::NaiveDate::from_ymd_opt(y + 1, 1, 1) } else { chrono::NaiveDate::from_ymd_opt(y, m + 1, 1) }.unwrap();
+    let last = next - chrono::Duration::days(1);
+    last - chrono::Duration::days(last.weekday().num_days_from_sunday() as i64)
+}
+
+/// Смещение города от UTC в минутах в данный момент — с учётом летнего времени.
+fn city_offset(c: &City, utc: chrono::NaiveDateTime) -> i32 {
+    use chrono::Datelike;
+    let y = utc.year();
+    let summer = match c.dst {
+        Dst::No => false,
+        Dst::Eu => {
+            let start = last_sunday(y, 3).and_hms_opt(1, 0, 0).unwrap();
+            let end = last_sunday(y, 10).and_hms_opt(1, 0, 0).unwrap();
+            utc >= start && utc < end
+        }
+        Dst::Us => {
+            // 02:00 местного зимнего = 02:00 − смещение в UTC; конец — 02:00 местного летнего
+            let start = nth_sunday(y, 3, 2).and_hms_opt(2, 0, 0).unwrap() - chrono::Duration::minutes(c.offset as i64);
+            let end = nth_sunday(y, 11, 1).and_hms_opt(2, 0, 0).unwrap() - chrono::Duration::minutes(c.offset as i64 + 60);
+            utc >= start && utc < end
+        }
+        Dst::Au => {
+            // южное полушарие: лето захватывает Новый год
+            let start = nth_sunday(y, 10, 1).and_hms_opt(2, 0, 0).unwrap() - chrono::Duration::minutes(c.offset as i64);
+            let end = nth_sunday(y, 4, 1).and_hms_opt(3, 0, 0).unwrap() - chrono::Duration::minutes(c.offset as i64 + 60);
+            utc >= start || utc < end
+        }
+    };
+    c.offset + if summer { 60 } else { 0 }
+}
+
+/// Подпись разницы: «+3 ч», «−8 ч», «+2:30», «так же»; и «завтра» / «вчера», если там другой день.
+fn world_label(here: chrono::NaiveDateTime, there: chrono::NaiveDateTime) -> String {
+    // времена берутся из разных часов и расходятся на доли секунды — округляем до ближайшей минуты
+    let diff = ((there - here).num_milliseconds() as f64 / 60_000.0).round() as i64;
+    let sign = if diff < 0 { "−" } else { "+" };
+    let a = diff.abs();
+    let mut s = match (a / 60, a % 60) {
+        (0, 0) => "так же".to_string(),
+        (h, 0) => format!("{sign}{h} ч"),
+        (h, m) => format!("{sign}{h}:{m:02}"),
+    };
+    match there.date().signed_duration_since(here.date()).num_days() {
+        1 => s.push_str(" · завтра"),
+        -1 => s.push_str(" · вчера"),
+        _ => {}
+    }
+    s
+}
+
+#[cfg(test)]
+mod world_tests {
+    use super::*;
+    fn t(y: i32, m: u32, d: u32, h: u32, mi: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, mi, 0).unwrap()
+    }
+    #[test]
+    fn world_clock() {
+        assert_eq!(nth_sunday(2026, 3, 2), chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap());
+        assert_eq!(last_sunday(2026, 10), chrono::NaiveDate::from_ymd_opt(2026, 10, 25).unwrap());
+        let ny = find_city("Нью Йорк").unwrap();
+        assert_eq!(city_offset(ny, t(2026, 3, 7, 12, 0)), -300);
+        assert_eq!(city_offset(ny, t(2026, 3, 9, 12, 0)), -240);
+        let berlin = find_city("BERLIN").unwrap();
+        assert_eq!(city_offset(berlin, t(2026, 10, 25, 0, 30)), 120);
+        assert_eq!(city_offset(berlin, t(2026, 10, 25, 1, 30)), 60);
+        assert_eq!(city_offset(find_city("токио").unwrap(), t(2026, 7, 1, 0, 0)), 540);
+        let syd = find_city("сидней").unwrap();
+        assert_eq!(city_offset(syd, t(2026, 11, 17, 0, 0)), 660); // ноябрь — у них лето
+        assert_eq!(city_offset(syd, t(2026, 7, 1, 0, 0)), 600); // июль — зима
+        assert_eq!(city_offset(syd, t(2026, 1, 10, 0, 0)), 660);
+        assert!(find_city("атлантида").is_none());
+        let msk = t(2026, 11, 17, 23, 0);
+        assert_eq!(world_label(msk, msk + chrono::Duration::minutes(150)), "+2:30 · завтра");
+        assert_eq!(world_label(msk, msk - chrono::Duration::hours(8)), "−8 ч");
+        assert_eq!(world_label(msk, msk), "так же");
+        // расхождение в доли секунды не превращает «+8 ч» в «+7:59»
+        assert_eq!(world_label(msk - chrono::Duration::hours(10), msk - chrono::Duration::hours(2) - chrono::Duration::milliseconds(300)), "+8 ч");
+        assert_eq!(world_label(t(2026, 11, 17, 2, 0), t(2026, 11, 16, 18, 0)), "−8 ч · вчера");
+    }
+}
+
 /// Прибавляет минуты фокуса к дню; лог отсортирован по дате и хранит 60 последних дней.
 fn add_focus(log: &mut Vec<(String, u32)>, day: chrono::NaiveDate, min: u32) {
     let key = day.format("%Y-%m-%d").to_string();
@@ -663,6 +816,9 @@ struct App {
     inbox_unread: usize,
     /// последние картинки из буфера обмена (только в памяти)
     clip_imgs: Vec<ClipImg>,
+    /// строка ввода нового города для мировых часов (None — показываем кнопку)
+    world_edit: Option<String>,
+    world_focus: bool,
     /// город уже перепроверен на совпадение с часовым поясом
     city_rechecked: bool,
     /// запущен из %LOCALAPPDATA%\Programs\Ostrovok
@@ -939,6 +1095,8 @@ impl App {
             inbox: Vec::new(),
             inbox_unread: 0,
             clip_imgs: Vec::new(),
+            world_edit: None,
+            world_focus: false,
             city_rechecked: false,
             is_installed: install::installed(),
             call_since: None,
@@ -1065,6 +1223,16 @@ impl App {
                     add_focus(&mut app.cfg.focus_log, today - chrono::Duration::days(6 - i as i64), m);
                 }
             }
+        }
+        // для снимков мировых часов: OSTROVOK_WORLD=Лондон,Токио,Нью-Йорк
+        if let Some(list) = std::env::var("OSTROVOK_WORLD").ok().filter(|_| test_mode()) {
+            let mut world: Vec<String> = Vec::new();
+            for c in list.split(',').filter_map(find_city) {
+                if !world.iter().any(|w| w == c.show) && world.len() < WORLD_MAX {
+                    world.push(c.show.to_string());
+                }
+            }
+            app.cfg.world = world;
         }
         // для снимков пилюли со значком непрочитанных: OSTROVOK_UNREAD=3
         if let Some(n) = std::env::var("OSTROVOK_UNREAD").ok().and_then(|v| v.parse::<usize>().ok()).filter(|_| test_mode()) {
@@ -1363,6 +1531,20 @@ impl App {
                 }
             };
             self.results.push(Item { title, sub: "Enter".into(), action: Action::Quick(cmd) });
+        }
+
+        // «время токио» — местное время в городе
+        for prefix in ["время ", "time "] {
+            if let Some(city) = low.strip_prefix(prefix).and_then(find_city) {
+                let utc = chrono::Utc::now().naive_utc();
+                let there = utc + chrono::Duration::minutes(city_offset(city, utc) as i64);
+                let t = there.format("%H:%M").to_string();
+                self.results.push(Item {
+                    title: format!("{} — {t} ({})", city.show, world_label(chrono::Local::now().naive_local(), there)),
+                    sub: "скопировать".into(),
+                    action: Action::Copy(format!("{} {t}", city.show)),
+                });
+            }
         }
 
         for prefix in ["таймер ", "timer "] {
@@ -2302,13 +2484,16 @@ impl App {
             Tab::Shelf => self.ui_shelf(ui),
             Tab::Ai => self.ui_ai(ui),
             Tab::Jarvis => self.ui_jarvis(ui),
-            Tab::Calendar => self.ui_calendar(ui),
             Tab::System => self.ui_system(ui),
             Tab::Sound => self.ui_sound(ui),
             Tab::Weather => self.ui_weather(ui),
             Tab::Timer => {
                 self.ui_timer(ui);
                 self.ui_focus_week(ui);
+            }
+            Tab::Calendar => {
+                self.ui_calendar(ui);
+                self.ui_world(ui);
             }
             Tab::Clip => self.ui_clip(ui),
             Tab::Inbox => self.ui_inbox(ui),
@@ -3873,6 +4058,89 @@ impl App {
             match self.sw_start.take() {
                 Some(t) => self.sw_acc += t.elapsed(),
                 None => self.sw_start = Some(Instant::now()),
+            }
+        }
+    }
+
+    /// Под календарём: мировые часы — города с местным временем и небом по их времени суток.
+    fn ui_world(&mut self, ui: &mut egui::Ui) {
+        use chrono::Timelike;
+        ui.add_space(8.0);
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
+        let utc = chrono::Utc::now().naive_utc();
+        let here = chrono::Local::now().naive_local();
+        let mut x = row.left();
+        let mut remove = None;
+        // таблетки делят ширину поровну (кнопке «+ город» оставляем место, пока городов меньше трёх)
+        let n = self.cfg.world.len().max(1) as f32;
+        let reserve = if self.cfg.world.len() < WORLD_MAX { 118.0 } else { 0.0 };
+        let w = ((row.width() - reserve - 8.0 * (n - 1.0)) / n).clamp(120.0, 210.0);
+        for (i, name) in self.cfg.world.iter().enumerate() {
+            let Some(city) = find_city(name) else { continue };
+            let there = utc + chrono::Duration::minutes(city_offset(city, utc) as i64);
+            let label = world_label(here, there);
+            let r = Rect::from_min_size(pos2(x, row.top()), vec2(w, row.height()));
+            let resp = ui.interact(r, ui.id().with(("world", i)), Sense::click()).on_hover_text("Правый щелчок — убрать город");
+            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
+            let p = ui.painter();
+            glass_chip(p, r, 14.0, 0.4 + 0.4 * hov);
+            // небо по местному часу города (восход и закат условно 7:00 и 19:00)
+            let h = there.hour() as f32 + there.minute() as f32 / 60.0;
+            let (top, low) = sky_colors(day_phase(h, 7.0, 19.0));
+            gradient_rrect(p, r.shrink(1.0), 13.0, |q| mix_a(top, low, ((q.y - r.top()) / r.height()).clamp(0.0, 1.0)));
+            p.text(pos2(r.left() + 12.0, r.top() + 8.0), Align2::LEFT_TOP, city.show, semi(12.0), FG);
+            p.text(pos2(r.left() + 12.0, r.bottom() - 8.0), Align2::LEFT_BOTTOM, label, FontId::proportional(11.0), DIM);
+            p.text(pos2(r.right() - 12.0, r.center().y), Align2::RIGHT_CENTER, there.format("%H:%M").to_string(), light(20.0), FG);
+            if resp.secondary_clicked() {
+                remove = Some(i);
+            }
+            x += w + 8.0;
+        }
+        if let Some(i) = remove {
+            self.cfg.world.remove(i);
+            self.cfg.save();
+        }
+        // справа — добавить город: кнопка или строка ввода
+        let rest = Rect::from_min_max(pos2(x, row.top()), row.max);
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rest).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        match &mut self.world_edit {
+            Some(text) => {
+                let r = child.add(egui::TextEdit::singleline(text).hint_text(RichText::new("Город, Enter").color(DIM)).margin(egui::Margin::symmetric(9.0, 7.0)).desired_width((rest.width() - 10.0).clamp(80.0, 170.0)));
+                if self.world_focus {
+                    r.request_focus();
+                    self.world_focus = false;
+                }
+                let enter = r.lost_focus() && child.input(|i| i.key_pressed(egui::Key::Enter));
+                let esc = child.input(|i| i.key_pressed(egui::Key::Escape));
+                if enter {
+                    match find_city(text) {
+                        Some(c) if self.cfg.world.iter().any(|w| w == c.show) => self.world_edit = None,
+                        Some(_) if self.cfg.world.len() >= WORLD_MAX => {
+                            self.notify("Не больше трёх городов — уберите один правым щелчком");
+                            self.world_edit = None;
+                        }
+                        Some(c) => {
+                            self.cfg.world.push(c.show.to_string());
+                            self.cfg.save();
+                            self.world_edit = None;
+                        }
+                        None => {
+                            self.notify("Не знаю такой город — попробуйте, например, «Лондон» или «Токио»");
+                            // оставляем поле в фокусе, чтобы поправить опечатку
+                            self.world_focus = true;
+                        }
+                    }
+                } else if esc || (r.lost_focus() && text.trim().is_empty()) {
+                    self.world_edit = None;
+                }
+            }
+            None if self.cfg.world.len() >= WORLD_MAX => {}
+            None => {
+                let hint = if self.cfg.world.is_empty() { "+ мировые часы" } else { "+ город" };
+                if jelly(&mut child, hint).on_hover_text("Добавить город: время, разница и день или ночь там").clicked() {
+                    self.world_edit = Some(String::new());
+                    self.world_focus = true;
+                }
             }
         }
     }
@@ -6284,7 +6552,8 @@ impl App {
             Tab::Weather if self.weather.is_some() => 292.0 + 74.0,
             Tab::Weather => 250.0,
             Tab::Timer => 348.0,
-            Tab::Calendar => 360.0,
+            // +52 — ряд мировых часов под календарём
+            Tab::Calendar => 360.0 + 52.0,
             Tab::Shot => 306.0,
             Tab::Clip => 340.0 + if self.clip_imgs.is_empty() { 0.0 } else { 72.0 },
             Tab::Inbox => 340.0,

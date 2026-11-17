@@ -15,6 +15,9 @@ pub struct Settings {
     /// минуты «Фокуса» по дням: («2026-11-17», 75), последние 60 дней
     #[serde(default)]
     pub focus_log: Vec<(String, u32)>,
+    /// города для мировых часов под календарём
+    #[serde(default)]
+    pub world: Vec<String>,
     #[serde(default)]
     pub lat: Option<f64>,
     #[serde(default)]
