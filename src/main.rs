@@ -8008,8 +8008,12 @@ fn next_due(at: chrono::NaiveDateTime, repeat: u8, now: chrono::NaiveDateTime) -
 fn reschedule<T: chrono::TimeZone>(at: chrono::NaiveDateTime, repeat: u8, now: chrono::NaiveDateTime, stamp: i64, lookup: impl Fn(chrono::NaiveDateTime) -> chrono::LocalResult<chrono::DateTime<T>>) -> Option<i64> {
     let mut next = next_due(at, repeat, now)?;
     for _ in 0..8 {
-        let ts = resolve_local(next, &lookup)?.timestamp();
-        if ts > stamp {
+        // в двусмысленный час подходит любой из двух моментов, лишь бы ещё впереди
+        let cands: Vec<i64> = match lookup(next) {
+            chrono::LocalResult::Ambiguous(x, y) => vec![x.timestamp(), y.timestamp()],
+            _ => resolve_local(next, &lookup).map(|d| d.timestamp()).into_iter().collect(),
+        };
+        if let Some(ts) = cands.into_iter().find(|ts| *ts > stamp) {
             return Some(ts);
         }
         next = next_due(next, repeat, next)?;
@@ -8143,7 +8147,7 @@ mod dst_tests {
         let at = t(2026, 10, 24, 2, 45);
         let next = reschedule(at, 1, t(2026, 10, 25, 2, 40), stamp, berlin).unwrap();
         assert!(next > stamp, "новый срок должен быть в будущем, иначе напоминание удалится");
-        assert_eq!(next, cet_ts(t(2026, 10, 26, 2, 45)));
+        assert_eq!(next, cet_ts(t(2026, 10, 25, 2, 45)), "второй проход часа ещё впереди");
         // обычный случай: следующий день, без лишних шагов
         assert_eq!(reschedule(t(2026, 11, 2, 9, 0), 1, t(2026, 11, 2, 9, 1), cet_ts(t(2026, 11, 2, 9, 1)), berlin), Some(cet_ts(t(2026, 11, 3, 9, 0))));
         assert_eq!(reschedule(t(2026, 11, 2, 9, 0), 0, t(2026, 11, 2, 9, 1), 0, berlin), None);
