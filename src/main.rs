@@ -4597,13 +4597,29 @@ impl App {
         let w = (row.width() - 8.0 * (n - 1.0)) / n;
         for (k, (name, frac, value, detail, color, alarm)) in items.into_iter().enumerate() {
             let r = Rect::from_min_size(pos2(row.left() + k as f32 * (w + 8.0), row.top()), vec2(w, row.height()));
-            glass_chip(ui.painter(), r, 18.0, 0.55);
+            // карточки открывают нужное окно Windows: диск — «Память устройства», память и процессор — диспетчер задач
+            let target = match name {
+                "Диск C:" => Some(("ms-settings:storagesense", "Открыть «Память устройства» — там видно, чем занят диск, и можно освободить место")),
+                "Процессор" | "Память" => Some(("taskmgr", "Открыть диспетчер задач")),
+                _ => None,
+            };
+            let resp = ui.interact(r, ui.id().with(("sys-card", k)), if target.is_some() { Sense::click() } else { Sense::hover() });
+            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered() && target.is_some(), 0.12);
+            glass_chip(ui.painter(), r, 18.0, 0.55 + 0.4 * hov);
             let shown = ui.ctx().animate_value_with_time(ui.id().with(("sys", k)), frac.clamp(0.0, 1.0), 0.5);
             let c = pos2(r.center().x, r.top() + 46.0);
-            ring(ui.painter(), c, 30.0, 6.0, shown, if alarm && shown > 0.9 { Color32::from_rgb(0xFF, 0x6B, 0x6B) } else { color });
+            let hot = alarm && shown > 0.9;
+            ring(ui.painter(), c, 30.0, 6.0, shown, if hot { Color32::from_rgb(0xFF, 0x6B, 0x6B) } else { color });
             ui.painter().text(c, Align2::CENTER_CENTER, value, semi(14.0), FG);
             ui.painter().text(pos2(c.x, r.top() + 96.0), Align2::CENTER_CENTER, name, semi(12.5), FG);
-            ui.painter().text(pos2(c.x, r.top() + 114.0), Align2::CENTER_CENTER, detail, FontId::proportional(11.5), DIM);
+            // диск почти полон — вместо «свободно …» подсказываем, что делать
+            let (detail, dc) = if hot && name == "Диск C:" { (format!("{detail} · освободить"), Color32::from_rgb(0xFF, 0x9A, 0x8A)) } else { (detail, DIM) };
+            ui.painter().text(pos2(c.x, r.top() + 114.0), Align2::CENTER_CENTER, detail, FontId::proportional(11.5), dc);
+            if let Some((cmd, tip)) = target {
+                if resp.on_hover_text(tip).clicked() {
+                    sys::open(cmd);
+                }
+            }
         }
         if s.battery.is_some() {
             ui.label(RichText::new(format!("Компьютер работает {d} д {h} ч {m} мин без перезагрузки")).color(DIM));
