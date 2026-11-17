@@ -1141,20 +1141,28 @@ impl App {
 
         {
             let apps = self.apps.lock().unwrap();
-            let mut found: Vec<(u8, &(String, String))> = apps
-                .iter()
-                .filter_map(|a| {
+            let rank = |low: &str, bias: u8| {
+                let low = low.to_string();
+                move |a: &(String, String)| {
                     let n = a.0.to_lowercase();
                     if n.starts_with(&low) {
-                        Some((0, a))
+                        Some(bias)
                     } else if n.contains(&format!(" {low}")) {
-                        Some((1, a))
+                        Some(bias + 1)
                     } else if n.contains(&low) {
-                        Some((2, a))
+                        Some(bias + 2)
                     } else {
                         None
                     }
-                })
+                }
+            };
+            let direct = rank(&low, 0);
+            // набрали в другой раскладке («тщеузфв» вместо «notepad») — ищем и так, но ниже прямых совпадений
+            let swapped = swap_layout(&low);
+            let other = rank(&swapped, 3);
+            let mut found: Vec<(u8, &(String, String))> = apps
+                .iter()
+                .filter_map(|a| direct(a).or_else(|| if swapped != low && swapped.chars().count() >= 2 { other(a) } else { None }).map(|r| (r, a)))
                 .collect();
             found.sort_by_key(|(r, a)| (*r, a.0.len()));
             for (_, a) in found.into_iter().take(5) {
@@ -5876,6 +5884,22 @@ fn smart_hint(text: &str) -> Option<Hint> {
     None
 }
 
+/// Переводит текст, набранный не в той раскладке: ЙЦУКЕН ↔ QWERTY по положению клавиш.
+/// Направление выбирается по первой букве.
+fn swap_layout(s: &str) -> String {
+    const EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
+    const RU: &str = "йцукенгшщзхъфывапролджэячсмитьбюё";
+    let (en, ru): (Vec<char>, Vec<char>) = (EN.chars().collect(), RU.chars().collect());
+    let to_en = s.chars().find(|c| c.is_alphabetic()).is_some_and(|c| ru.contains(&c.to_lowercase().next().unwrap_or(c)));
+    s.chars()
+        .map(|c| {
+            let l = c.to_lowercase().next().unwrap_or(c);
+            let (from, to) = if to_en { (&ru, &en) } else { (&en, &ru) };
+            from.iter().position(|x| *x == l).map_or(c, |i| to[i])
+        })
+        .collect()
+}
+
 /// Фраза на иностранном языке, которую стоит предложить перевести: хотя бы два слова, почти все буквы
 /// латинские, кириллицы нет, и это не похоже на код или команду.
 fn foreign_phrase(t: &str) -> bool {
@@ -5900,6 +5924,10 @@ mod hint_tests {
         assert!(!foreign_phrase("cargo build --release_mode"));
         assert!(!foreign_phrase("12 34 56 ab"));
         assert!(matches!(smart_hint("good morning everyone").map(|h| h.label), Some(l) if l == "Перевести"));
+        assert_eq!(swap_layout("тщеузфв"), "notepad");
+        assert_eq!(swap_layout("ghbdtn"), "привет");
+        assert_eq!(swap_layout("Ntktuhfv"), "телеграм");
+        assert_eq!(swap_layout("123"), "123");
         // ссылки и почта по-прежнему узнаются первыми
         assert!(matches!(smart_hint("https://example.org").map(|h| h.label), Some(l) if l == "Открыть ссылку"));
     }
