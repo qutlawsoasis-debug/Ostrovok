@@ -4349,11 +4349,12 @@ impl App {
                 for (kind, tip) in &tips {
                     // значок и цвет по виду подсказки (Segoe MDL2 Assets)
                     let (glyph, tint) = match kind {
-                        weather::Tip::Rain => ("\u{E9C1}", Color32::from_rgb(0x8F, 0xCB, 0xFF)),
-                        weather::Tip::Snow => ("\u{E9C8}", Color32::from_rgb(0xA8, 0xD8, 0xFF)),
-                        weather::Tip::Cold => ("\u{E9CA}", Color32::from_rgb(0xA8, 0xD8, 0xFF)),
-                        weather::Tip::Hot => ("\u{E9CA}", Color32::from_rgb(0xFF, 0xB3, 0x6B)),
-                        weather::Tip::Wind => ("\u{E9CB}", Color32::from_rgb(0xC8, 0xD4, 0xE0)),
+                        // те же знаки, что на плитках дней (weather::describe), — они точно есть в шрифте
+                        weather::Tip::Rain => ("☂", Color32::from_rgb(0x8F, 0xCB, 0xFF)),
+                        weather::Tip::Snow => ("❄", Color32::from_rgb(0xA8, 0xD8, 0xFF)),
+                        weather::Tip::Cold => ("❄", Color32::from_rgb(0xA8, 0xD8, 0xFF)),
+                        weather::Tip::Hot => ("☀", Color32::from_rgb(0xFF, 0xB3, 0x6B)),
+                        weather::Tip::Wind => ("≋", Color32::from_rgb(0xC8, 0xD4, 0xE0)),
                     };
                     let font = FontId::proportional(12.5);
                     let tw = ui.painter().layout_no_wrap(tip.clone(), font.clone(), FG).size().x;
@@ -4376,7 +4377,9 @@ impl App {
             let n = w.hours.len();
             let (lo, hi) = w.hours.iter().fold((f64::MAX, f64::MIN), |(lo, hi), h| (lo.min(h.temp), hi.max(h.temp)));
             let span = (hi - lo).max(2.0);
-            let (top, bottom) = (area.top() + 34.0, area.bottom() - 40.0);
+            let wet = w.hours.iter().map(|h| h.rain).fold(0.0, f64::max);
+            // подпись «осадки до …» стоит сверху: кривую опускаем, чтобы метки температуры её не задевали
+            let (top, bottom) = (area.top() + if wet >= 15.0 { 48.0 } else { 34.0 }, area.bottom() - 40.0);
             let px = |i: f32| area.left() + 26.0 + (area.width() - 52.0) * i / (n - 1) as f32;
             let py = |t: f64| bottom - (bottom - top) * ((t - lo) / span) as f32;
             // сглаживание: между соседними часами — плавный переход
@@ -4417,7 +4420,6 @@ impl App {
                     p.text(pos2(x, area.bottom() - 6.0), Align2::CENTER_BOTTOM, if now { "сейчас".to_string() } else { format!("{:02}:00", h.hour) }, FontId::proportional(11.0), if now { FG } else { DIM });
                 }
             }
-            let wet = w.hours.iter().map(|h| h.rain).fold(0.0, f64::max);
             if wet >= 15.0 {
                 p.text(area.left_top() + vec2(12.0, 8.0), Align2::LEFT_TOP, format!("осадки до {wet:.0}%"), FontId::proportional(11.0), Color32::from_rgb(0x8F, 0xCB, 0xFF));
             }
@@ -7283,7 +7285,8 @@ impl App {
 
     fn weather_tips_h(&self) -> f32 {
         let has = self.weather.as_ref().is_some_and(|w| !weather::advice(w.feels, w.wind, &w.hours).is_empty());
-        if has { 32.0 } else { 0.0 }
+        // строка фишек 26 px + отступ 6 px + запас, чтобы карточка Луны не упиралась в край
+        if has { 44.0 } else { 0.0 }
     }
 
     fn panel_height(&self) -> f32 {
