@@ -2113,29 +2113,50 @@ impl App {
         let left = self.cfg.todos.iter().filter(|t| !t.done).count();
         let done = self.cfg.todos.len() - left;
         let mut clear_done = false;
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(if left == 0 { "Всё сделано".to_string() } else { format!("Осталось: {left}") }).color(DIM));
+        // строка прогресса: «Сделано 1 из 4», полоска и тихая ссылка «убрать сделанные»
+        {
+            ui.add_space(4.0);
+            let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
+            let p = ui.painter().clone();
+            let total = self.cfg.todos.len();
+            let title = if left == 0 { "Всё сделано".to_string() } else { format!("Сделано {done} из {total}") };
+            let t = p.text(pos2(row.left() + 4.0, row.center().y), Align2::LEFT_CENTER, title, semi(13.5), if left == 0 { accent() } else { FG });
+            let link_w = if done > 0 { 132.0 } else { 0.0 };
             if done > 0 {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    clear_done = jelly(ui, "Убрать сделанные").clicked();
-                });
+                let lr = Rect::from_min_max(pos2(row.right() - link_w, row.top()), row.max);
+                let resp = ui.interact(lr, ui.id().with("todo-clear"), Sense::click()).on_hover_text("Удалить отмеченные дела");
+                let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
+                let g = p.text(pos2(row.right() - 4.0, row.center().y), Align2::RIGHT_CENTER, "убрать сделанные", FontId::proportional(12.5), mix(DIM, FG, hov));
+                if hov > 0.0 {
+                    p.line_segment([pos2(g.left(), g.bottom()), pos2(g.right(), g.bottom())], Stroke::new(1.0_f32, rgba(255, 255, 255, (90.0 * hov) as u8)));
+                }
+                clear_done = resp.clicked();
             }
-        });
+            let bar = Rect::from_min_max(pos2(t.right() + 14.0, row.center().y - 2.5), pos2(row.right() - link_w - 14.0, row.center().y + 2.5));
+            if bar.width() > 20.0 {
+                let frac = ui.ctx().animate_value_with_time(ui.id().with("todo-frac"), done as f32 / total.max(1) as f32, 0.35);
+                p.rect_filled(bar, Rounding::same(2.5), rgba(255, 255, 255, 22));
+                if frac > 0.0 {
+                    let fill = Rect::from_min_max(bar.min, pos2(bar.left() + (bar.width() * frac).max(5.0), bar.bottom()));
+                    p.rect_filled(fill, Rounding::same(2.5), accent());
+                }
+            }
+            ui.add_space(6.0);
+        }
         let (mut toggle, mut remove) = (None, None);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.spacing_mut().item_spacing.y = 6.0;
             // сначала несделанные, потом сделанные; внутри — в порядке добавления
             let order: Vec<usize> = (0..self.cfg.todos.len()).filter(|i| !self.cfg.todos[*i].done).chain((0..self.cfg.todos.len()).filter(|i| self.cfg.todos[*i].done)).collect();
             for i in order {
                 let item = &self.cfg.todos[i];
-                let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 6.0, 34.0), Sense::click());
+                let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 6.0, 38.0), Sense::click());
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
                 let k = ui.ctx().animate_bool_with_time(ui.id().with(("todo-done", &item.text)), item.done, 0.16);
                 let p = ui.painter();
-                if hov > 0.0 {
-                    p.rect_filled(row, Rounding::same(10.0), rgba(255, 255, 255, (14.0 * hov) as u8));
-                }
-                let c = pos2(row.left() + 18.0, row.center().y);
+                // сделанные карточки тише: меньше стекла
+                glass_chip(p, row, 12.0, (0.42 - 0.22 * k) + 0.45 * hov);
+                let c = pos2(row.left() + 20.0, row.center().y);
                 let a = accent();
                 p.circle_stroke(c, 8.5, Stroke::new(1.5_f32, mix(DIM, a, k.max(hov * 0.6))));
                 if k > 0.0 {
@@ -2143,8 +2164,8 @@ impl App {
                     p.text(c, Align2::CENTER_CENTER, "\u{E73E}", FontId::proportional(9.5), Color32::from_rgba_unmultiplied(16, 14, 28, (k * 255.0) as u8));
                 }
                 let text = p
-                    .with_clip_rect(Rect::from_min_max(pos2(row.left() + 36.0, row.top()), pos2(row.right() - 34.0, row.bottom())))
-                    .text(pos2(row.left() + 36.0, row.center().y), Align2::LEFT_CENTER, &item.text, FontId::proportional(13.5), mix(FG, DIM, k));
+                    .with_clip_rect(Rect::from_min_max(pos2(row.left() + 40.0, row.top()), pos2(row.right() - 34.0, row.bottom())))
+                    .text(pos2(row.left() + 40.0, row.center().y), Align2::LEFT_CENTER, &item.text, FontId::proportional(13.5), mix(FG, DIM, k));
                 if k > 0.0 {
                     let end = text.left() + text.width().min(row.right() - 34.0 - text.left()) * k;
                     p.line_segment([pos2(text.left(), row.center().y + 1.0), pos2(end, row.center().y + 1.0)], Stroke::new(1.2_f32, DIM));
@@ -5428,7 +5449,7 @@ impl App {
             Tab::Clip => 340.0,
             Tab::Inbox => 340.0,
             Tab::Notes => 340.0,
-            Tab::Todo => 340.0,
+            Tab::Todo => 366.0,
             Tab::System => if self.stats.battery.is_some() { 416.0 } else { 394.0 },
             Tab::Settings => 528.0,
         }
