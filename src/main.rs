@@ -2924,7 +2924,10 @@ impl App {
         ui.add_space(6.0);
         let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 132.0), Sense::hover());
         glass_chip(&p, area, 18.0, 0.4);
-        spectrum(&p.with_clip_rect(area), area.shrink2(vec2(14.0, 0.0)), &self.bars, accent, 0.26, 0.62);
+        let no_text = self.cfg.lyrics && self.lyrics.is_empty();
+        if !no_text {
+            spectrum(&p.with_clip_rect(area), area.shrink2(vec2(14.0, 0.0)), &self.bars, accent, 0.26, 0.62);
+        }
         let lines = p.with_clip_rect(area.shrink(8.0));
         if !self.cfg.lyrics {
             lines.text(area.center() - vec2(0.0, 16.0), Align2::CENTER_CENTER, "Текст песни выключен", semi(14.0), FG);
@@ -2940,7 +2943,10 @@ impl App {
                 self.lyrics_key.clear();
             }
         } else if self.lyrics.is_empty() {
-            lines.text(area.center(), Align2::CENTER_CENTER, "Для этого трека текста с отметками времени не нашлось", FontId::proportional(13.0), DIM);
+            // текста нет — вместо пустой рамки крупный зеркальный эквалайзер в цвет обложки
+            let t = ui.input(|i| i.time) as f32;
+            spectrum_mirror(&p.with_clip_rect(area), area.shrink2(vec2(18.0, 26.0)).translate(vec2(0.0, 8.0)), &self.bars, accent, t, m.playing);
+            lines.text(pos2(area.center().x, area.top() + 16.0), Align2::CENTER_CENTER, "Текста для этого трека не нашлось — только звук", FontId::proportional(11.5), DIM);
         } else {
             let cur = self.lyrics.iter().rposition(|l| l.0 <= at);
             // плавная прокрутка: строка въезжает на место за время до следующей
@@ -6215,6 +6221,36 @@ fn spectrum(p: &egui::Painter, area: Rect, bars: &[f32], color: Color32, alpha: 
         // громкие столбики ярче тихих
         let a = (255.0 * alpha * (0.45 + 0.55 * v)).min(255.0) as u8;
         p.rect_filled(r, Rounding { nw: w / 2.0, ne: w / 2.0, sw: 0.0, se: 0.0 }, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a));
+    }
+}
+
+/// Эквалайзер, отражённый от средней линии: столбики растут вверх и вниз. Когда плеер играет,
+/// а настоящий звук не слышен (например, звук идёт в наушники мимо устройства), столбики мягко дышат.
+fn spectrum_mirror(p: &egui::Painter, area: Rect, bars: &[f32], color: Color32, time: f32, playing: bool) {
+    // полос мало (16), поэтому рисуем втрое больше тонких столбиков, плавно переходя между полосами
+    const M: usize = 48;
+    let step = area.width() / M as f32;
+    let w = (step * 0.42).clamp(2.0, 7.0);
+    let mid = area.center().y;
+    let band = |f: f32| -> f32 {
+        if bars.is_empty() {
+            return 0.0;
+        }
+        let x = f * (bars.len() - 1) as f32;
+        let (a, k) = (x.floor() as usize, x.fract());
+        let b = (a + 1).min(bars.len() - 1);
+        bars[a] * (1.0 - k) + bars[b] * k
+    };
+    for i in 0..M {
+        let idle = if playing { 0.10 + 0.08 * (time * 2.1 + i as f32 * 0.35).sin().abs() } else { 0.03 };
+        let v = band(i as f32 / (M - 1) as f32).max(idle);
+        let h = (area.height() / 2.0 * v.powf(1.1)).max(1.5);
+        let x = area.left() + step * (i as f32 + 0.5) - w / 2.0;
+        let r = Rect::from_min_max(pos2(x, mid - h), pos2(x + w, mid + h));
+        let a = (60.0 + 170.0 * v).min(235.0) as u8;
+        p.rect_filled(r, Rounding::same(w / 2.0), Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a));
+        // отражение тусклее: нижняя половина приглушена
+        p.rect_filled(Rect::from_min_max(pos2(x, mid), pos2(x + w, mid + h)), Rounding { nw: 0.0, ne: 0.0, sw: w / 2.0, se: w / 2.0 }, Color32::from_rgba_unmultiplied(20, 18, 34, 90));
     }
 }
 
