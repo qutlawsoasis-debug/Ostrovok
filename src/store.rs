@@ -42,6 +42,9 @@ pub struct Settings {
     /// закреплённые приложения на сводке
     #[serde(default)]
     pub apps: Vec<PinnedApp>,
+    /// быстрые действия на сводке, скрытые правым щелчком (в порядке скрытия)
+    #[serde(default)]
+    pub hidden_actions: Vec<String>,
     /// показывать на острове уведомления мессенджеров
     #[serde(default)]
     pub mirror: bool,

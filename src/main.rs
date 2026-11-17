@@ -1416,6 +1416,10 @@ impl App {
                 app.push_inbox(live::Notice { app: "Telegram".into(), title: "Мирон".into(), body: "привет".into() }, [0x2A, 0xAB, 0xEE]);
             }
         }
+        // для снимков настраиваемого ряда действий: OSTROVOK_HIDEACT=ocr,cleantext
+        if let Some(v) = std::env::var("OSTROVOK_HIDEACT").ok().filter(|_| test_mode()) {
+            app.cfg.hidden_actions = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        }
         // для снимков таймера на паузе: OSTROVOK_TIMERPAUSE=25 — таймер на 25 минут, на паузе на трети пути
         if let Some(m) = std::env::var("OSTROVOK_TIMERPAUSE").ok().and_then(|v| v.parse::<f64>().ok()).filter(|m| test_mode() && *m > 0.0 && *m <= 1440.0) {
             app.timer_total = (m * 60.0) as f32;
@@ -3591,10 +3595,15 @@ impl App {
             ("command", "\u{E756}", "Команда", [0xB8, 0xB8, 0xC4]),
         ];
         let mut act = "";
+        let (mut hide, mut restore) = (None, false);
+        let ids = ACTIONS.map(|a| a.0);
+        let shown = visible_actions(&ids, &self.cfg.hidden_actions);
+        let has_hidden = shown.len() < ACTIONS.len();
         let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 60.0), Sense::hover());
-        let step = row.width() / ACTIONS.len() as f32;
-        for (i, (id, glyph, label, col)) in ACTIONS.iter().enumerate() {
-            let r = Rect::from_min_size(pos2(row.left() + step * i as f32, row.top()), vec2(step, row.height()));
+        let step = row.width() / (shown.len() + has_hidden as usize) as f32;
+        for (slot, &i) in shown.iter().enumerate() {
+            let (id, glyph, label, col) = &ACTIONS[i];
+            let r = Rect::from_min_size(pos2(row.left() + step * slot as f32, row.top()), vec2(step, row.height()));
             let resp = ui.interact(r, ui.id().with(("act", *id)), Sense::click()).on_hover_text(match *id {
                 "region" => "Выделите часть экрана — снимок попадёт в буфер",
                 "full" => "Снимок всего экрана: файл в «Изображения\\Островок» и копия в буфере",
@@ -3605,6 +3614,9 @@ impl App {
                 "remind" => "Добавить напоминание",
                 _ => "Строка поиска и команд",
             });
+            if resp.secondary_clicked() {
+                hide = Some(*id);
+            }
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
             let down = ui.ctx().animate_bool_with_time(resp.id.with("down"), resp.is_pointer_button_down_on(), 0.06);
             let at = pos2(r.center().x, r.top() + 21.0 - 2.0 * hov + 2.0 * down);
@@ -3614,6 +3626,37 @@ impl App {
             if resp.clicked() {
                 act = id;
             }
+        }
+        // «+» в конце ряда: возвращает последнее скрытое, в подсказке — весь список
+        if has_hidden {
+            let r = Rect::from_min_size(pos2(row.left() + step * shown.len() as f32, row.top()), vec2(step, row.height()));
+            let names: Vec<&str> = self.cfg.hidden_actions.iter().filter_map(|h| ACTIONS.iter().find(|a| a.0 == h).map(|a| a.2)).collect();
+            let resp = ui.interact(r, ui.id().with("act-restore"), Sense::click()).on_hover_text(format!("Скрыто: {}\nЩелчок — вернуть «{}»", names.join(", "), names.last().copied().unwrap_or("")));
+            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+            let at = pos2(r.center().x, r.top() + 21.0 - 2.0 * hov);
+            p.circle_stroke(at, 17.0 + 1.5 * hov, Stroke::new(1.2_f32, rgba(255, 255, 255, (60.0 + 80.0 * hov) as u8)));
+            p.text(at, Align2::CENTER_CENTER, "\u{E710}", FontId::proportional(14.0), mix(DIM, FG, hov));
+            p.text(pos2(r.center().x, r.bottom() - 8.0), Align2::CENTER_CENTER, format!("ещё {}", names.len()), FontId::proportional(11.0), mix(DIM, FG, hov));
+            restore = resp.clicked();
+        }
+        if let Some(id) = hide {
+            let next = hide_action(&ids, &self.cfg.hidden_actions, id);
+            if next.len() == self.cfg.hidden_actions.len() {
+                self.notify("Последнее действие скрыть нельзя");
+            } else {
+                self.cfg.hidden_actions = next;
+                self.cfg.save();
+                self.notify("Скрыто. Вернуть — кнопкой «+» в конце ряда");
+            }
+        }
+        if restore {
+            // старые неизвестные записи снимаем заодно, пока не вернём настоящее действие
+            while let Some(h) = self.cfg.hidden_actions.pop() {
+                if ids.contains(&h.as_str()) {
+                    break;
+                }
+            }
+            self.cfg.save();
         }
         if !act.is_empty() {
             self.run_action(act, ctx);
@@ -7702,6 +7745,44 @@ fn timer_view(end: Option<Instant>, paused: Option<Duration>, total: f32, now: I
         }
         (None, Some(left)) => (left.as_secs_f32().ceil() as u64, left.as_secs_f32() / total, false, true),
         _ => (0, 0.0, false, false),
+    }
+}
+
+/// Номера быстрых действий, которые не скрыты, в исходном порядке.
+fn visible_actions(ids: &[&str], hidden: &[String]) -> Vec<usize> {
+    (0..ids.len()).filter(|i| !hidden.iter().any(|h| h == ids[*i])).collect()
+}
+
+/// Скрыть действие: известное, ещё не скрытое и не последнее видимое.
+fn hide_action(ids: &[&str], hidden: &[String], id: &str) -> Vec<String> {
+    let mut out = hidden.to_vec();
+    if ids.contains(&id) && !out.iter().any(|h| h == id) && visible_actions(ids, hidden).len() > 1 {
+        out.push(id.to_string());
+    }
+    out
+}
+
+#[cfg(test)]
+mod actions_row_tests {
+    use super::*;
+    const IDS: [&str; 4] = ["region", "full", "ocr", "qr"];
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+    #[test]
+    fn visible_keeps_order() {
+        assert_eq!(visible_actions(&IDS, &[]), vec![0, 1, 2, 3]);
+        assert_eq!(visible_actions(&IDS, &s(&["full", "qr", "чужое"])), vec![0, 2]);
+    }
+    #[test]
+    fn hide_never_empties() {
+        assert_eq!(hide_action(&IDS, &[], "ocr"), s(&["ocr"]));
+        // повторное скрытие ничего не меняет
+        assert_eq!(hide_action(&IDS, &s(&["ocr"]), "ocr"), s(&["ocr"]));
+        // последнее видимое не скрываем
+        assert_eq!(hide_action(&IDS, &s(&["region", "full", "ocr"]), "qr"), s(&["region", "full", "ocr"]));
+        // неизвестное не добавляем
+        assert_eq!(hide_action(&IDS, &[], "zzz"), Vec::<String>::new());
     }
 }
 
