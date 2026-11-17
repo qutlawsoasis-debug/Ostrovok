@@ -2467,7 +2467,7 @@ dependencies = [
 
 [[package]]
 name = "ostrovok"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "arboard",
  "bzip2-rs",

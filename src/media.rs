@@ -107,11 +107,11 @@ pub fn spawn() -> (Arc<Mutex<State>>, mpsc::Sender<Cmd>) {
 
 fn poll(s: &Session) -> windows::core::Result<Info> {
     let p = s.TryGetMediaPropertiesAsync()?.get()?;
-    let title = p.Title()?.to_string();
+    let title = clean_title(&p.Title()?.to_string());
     if title.trim().is_empty() {
         return Err(windows::core::Error::empty());
     }
-    let artist = p.Artist().map(|a| a.to_string()).unwrap_or_default();
+    let artist = clean_artist(&p.Artist().map(|a| a.to_string()).unwrap_or_default());
     let playing = s
         .GetPlaybackInfo()
         .and_then(|i| i.PlaybackStatus())
@@ -183,6 +183,62 @@ pub fn fetch_lyrics(artist: &str, title: &str) -> Option<Vec<(f64, String)>> {
         }
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// Чистит название из вкладки браузера: счётчик уведомлений «(18) », хвост « - YouTube» и т. п.
+pub fn clean_title(raw: &str) -> String {
+    let mut t = raw.trim();
+    // «(18) …», «(3)…», «• …» — счётчики и точки непрочитанного в начале
+    loop {
+        let before = t;
+        if let Some(rest) = t.strip_prefix('(') {
+            if let Some((num, after)) = rest.split_once(')') {
+                if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit() || c == '+') {
+                    t = after.trim_start();
+                }
+            }
+        }
+        t = t.trim_start_matches(['•', '●', '▶', '►']).trim_start();
+        if t == before {
+            break;
+        }
+    }
+    const TAILS: [&str; 12] = [
+        "YouTube Music", "YouTube", "TikTok", "SoundCloud", "Яндекс Музыка", "Яндекс.Музыка",
+        "VK Музыка", "ВКонтакте", "Twitch", "Spotify", "Deezer", "Rutube",
+    ];
+    for _ in 0..2 {
+        for tail in TAILS {
+            for sep in [" - ", " — ", " – ", " | ", " · "] {
+                let suffix = format!("{sep}{tail}");
+                if t.len() > suffix.len() && t.ends_with(&suffix) {
+                    t = t[..t.len() - suffix.len()].trim_end();
+                }
+            }
+        }
+    }
+    t.to_string()
+}
+
+/// Исполнитель: YouTube отдаёт «Канал - Topic», это не часть имени.
+pub fn clean_artist(raw: &str) -> String {
+    raw.trim().trim_end_matches(" - Topic").trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn titles() {
+        assert_eq!(clean_title("(18)TikTok - Make Your Day"), "TikTok - Make Your Day");
+        assert_eq!(clean_title("(3) Linkin Park - Numb - YouTube"), "Linkin Park - Numb");
+        assert_eq!(clean_title("• Song — Яндекс Музыка"), "Song");
+        assert_eq!(clean_title("Numb (Live)"), "Numb (Live)");
+        assert_eq!(clean_title("(Intro)"), "(Intro)");
+        assert_eq!(clean_title("YouTube"), "YouTube");
+        assert_eq!(clean_title("(99+) Trap mix | SoundCloud"), "Trap mix");
+        assert_eq!(clean_artist("Daft Punk - Topic"), "Daft Punk");
+    }
 }
 
 /// Яркий цвет обложки: насыщенные и светлые точки весят больше (приём из Atoll, MainWindow.Liquid.cs, MIT).

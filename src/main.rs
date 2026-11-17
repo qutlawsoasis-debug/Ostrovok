@@ -150,6 +150,54 @@ struct ShotCard {
     until: Instant,
 }
 
+struct InboxItem {
+    app: String,
+    title: String,
+    body: String,
+    color: [u8; 3],
+    at: chrono::DateTime<chrono::Local>,
+}
+
+/// «5 сообщений», «1 сообщение», «22 сообщения».
+fn count_ru(n: usize, forms: [&str; 3]) -> String {
+    let form = match (n % 10, n % 100) {
+        (_, 11..=14) => forms[2],
+        (1, _) => forms[0],
+        (2..=4, _) => forms[1],
+        _ => forms[2],
+    };
+    format!("{n} {form}")
+}
+
+/// Сколько прошло: «только что», «14 мин», «2 ч», дальше — время по часам.
+fn ago_ru(mins: i64, clock: &str) -> String {
+    match mins {
+        i64::MIN..=0 => "только что".into(),
+        1..=59 => format!("{mins} мин"),
+        60..=359 => format!("{} ч", mins / 60),
+        _ => clock.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::*;
+    #[test]
+    fn russian_counts() {
+        let f = ["сообщение", "сообщения", "сообщений"];
+        assert_eq!(count_ru(1, f), "1 сообщение");
+        assert_eq!(count_ru(3, f), "3 сообщения");
+        assert_eq!(count_ru(5, f), "5 сообщений");
+        assert_eq!(count_ru(11, f), "11 сообщений");
+        assert_eq!(count_ru(21, f), "21 сообщение");
+        assert_eq!(count_ru(112, f), "112 сообщений");
+        assert_eq!(ago_ru(0, "12:00"), "только что");
+        assert_eq!(ago_ru(14, "12:00"), "14 мин");
+        assert_eq!(ago_ru(95, "12:00"), "1 ч");
+        assert_eq!(ago_ru(400, "05:20"), "05:20");
+    }
+}
+
 struct Toast {
     glyph: &'static str,
     color: [u8; 3],
@@ -228,6 +276,7 @@ enum Tab {
     Weather,
     Timer,
     Clip,
+    Inbox,
     Notes,
     Todo,
     /// карточка только что сделанного снимка экрана (в меню разделов её нет)
@@ -391,6 +440,8 @@ struct App {
     last_fg: isize,
     album: Option<[u8; 3]>,
     live: live::Live,
+    /// последние уведомления мессенджеров, новые сверху; живут только в памяти
+    inbox: Vec<InboxItem>,
     call_since: Option<Instant>,
     toast: Option<Toast>,
     last_track: String,
@@ -660,6 +711,7 @@ impl App {
             last_fg: 0,
             album: None,
             live,
+            inbox: Vec::new(),
             call_since: None,
             toast: None,
             last_track: String::new(),
@@ -818,6 +870,21 @@ impl App {
                     Tab::Jarvis
                 }
                 "control" => Tab::Control,
+                "inbox" => {
+                    // для снимков: выдуманные сообщения (в проверочном запуске уведомления не читаются)
+                    let samples = [
+                        ("Telegram", "Мирон", "скинь потом ту ссылку на релиз", [0x2A, 0xAB, 0xEE], 2),
+                        ("Discord", "#general · Лёша", "кто сегодня в кс? собираем пятёрку к девяти", [0x58, 0x65, 0xF2], 14),
+                        ("Telegram", "Мама", "Позвони, как освободишься", [0x2A, 0xAB, 0xEE], 47),
+                        ("WhatsApp", "Доставка", "Курьер будет с 18:00 до 20:00", [0x25, 0xD3, 0x66], 95),
+                        ("Discord", "Аня", "смотри что нашла, это же наш остров", [0x58, 0x65, 0xF2], 180),
+                    ];
+                    for (app_name, title, body, color, mins) in samples.into_iter().rev() {
+                        app.push_inbox(live::Notice { app: app_name.into(), title: title.into(), body: body.into() }, color);
+                        app.inbox[0].at = chrono::Local::now() - chrono::Duration::minutes(mins);
+                    }
+                    Tab::Inbox
+                }
                 "music" => Tab::Music,
                 "remind" => Tab::Remind,
                 "qr" => Tab::Qr,
@@ -1136,6 +1203,7 @@ impl App {
                     };
                     let body = if n.body.is_empty() { n.app.clone() } else { n.body.clone() };
                     self.show_toast("\u{E8BD}", color, &n.title, &body, 5, false);
+                    self.push_inbox(n, color);
                 }
                 Msg::Download(name) => self.show_toast("\u{E896}", [0x3A, 0x9B, 0xFF], "Загрузка завершена", &name, 6, false),
                 Msg::Lyrics(key, lines) => {
@@ -1212,7 +1280,7 @@ impl App {
             }
             // проверка вида пилюли без плеера: OSTROVOK_TRACK=«название»
             if let (None, Ok(t)) = (&self.media_now, std::env::var("OSTROVOK_TRACK")) {
-                self.media_now = Some(media::Info { title: t, artist: "Исполнитель".into(), playing: true, pos: 64.0, dur: 200.0, at: Instant::now() });
+                self.media_now = Some(media::Info { title: media::clean_title(&t), artist: "Исполнитель".into(), playing: true, pos: 64.0, dur: 200.0, at: Instant::now() });
             }
             if st.thumb_gen != self.thumb_gen {
                 self.thumb_gen = st.thumb_gen;
@@ -1741,7 +1809,7 @@ impl App {
             ("\u{E80F}", "Обзор", &[(Tab::Home, "Сводка"), (Tab::Music, "Музыка"), (Tab::Weather, "Погода"), (Tab::Calendar, "Календарь")]),
             ("\u{E7F4}", "Система", &[(Tab::Control, "Управление"), (Tab::Sound, "Звук"), (Tab::System, "Монитор")]),
             ("\u{E90F}", "Инструменты", &[(Tab::Timer, "Таймер"), (Tab::Remind, "Напоминания"), (Tab::Qr, "QR-код")]),
-            ("\u{E70B}", "Записи", &[(Tab::Clip, "Буфер"), (Tab::Todo, "Дела"), (Tab::Notes, "Заметки"), (Tab::Shelf, "Полка")]),
+            ("\u{E70B}", "Записи", &[(Tab::Clip, "Буфер"), (Tab::Inbox, "Уведомления"), (Tab::Todo, "Дела"), (Tab::Notes, "Заметки"), (Tab::Shelf, "Полка")]),
             ("\u{E8BD}", "ИИ", &[(Tab::Ai, "ИИ"), (Tab::Jarvis, "Джарвис")]),
             ("\u{E713}", "Настройки", &[(Tab::Settings, "Настройки")]),
         ];
@@ -1826,6 +1894,7 @@ impl App {
             Tab::Weather => self.ui_weather(ui),
             Tab::Timer => self.ui_timer(ui),
             Tab::Clip => self.ui_clip(ui),
+            Tab::Inbox => self.ui_inbox(ui),
             Tab::Notes => self.ui_notes(ui),
             Tab::Todo => self.ui_todo(ui),
             Tab::Shot => self.ui_shot(ui),
@@ -2242,10 +2311,13 @@ impl App {
         let art = Rect::from_min_size(music_r.min + vec2(12.0, 12.0), vec2(76.0, 76.0));
         match &self.thumb {
             Some(t) => rounded_image(&p, t, art, 14.0),
-            None => {
-                p.rect_filled(art, Rounding::same(14.0), tint(20));
-                p.text(art.center(), Align2::CENTER_CENTER, "\u{E8D6}", FontId::proportional(24.0), DIM);
-            }
+            None => match &self.media_now {
+                Some(m) => art_placeholder(&p, art, 14.0, &m.title, 26.0),
+                None => {
+                    p.rect_filled(art, Rounding::same(14.0), tint(20));
+                    p.text(art.center(), Align2::CENTER_CENTER, "\u{E8D6}", FontId::proportional(24.0), DIM);
+                }
+            },
         }
         if ui.interact(art, ui.id().with("home-art"), Sense::click()).on_hover_text("Открыть страницу музыки").clicked() {
             self.tab = Tab::Music;
@@ -2560,10 +2632,7 @@ impl App {
         let art = Rect::from_min_size(row.min, vec2(104.0, 104.0));
         match &self.thumb {
             Some(t) => rounded_image(&p, t, art, 20.0),
-            None => {
-                p.rect_filled(art, Rounding::same(20.0), tint(22));
-                p.text(art.center(), Align2::CENTER_CENTER, "\u{E8D6}", FontId::proportional(34.0), DIM);
-            }
+            None => art_placeholder(&p, art, 20.0, &m.title, 36.0),
         }
         let x = art.right() + 18.0;
         let text = p.with_clip_rect(Rect::from_min_max(pos2(x, row.top()), row.max));
@@ -3218,6 +3287,102 @@ impl App {
         } else if let Some(text) = pick {
             self.set_clipboard(&text);
             self.notify("Скопировано в буфер");
+        }
+    }
+
+    fn push_inbox(&mut self, n: live::Notice, color: [u8; 3]) {
+        self.inbox.insert(0, InboxItem { app: n.app, title: n.title, body: n.body, color, at: chrono::Local::now() });
+        self.inbox.truncate(50);
+    }
+
+    /// Записи → Уведомления: что пришло в мессенджеры, пока вы были заняты.
+    fn ui_inbox(&mut self, ui: &mut egui::Ui) {
+        if self.inbox.is_empty() {
+            let hint = if self.cfg.mirror {
+                "Здесь соберутся сообщения из Telegram, Discord и других мессенджеров"
+            } else {
+                "Включите «Уведомления мессенджеров» в настройках, и они будут собираться здесь"
+            };
+            empty_state(ui, "\u{EA8F}", "Новых сообщений нет", hint);
+            return;
+        }
+        // сводка: сколько и откуда
+        let mut by_app: Vec<(String, usize, [u8; 3])> = Vec::new();
+        for it in &self.inbox {
+            match by_app.iter_mut().find(|a| a.0 == it.app) {
+                Some(a) => a.1 += 1,
+                None => by_app.push((it.app.clone(), 1, it.color)),
+            }
+        }
+        let mut clear = false;
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.label(RichText::new(count_ru(self.inbox.len(), ["сообщение", "сообщения", "сообщений"])).font(semi(14.0)));
+            for (app, n, c) in by_app.iter().take(4) {
+                ui.add_space(6.0);
+                let (r, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                ui.painter().circle_filled(r.center(), 3.5, Color32::from_rgb(c[0], c[1], c[2]));
+                ui.label(RichText::new(format!("{app} {n}")).color(DIM).size(12.5));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if jelly(ui, "Очистить").on_hover_text("Убрать все сообщения из списка").clicked() {
+                    clear = true;
+                }
+            });
+        });
+        ui.add_space(4.0);
+        let now = chrono::Local::now();
+        let mut pick: Option<usize> = None;
+        let mut drop: Option<usize> = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            for (i, it) in self.inbox.iter().enumerate() {
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 6.0, 50.0), Sense::click());
+                let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
+                let p = ui.painter();
+                glass_chip(p, r, 14.0, 0.4 + 0.5 * hov);
+                // цветная полоска слева — по мессенджеру
+                let c = Color32::from_rgb(it.color[0], it.color[1], it.color[2]);
+                let letter: String = it.title.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().collect()).unwrap_or_else(|| "·".into());
+                let top = [it.color[0].saturating_add(40), it.color[1].saturating_add(40), it.color[2].saturating_add(40)];
+                icon_disc(p, pos2(r.left() + 27.0, r.center().y), 16.0, top, it.color, &letter, 14.0);
+                let x = r.left() + 54.0;
+                let when = ago_ru((now - it.at).num_minutes(), &it.at.format("%H:%M").to_string());
+                let when_w = p.layout_no_wrap(when.clone(), FontId::proportional(11.5), DIM).size().x;
+                let close = Rect::from_center_size(pos2(r.right() - 20.0, r.center().y), vec2(26.0, 26.0));
+                let right = r.right() - 14.0 - if hov > 0.0 { 30.0 } else { 0.0 };
+                let clip = p.with_clip_rect(Rect::from_min_max(pos2(x, r.top()), pos2(right - when_w - 10.0, r.bottom())));
+                let head = clip.text(pos2(x, r.top() + 9.0), Align2::LEFT_TOP, &it.title, semi(13.0), FG);
+                clip.text(pos2(head.right() + 8.0, r.top() + 10.5), Align2::LEFT_TOP, &it.app, FontId::proportional(11.0), mix(c, DIM, 0.35));
+                let body: String = it.body.split_whitespace().collect::<Vec<_>>().join(" ");
+                let body = if body.is_empty() { "без текста".to_string() } else { body };
+                p.with_clip_rect(Rect::from_min_max(pos2(x, r.top()), pos2(right, r.bottom())))
+                    .text(pos2(x, r.top() + 28.0), Align2::LEFT_TOP, body, FontId::proportional(12.5), DIM);
+                p.text(pos2(right, r.top() + 10.0), Align2::RIGHT_TOP, when, FontId::proportional(11.5), mix(DIM, BG, 0.25));
+                let mut used = false;
+                if hov > 0.0 {
+                    let b = ui.interact(close, ui.id().with(("inbox-x", i)), Sense::click()).on_hover_text("Убрать");
+                    let bh = ui.ctx().animate_bool_with_time(b.id.with("hov"), b.hovered(), 0.10);
+                    glass_chip(ui.painter(), close, 9.0, (0.3 + 0.7 * bh) * hov);
+                    ui.painter().text(close.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(10.5), mix(DIM, FG, bh).gamma_multiply(hov));
+                    if b.clicked() {
+                        drop = Some(i);
+                        used = true;
+                    }
+                }
+                if !used && resp.on_hover_text("Щелчок копирует текст сообщения").clicked() {
+                    pick = Some(i);
+                }
+            }
+        });
+        if clear {
+            self.inbox.clear();
+        } else if let Some(i) = drop {
+            self.inbox.remove(i);
+        } else if let Some(i) = pick {
+            let text = if self.inbox[i].body.is_empty() { self.inbox[i].title.clone() } else { self.inbox[i].body.clone() };
+            self.set_clipboard(&text);
+            self.notify("Текст сообщения скопирован");
         }
     }
 
@@ -5141,6 +5306,7 @@ impl App {
             Tab::Calendar => 360.0,
             Tab::Shot => 306.0,
             Tab::Clip => 340.0,
+            Tab::Inbox => 340.0,
             Tab::Notes => 340.0,
             Tab::Todo => 340.0,
             Tab::System => if self.stats.battery.is_some() { 416.0 } else { 394.0 },
@@ -5183,6 +5349,38 @@ fn hwnd_of(frame: &eframe::Frame) -> Option<isize> {
 }
 
 /// Чистый цвет радуги: h от 0 до 1, a — непрозрачность.
+/// Обложка-заглушка: диагональный градиент двух соседних оттенков, выбранных по названию трека,
+/// мягкий блик сверху и нота. У каждого трека свой цвет, но всегда в спокойной гамме.
+fn art_placeholder(p: &egui::Painter, rect: Rect, r: f32, seed: &str, glyph: f32) {
+    let h = seed.bytes().fold(2166136261u32, |a, b| (a ^ b as u32).wrapping_mul(16777619));
+    let base = (h % 360) as f32 / 360.0;
+    let soft = |c: Color32, k: f32| mix(Color32::from_rgb(24, 22, 40), c, k);
+    // зелёно-жёлтые оттенки на тёмном выглядят кисло — сдвигаем их к бирюзе
+    let base = if (0.12..0.30).contains(&base) { base + 0.25 } else { base };
+    let c1 = soft(hue(base, 1.0), 0.52);
+    let c2 = soft(hue(base + 0.11, 1.0), 0.30);
+    let pts = contour(rect, r.min(rect.width() / 2.0), 0.0, 8);
+    let mut mesh = egui::Mesh::default();
+    let diag = (rect.width() + rect.height()).max(1.0);
+    // диагональ от первого цвета ко второму плюс мягкое высветление к верхнему краю
+    let col = |q: Pos2| {
+        let up = 1.0 - ((q.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
+        mix(mix(c1, c2, ((q.x - rect.left()) + (q.y - rect.top())) / diag), Color32::WHITE, 0.10 * up * up)
+    };
+    mesh.colored_vertex(rect.center(), col(rect.center()));
+    for (q, _) in &pts {
+        mesh.colored_vertex(*q, col(*q));
+    }
+    let n = pts.len() as u32;
+    for i in 0..n {
+        mesh.add_triangle(0, 1 + i, 1 + (i + 1) % n);
+    }
+    p.add(egui::Shape::mesh(mesh));
+    p.rect_stroke(rect, Rounding::same(r), Stroke::new(1.0_f32, rgba(255, 255, 255, 18)));
+    p.text(rect.center() + vec2(1.0, 2.0), Align2::CENTER_CENTER, "\u{E8D6}", FontId::proportional(glyph), rgba(0, 0, 0, 60));
+    p.text(rect.center(), Align2::CENTER_CENTER, "\u{E8D6}", FontId::proportional(glyph), rgba(255, 255, 255, 225));
+}
+
 fn hue(h: f32, a: f32) -> Color32 {
     let h = h.rem_euclid(1.0) * 6.0;
     let ch = |n: f32| {
