@@ -244,6 +244,98 @@ pub fn save_notes(notes: &[String]) {
     let _ = write_atomic(&dir().join("notes.txt"), kept.join(NOTE_SEP).as_bytes());
 }
 
+/// Пункт чек-листа в заметке: номер строки, отмечен ли, текст после «[ ]».
+#[derive(Debug, PartialEq)]
+pub struct CheckItem {
+    pub line: usize,
+    pub done: bool,
+    pub label: String,
+}
+
+/// Разбирает строку «- [ ] текст» / «* [x] текст» (с отступом или без).
+fn parse_check(line: &str) -> Option<(bool, &str)> {
+    let t = line.trim_start();
+    let t = t.strip_prefix("- ").or_else(|| t.strip_prefix("* "))?;
+    let (done, rest) = if let Some(r) = t.strip_prefix("[ ]") {
+        (false, r)
+    } else if let Some(r) = t.strip_prefix("[x]").or_else(|| t.strip_prefix("[X]")) {
+        (true, r)
+    } else {
+        return None;
+    };
+    if !(rest.is_empty() || rest.starts_with(' ')) {
+        return None;
+    }
+    Some((done, rest.trim()))
+}
+
+pub fn check_items(note: &str) -> Vec<CheckItem> {
+    note.lines()
+        .enumerate()
+        .filter_map(|(i, l)| parse_check(l).map(|(done, label)| CheckItem { line: i, done, label: label.to_string() }))
+        .collect()
+}
+
+/// (отмечено, всего)
+pub fn check_progress(note: &str) -> (usize, usize) {
+    let items = check_items(note);
+    (items.iter().filter(|c| c.done).count(), items.len())
+}
+
+/// Переключает отметку в строке `line`; прочий текст (и перевод строки в конце) не трогает.
+pub fn toggle_check(note: &str, line: usize) -> String {
+    let mut out: Vec<String> = note.split('\n').map(str::to_string).collect();
+    if let Some(l) = out.get_mut(line) {
+        if let Some((done, _)) = parse_check(l.trim_end_matches('\r')) {
+            // «[» стоит сразу после отступа и «- »: все символы там ASCII
+            let at = l.len() - l.trim_start().len() + 2;
+            l.replace_range(at..at + 3, if done { "[ ]" } else { "[x]" });
+        }
+    }
+    out.join("\n")
+}
+
+/// Добавляет пустой пункт в конец заметки.
+pub fn append_check(note: &str) -> String {
+    let base = note.trim_end_matches(['\n', '\r', ' ']);
+    if base.is_empty() { "- [ ] ".to_string() } else { format!("{base}\n- [ ] ") }
+}
+
+#[cfg(test)]
+mod check_tests {
+    use super::*;
+
+    #[test]
+    fn parses_items() {
+        let n = "Покупки\n- [ ] хлеб\n- [x] молоко\n  * [X] сыр\n-[ ] нет\n- [y] нет\n- [ ]слитно";
+        let it = check_items(n);
+        assert_eq!(it.len(), 3);
+        assert_eq!(it[0], CheckItem { line: 1, done: false, label: "хлеб".into() });
+        assert!(it[1].done && it[2].done);
+        assert_eq!(it[2].label, "сыр");
+        assert_eq!(check_progress(n), (2, 3));
+        assert_eq!(check_progress("просто текст"), (0, 0));
+    }
+
+    #[test]
+    fn toggles_only_that_line() {
+        let n = "T\n- [ ] а [ ] б\n- [X] в\n";
+        let a = toggle_check(n, 1);
+        assert_eq!(a, "T\n- [x] а [ ] б\n- [X] в\n");
+        assert_eq!(toggle_check(&a, 2), "T\n- [x] а [ ] б\n- [ ] в\n");
+        assert_eq!(toggle_check(n, 0), n);
+        assert_eq!(toggle_check(n, 99), n);
+        assert_eq!(toggle_check("- [ ] а\r\nб", 0), "- [x] а\r\nб");
+        assert_eq!(toggle_check("  * [X] а [x]", 0), "  * [ ] а [x]");
+    }
+
+    #[test]
+    fn appends() {
+        assert_eq!(append_check(""), "- [ ] ");
+        assert_eq!(append_check("T\n\n"), "T\n- [ ] ");
+    }
+}
+
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_NAME: &str = "Ostrovok";
 
