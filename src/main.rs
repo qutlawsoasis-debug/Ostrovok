@@ -5198,14 +5198,18 @@ impl App {
             head(ui, "ТЕМА");
             ui.horizontal(|ui| {
                 let cur = THEME.load(Ordering::Relaxed);
+                let mut hovered: Option<usize> = std::env::var("OSTROVOK_THEMEHOVER").ok().filter(|_| test_mode()).and_then(|v| v.parse().ok());
                 for (i, t) in THEMES.iter().enumerate() {
                     let (r, resp) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
-                    let resp = resp.on_hover_text(t.name);
+                    if resp.hovered() {
+                        hovered = Some(i);
+                    }
                     let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
                     let sel = ui.ctx().animate_bool_with_time(resp.id.with("sel"), i == cur, 0.14);
                     let col = Color32::from_rgb(t.accent[0], t.accent[1], t.accent[2]);
                     // кружок показывает и акцент, и оттенок стекла
-                    ui.painter().circle_filled(r.center(), 11.0 + hov, Color32::from_rgb(t.glass[0] * 3, t.glass[1] * 3, t.glass[2] * 3));
+                    let [gr, gg, gb] = glass_shade(t.glass);
+                    ui.painter().circle_filled(r.center(), 11.0 + hov, Color32::from_rgb(gr, gg, gb));
                     ui.painter().circle_filled(r.center(), 7.0 + hov, col);
                     if sel > 0.0 {
                         ui.painter().circle_stroke(r.center(), 13.5, Stroke::new(1.6_f32, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (sel * 255.0) as u8)));
@@ -5216,8 +5220,25 @@ impl App {
                         self.cfg.save();
                     }
                 }
-                ui.add_space(4.0);
-                ui.label(RichText::new(theme().name).font(semi(13.0)).color(accent()));
+                // мини-пилюля: как остров будет выглядеть в теме под курсором (или в выбранной)
+                ui.add_space(6.0);
+                let w = ui.available_width().clamp(96.0, 150.0);
+                let (r, _) = ui.allocate_exact_size(vec2(w, 28.0), Sense::hover());
+                let idx = theme_preview_idx(hovered, cur);
+                let t = &THEMES[idx];
+                let fade = |key: &str, v: u8| ui.ctx().animate_value_with_time(ui.id().with(("tp", key)), v as f32, 0.18) as u8;
+                let [gr, gg, gb] = t.glass;
+                let glass = Color32::from_rgb(fade("gr", gr), fade("gg", gg), fade("gb", gb));
+                let a = Color32::from_rgb(fade("ar", t.accent[0]), fade("ag", t.accent[1]), fade("ab", t.accent[2]));
+                let p = ui.painter();
+                p.rect_filled(r, Rounding::same(14.0), glass);
+                p.rect_stroke(r, Rounding::same(14.0), Stroke::new(1.2_f32, Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 150)));
+                for dx in [11.0, 18.0] {
+                    p.rect_filled(Rect::from_center_size(pos2(r.left() + dx, r.center().y), vec2(3.5, 7.0)), Rounding::same(1.8), Color32::WHITE);
+                }
+                let tm = p.text(pos2(r.left() + 28.0, r.center().y), Align2::LEFT_CENTER, "12:34", semi(12.0), FG);
+                p.with_clip_rect(Rect::from_min_max(pos2(tm.right() + 6.0, r.top()), pos2(r.right() - 8.0, r.bottom())))
+                    .text(pos2(r.right() - 10.0, r.center().y), Align2::RIGHT_CENTER, t.name, semi(11.5), a);
             });
             ui.add_space(4.0);
             head(ui, "ПЕРСОНАЖ");
@@ -7373,6 +7394,33 @@ fn power_timer_label(action: &str, secs_left: u64) -> String {
 /// Отложенное действие: (пора выполнить, пора предупредить за минуту).
 fn power_due(secs_left: u64, warned: bool) -> (bool, bool) {
     (secs_left == 0, !warned && secs_left > 0 && secs_left <= 60)
+}
+
+/// Какую тему показывать в предпросмотре: под курсором, иначе выбранную.
+fn theme_preview_idx(hovered: Option<usize>, current: usize) -> usize {
+    hovered.unwrap_or(current).min(THEMES.len() - 1)
+}
+
+/// Оттенок стекла темы, осветлённый для кружков и предпросмотра.
+fn glass_shade(g: [u8; 3]) -> [u8; 3] {
+    g.map(|c| c.saturating_mul(3))
+}
+
+#[cfg(test)]
+mod theme_preview_tests {
+    use super::*;
+    #[test]
+    fn picks_hovered_or_current() {
+        assert_eq!(theme_preview_idx(Some(3), 0), 3);
+        assert_eq!(theme_preview_idx(None, 2), 2);
+        assert_eq!(theme_preview_idx(Some(99), 1), THEMES.len() - 1);
+        assert_eq!(theme_preview_idx(None, 99), THEMES.len() - 1);
+    }
+    #[test]
+    fn glass_is_lighter_and_safe() {
+        assert_eq!(glass_shade([11, 11, 20]), [33, 33, 60]);
+        assert_eq!(glass_shade([200, 90, 0]), [255, 255, 0]);
+    }
 }
 
 #[cfg(test)]
