@@ -364,7 +364,7 @@ impl CpuMeter {
             let mut mem = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
             if GlobalMemoryStatusEx(&mut mem).is_ok() {
                 s.mem_total = mem.ullTotalPhys as f64 / GB;
-                s.mem_used = (mem.ullTotalPhys - mem.ullAvailPhys) as f64 / GB;
+                s.mem_used = mem.ullTotalPhys.saturating_sub(mem.ullAvailPhys) as f64 / GB;
             }
 
             let (mut free, mut total) = (0u64, 0u64);
