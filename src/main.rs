@@ -980,6 +980,10 @@ struct App {
     capture_req: Option<bool>,
     app_query: Option<String>,
     confirm: Option<(&'static str, Instant)>,
+    /// отложенная блокировка или сон: действие, когда, предупредили ли за минуту
+    power_timer: Option<(&'static str, Instant, bool)>,
+    /// что выбрано для отложенного действия: "lock" или "sleep"
+    power_pick: &'static str,
     was_foreground: bool,
     qr_text: String,
     pick_at: Option<Instant>,
@@ -1259,6 +1263,8 @@ impl App {
             capture_req: None,
             app_query: None,
             confirm: None,
+            power_timer: None,
+            power_pick: "sleep",
             was_foreground: false,
             qr_text: String::new(),
             pick_at: None,
@@ -1377,6 +1383,10 @@ impl App {
             for _ in 0..n {
                 app.push_inbox(live::Notice { app: "Telegram".into(), title: "Мирон".into(), body: "привет".into() }, [0x2A, 0xAB, 0xEE]);
             }
+        }
+        // для снимков отложенного сна на «Управлении»: OSTROVOK_POWERTIMER=30 (в тестовом режиме по истечении ничего не делает)
+        if let Some(m) = std::env::var("OSTROVOK_POWERTIMER").ok().and_then(|v| v.parse::<u64>().ok()).filter(|_| test_mode()) {
+            app.power_timer = Some(("sleep", Instant::now() + Duration::from_secs(m * 60 - 19), false));
         }
         // для снимков страницы «Звук» во включённом тихом режиме: OSTROVOK_QUIET=1 (системную громкость не трогает)
         if test_mode() && std::env::var_os("OSTROVOK_QUIET").is_some() {
@@ -2204,6 +2214,21 @@ impl App {
         }
         if now.duration_since(self.stats_at) >= Duration::from_millis(1500) {
             self.stats_at = now;
+            // отложенная блокировка или сон со страницы «Управление»
+            if let Some((action, at, warned)) = self.power_timer {
+                let left = at.saturating_duration_since(now).as_secs();
+                let (fire, warn) = power_due(left, warned);
+                if fire {
+                    self.power_timer = None;
+                    if !test_mode() {
+                        store::save_notes(&self.notes);
+                        sys::power(action);
+                    }
+                } else if warn {
+                    self.power_timer = Some((action, at, true));
+                    self.notify(if action == "sleep" { "Сон через минуту" } else { "Блокировка через минуту" });
+                }
+            }
             self.stats = self.meter.sample();
             // для снимков батарейки в пилюле: OSTROVOK_BATTERY=8 (разряжается) или 15c (заряжается)
             if let Some(v) = std::env::var("OSTROVOK_BATTERY").ok().filter(|_| test_mode()) {
@@ -3827,6 +3852,59 @@ impl App {
             if jelly(&mut folders, name).clicked() {
                 sys::open(&format!("{home}\\{dir}"));
                 self.mode = Mode::Pill;
+            }
+        }
+
+        // ── отложить: блокировка или сон через N минут, отмена одним щелчком
+        ui.add_space(6.0);
+        {
+            let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
+            let moon = Color32::from_rgb(0xB4, 0x9C, 0xFF);
+            let chip = |ui: &egui::Ui, r: Rect, key: &str, label: &str, lit: bool, tone: Color32| -> bool {
+                let resp = ui.interact(r, ui.id().with(("pt", key)), Sense::click());
+                let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
+                let glow = ui.ctx().animate_bool_with_time(resp.id.with("lit"), lit, 0.16);
+                glass_chip(&p, r, 16.0, 0.4 + 0.5 * hov);
+                if glow > 0.0 {
+                    p.rect_filled(r.shrink(1.0), Rounding::same(15.0), Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), (70.0 * glow) as u8));
+                }
+                p.text(r.center(), Align2::CENTER_CENTER, label, semi(12.0), mix(mix(DIM, FG, hov), FG, glow));
+                resp.clicked()
+            };
+            p.text(pos2(row.left() + 4.0, row.center().y), Align2::LEFT_CENTER, "\u{E916}  Отложить", semi(12.5), DIM);
+            let x0 = row.left() + 100.0;
+            match self.power_timer {
+                Some((action, at, _)) => {
+                    let left = at.saturating_duration_since(Instant::now()).as_secs();
+                    let r = Rect::from_min_max(pos2(x0, row.top()), pos2(row.right() - 104.0, row.bottom()));
+                    glass_chip(&p, r, 16.0, 0.55);
+                    p.rect_filled(r.shrink(1.0), Rounding::same(15.0), Color32::from_rgba_unmultiplied(moon.r(), moon.g(), moon.b(), 46));
+                    p.text(pos2(r.left() + 16.0, r.center().y), Align2::LEFT_CENTER, power_timer_label(action, left), semi(12.5), FG);
+                    if chip(ui, Rect::from_min_max(pos2(row.right() - 96.0, row.top()), row.max), "cancel", "Отменить", false, moon) {
+                        self.power_timer = None;
+                        self.notify("Отложенное действие отменено");
+                    }
+                    // секунды идут, пока страница открыта
+                    ui.ctx().request_repaint_after(Duration::from_millis(500));
+                }
+                None => {
+                    let mut x = x0;
+                    for (key, label, w) in [("lock", "Блокировка", 96.0), ("sleep", "Сон", 56.0)] {
+                        if chip(ui, Rect::from_min_size(pos2(x, row.top()), vec2(w, row.height())), key, label, self.power_pick == key, moon) {
+                            self.power_pick = if key == "lock" { "lock" } else { "sleep" };
+                        }
+                        x += w + 6.0;
+                    }
+                    x += 10.0;
+                    let step = (row.right() - x) / 4.0;
+                    for (k, m) in [15u64, 30, 60, 90].into_iter().enumerate() {
+                        let r = Rect::from_min_size(pos2(x + step * k as f32, row.top()), vec2(step - 6.0, row.height()));
+                        if chip(ui, r, &format!("m{m}"), &format!("{m} мин"), false, accent()) {
+                            self.power_timer = Some((self.power_pick, Instant::now() + Duration::from_secs(m * 60), false));
+                            self.notify(&format!("{} через {m} мин", if self.power_pick == "sleep" { "Сон" } else { "Блокировка" }));
+                        }
+                    }
+                }
             }
         }
 
@@ -6986,7 +7064,7 @@ impl App {
         let saved = if matches!(self.tab, Tab::Ai | Tab::Settings) { 0.0 } else { 24.0 };
         -saved + match self.tab {
             Tab::Home => 396.0,
-            Tab::Control => 238.0,
+            Tab::Control => 276.0,
             Tab::Sound => 322.0,
             Tab::Music => 388.0,
             Tab::Remind => 320.0,
@@ -7284,6 +7362,37 @@ fn due_date_label(due: chrono::NaiveDate) -> (String, u8) {
 fn new_todo(text: &str) -> store::Todo {
     let (text, due) = parse_due(text, chrono::Local::now().date_naive());
     store::Todo { text, done: false, due: due.map(|d| d.format("%Y-%m-%d").to_string()) }
+}
+
+/// «Сон через 29:41» — подпись отложенного действия питания.
+fn power_timer_label(action: &str, secs_left: u64) -> String {
+    let name = if action == "sleep" { "Сон" } else { "Блокировка" };
+    format!("{name} через {}:{:02}", secs_left / 60, secs_left % 60)
+}
+
+/// Отложенное действие: (пора выполнить, пора предупредить за минуту).
+fn power_due(secs_left: u64, warned: bool) -> (bool, bool) {
+    (secs_left == 0, !warned && secs_left > 0 && secs_left <= 60)
+}
+
+#[cfg(test)]
+mod power_timer_tests {
+    use super::*;
+    #[test]
+    fn labels() {
+        assert_eq!(power_timer_label("sleep", 1781), "Сон через 29:41");
+        assert_eq!(power_timer_label("lock", 59), "Блокировка через 0:59");
+        assert_eq!(power_timer_label("lock", 3600), "Блокировка через 60:00");
+        assert_eq!(power_timer_label("sleep", 0), "Сон через 0:00");
+    }
+    #[test]
+    fn due_and_warning() {
+        // (сработать, предупредить)
+        assert_eq!(power_due(120, false), (false, false));
+        assert_eq!(power_due(60, false), (false, true));
+        assert_eq!(power_due(30, true), (false, false));
+        assert_eq!(power_due(0, true), (true, false));
+    }
 }
 
 #[cfg(test)]
