@@ -5376,12 +5376,15 @@ impl App {
                 for m in &self.shot_marks {
                     draw_frame_rgba(&mut px, size.0, size.1, *m, t, [MARK.r(), MARK.g(), MARK.b()]);
                 }
-                // проверочный запуск ничего не пишет на диск
-                let saved = !test_mode() && image::save_buffer(&path, &px, size.0 as u32, size.1 as u32, image::ExtendedColorType::Rgba8).is_ok();
+                // исходник не трогаем: размеченное — отдельным файлом рядом. Проверочный запуск ничего не пишет на диск
+                let out = marked_path(&path, |p| p.exists());
+                let saved = !test_mode() && image::save_buffer(&out, &px, size.0 as u32, size.1 as u32, image::ExtendedColorType::Rgba8).is_ok();
                 self.clip_skip = true;
                 let data = arboard::ImageData { width: size.0, height: size.1, bytes: std::borrow::Cow::Borrowed(&px) };
                 let copied = self.clipboard.as_mut().is_some_and(|cb| cb.set_image(data).is_ok());
-                self.show_shot(ui.ctx(), size.0, size.1, px, path);
+                // карточка дальше работает с новым файлом; не сохранился — остаётся прежний путь
+                let shown = if saved { out.to_string_lossy().to_string() } else { path };
+                self.show_shot(ui.ctx(), size.0, size.1, px, shown);
                 self.notify(match (saved, copied) {
                     (true, true) => "Разметка сохранена и в буфере",
                     (true, false) => "Разметка сохранена, в буфер не вышло",
@@ -9091,6 +9094,17 @@ fn view_to_image(a: Pos2, b: Pos2, img: Rect, size: (usize, usize)) -> Option<[u
     Some([sx(r.left()), sy(r.top()), sx(r.right()), sy(r.bottom())])
 }
 
+/// Куда сохранить размеченную копию снимка: «<имя> (разметка).png» рядом, при занятом — «(разметка 2)» и т.д.
+fn marked_path(path: &str, exists: impl Fn(&std::path::Path) -> bool) -> std::path::PathBuf {
+    let p = std::path::Path::new(path);
+    let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Снимок".into());
+    let dir = p.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+    (1..1000)
+        .map(|n| dir.join(if n == 1 { format!("{stem} (разметка).png") } else { format!("{stem} (разметка {n}).png") }))
+        .find(|c| !exists(c))
+        .unwrap_or_else(|| dir.join(format!("{stem} (разметка {}).png", chrono::Local::now().timestamp())))
+}
+
 /// Рисует прямоугольную рамку толщиной t прямо в RGBA-снимке w×h; всё за краем пропускается.
 fn draw_frame_rgba(px: &mut [u8], w: usize, h: usize, r: [u32; 4], t: usize, color: [u8; 3]) {
     let (x0, y0) = (r[0] as usize, r[1] as usize);
@@ -9119,6 +9133,18 @@ mod shot_mark_tests {
         assert_eq!(view_to_image(pos2(200.0, 90.0), pos2(60.0, 0.0), img, (1000, 500)), Some([500, 0, 1000, 500]));
         assert_eq!(view_to_image(pos2(20.0, 30.0), pos2(20.5, 30.2), img, (1000, 500)), None, "просто щелчок — не рамка");
         assert_eq!(view_to_image(pos2(0.0, 0.0), pos2(5.0, 5.0), img, (1000, 500)), None, "целиком мимо снимка");
+    }
+
+    #[test]
+    fn marked_copy_name() {
+        let none = |_: &std::path::Path| false;
+        assert_eq!(marked_path(r"C:\P\Снимок 1.png", none), std::path::PathBuf::from(r"C:\P\Снимок 1 (разметка).png"));
+        let taken = |p: &std::path::Path| {
+            let s = p.to_string_lossy();
+            s.ends_with("(разметка).png") || s.ends_with("(разметка 2).png")
+        };
+        assert_eq!(marked_path(r"C:\P\a.png", taken), std::path::PathBuf::from(r"C:\P\a (разметка 3).png"));
+        assert_eq!(marked_path(r"C:\P\b", none), std::path::PathBuf::from(r"C:\P\b (разметка).png"), "без расширения — png");
     }
 
     #[test]
