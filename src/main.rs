@@ -1422,7 +1422,7 @@ impl App {
                 }
                 "notes" => {
                     // для снимков: образцы заметок (в проверочном запуске они не сохраняются)
-                    app.notes = ["Покупки\nхлеб, молоко, сыр\nкорм коту", "Идеи для острова\nгромкость по приложениям колесом\nвиджет курса валют", "Пароль от вайфая у соседей\nспросить в субботу", "Сервер\nперезагружать по вторникам"].map(String::from).to_vec();
+                    app.notes = ["Покупки\n- [x] хлеб\n- [x] молоко\n- [ ] сыр\n- [ ] корм коту", "Идеи для острова\nгромкость по приложениям колесом\nвиджет курса валют", "Пароль от вайфая у соседей\nспросить в субботу", "Сервер\nперезагружать по вторникам"].map(String::from).to_vec();
                     Tab::Notes
                 }
                 "jarvis" => Tab::Jarvis,
@@ -4819,6 +4819,13 @@ impl App {
                 let on = i == self.note_sel;
                 glass_chip(ui.painter(), r, 11.0, if on { 1.0 } else { 0.3 + 0.4 * hov });
                 let p = ui.painter().with_clip_rect(r.shrink2(vec2(10.0, 0.0)));
+                let (done, total) = store::check_progress(n);
+                let p = if total > 0 {
+                    let badge = p.text(pos2(r.right() - 10.0, r.top() + 14.0), Align2::RIGHT_CENTER, format!("{done}/{total}"), FontId::proportional(11.0), if done == total { accent() } else { DIM });
+                    p.with_clip_rect(Rect::from_min_max(r.min + vec2(10.0, 0.0), pos2(badge.left() - 6.0, r.bottom())))
+                } else {
+                    p
+                };
                 p.text(pos2(r.left() + 12.0, r.top() + 14.0), Align2::LEFT_CENTER, title, semi(13.0), if on { accent() } else { FG });
                 p.text(pos2(r.left() + 12.0, r.top() + 31.0), Align2::LEFT_CENTER, if more.is_empty() { "без продолжения".to_string() } else { more }, FontId::proportional(11.5), DIM);
                 if resp.clicked() {
@@ -4835,7 +4842,45 @@ impl App {
         // ----- текст
         let mut ru = ui.new_child(egui::UiBuilder::new().max_rect(right));
         let sel = self.note_sel;
+        let mut toggle = None;
         egui::ScrollArea::vertical().id_salt("notes-text").max_height(right.height() - 30.0).auto_shrink([false, false]).show(&mut ru, |ui| {
+            // ----- чек-лист: пункты «- [ ] …» кружками, щелчок отмечает
+            let items = store::check_items(&self.notes[sel]);
+            if !items.is_empty() {
+                let (done, total) = (items.iter().filter(|c| c.done).count(), items.len());
+                let (br, _) = ui.allocate_exact_size(vec2(ui.available_width(), 4.0), Sense::hover());
+                let bar = Rect::from_min_size(br.min, vec2(br.width(), 3.0));
+                ui.painter().rect_filled(bar, 2.0, DIM.gamma_multiply(0.25));
+                let k = ui.ctx().animate_value_with_time(Id::new(("chk-bar", sel)), done as f32 / total as f32, 0.25);
+                ui.painter().rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * k, 3.0)), 2.0, accent());
+                ui.add_space(4.0);
+                for c in &items {
+                    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+                    let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
+                    let t = ui.ctx().animate_bool_with_time(Id::new(("chk", sel, c.line)), c.done, 0.18);
+                    if hov > 0.0 {
+                        glass_chip(ui.painter(), r, 8.0, 0.35 * hov);
+                    }
+                    let ctr = pos2(r.left() + 16.0, r.center().y);
+                    ui.painter().circle_stroke(ctr, 7.5, Stroke::new(1.5_f32, if c.done { accent() } else { DIM }));
+                    if t > 0.0 {
+                        ui.painter().circle_filled(ctr, 7.5 * t, accent());
+                        let pts = vec![ctr + vec2(-3.5, 0.2), ctr + vec2(-1.0, 2.8), ctr + vec2(3.8, -2.6)];
+                        ui.painter().add(egui::Shape::line(pts, Stroke::new(1.6_f32, Color32::WHITE.gamma_multiply(t))));
+                    }
+                    let label = if c.label.is_empty() { "пустой пункт" } else { c.label.as_str() };
+                    let g = ui.painter().with_clip_rect(r).text(pos2(r.left() + 32.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(13.0), if c.done { DIM } else { FG });
+                    if t > 0.0 {
+                        let y = g.center().y;
+                        ui.painter().with_clip_rect(r).line_segment([pos2(g.left(), y), pos2(g.left() + g.width() * t, y)], Stroke::new(1.0_f32, DIM));
+                    }
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        toggle = Some(c.line);
+                    }
+                }
+                ui.label(RichText::new(format!("Готово {done} из {total}")).color(DIM).size(11.0));
+                ui.add_space(6.0);
+            }
             let r = ui.add(
                 egui::TextEdit::multiline(&mut self.notes[sel])
                     .hint_text(RichText::new("Первая строка станет названием. Заметки сохраняются сами").color(DIM))
@@ -4845,6 +4890,7 @@ impl App {
             );
             if r.changed() {
                 self.notes_dirty = Some(Instant::now());
+                toggle = None; // текст сдвинулся — номер строки мог устареть
             }
         });
         ru.horizontal(|ui| {
@@ -4852,6 +4898,10 @@ impl App {
             ui.label(RichText::new(format!("{} из {} · {n} симв.", sel + 1, self.notes.len())).color(DIM).size(11.5));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 del = ui.add_enabled(self.notes.len() > 1 || n > 0, egui::Button::new("Удалить")).clicked();
+                if jelly(ui, "+ пункт").on_hover_text("Добавить пункт чек-листа «- [ ] »").clicked() {
+                    self.notes[sel] = store::append_check(&self.notes[sel]);
+                    self.notes_dirty = Some(Instant::now());
+                }
                 if jelly(ui, "Копировать").clicked() {
                     let text = self.notes[sel].clone();
                     self.set_clipboard(&text);
@@ -4860,6 +4910,10 @@ impl App {
             });
         });
 
+        if let Some(line) = toggle {
+            self.notes[sel] = store::toggle_check(&self.notes[sel], line);
+            self.notes_dirty = Some(Instant::now());
+        }
         if let Some(i) = pick {
             self.note_sel = i;
         }
