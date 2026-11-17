@@ -1380,6 +1380,8 @@ impl App {
         // конвертер: единицы считаются сразу, для валют подгружаются курсы
         let rates = self.rates.get();
         for (title, value, sub) in convert::convert(&q, rates.as_ref()) {
+            // курсов нет и загрузить не вышло — говорим честно, а не «загружается» до бесконечности
+            let title = if rates.is_none() && value.is_empty() && self.rates.failed() { "Нет связи — курсы валют недоступны, попробую позже".to_string() } else { title };
             let action = if value.is_empty() { Action::Copy(String::new()) } else { Action::Copy(value) };
             self.results.push(Item { title, sub: sub.into(), action });
         }
@@ -3707,6 +3709,60 @@ impl App {
                 }
             });
         }
+        self.ui_sky_card(ui, &w);
+    }
+
+    /// Под погодой: фаза Луны и дуга солнца от восхода к закату — считается на месте, без сети.
+    fn ui_sky_card(&self, ui: &mut egui::Ui, w: &weather::Now) {
+        use chrono::Timelike;
+        ui.add_space(8.0);
+        let (card, _) = ui.allocate_exact_size(vec2(ui.available_width(), 66.0), Sense::hover());
+        let p = ui.painter().clone();
+        glass_chip(&p, card, 16.0, 0.45);
+        // время города (восход и закат даны в его поясе)
+        let city = chrono::Utc::now().naive_utc() + chrono::Duration::seconds(w.utc_offset as i64);
+        let date = if test_mode() {
+            std::env::var("OSTROVOK_MOON_DATE").ok().and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()).unwrap_or(city.date())
+        } else {
+            city.date()
+        };
+        // ── Луна
+        let (illum, name, waxing, to_full) = moon_phase(moon_age(date));
+        let mc = pos2(card.left() + 36.0, card.center().y);
+        moon_disc(&p, mc, 19.0, illum, waxing);
+        p.text(pos2(card.left() + 68.0, card.top() + 15.0), Align2::LEFT_TOP, name, semi(13.0), FG);
+        let sub = match to_full {
+            0 => format!("освещена {:.0}% · сегодня полнолуние", illum * 100.0),
+            n => format!("освещена {:.0}% · полнолуние через {}", illum * 100.0, count_ru(n as usize, ["день", "дня", "дней"])),
+        };
+        p.text(pos2(card.left() + 68.0, card.top() + 35.0), Align2::LEFT_TOP, sub, FontId::proportional(11.5), DIM);
+        // ── солнце: дуга от восхода к закату и точка «сейчас»
+        let hm = |s: &str| s.split_once(':').and_then(|(h, m)| Some(h.trim().parse::<f32>().ok()? + m.trim().parse::<f32>().ok()? / 60.0));
+        let (Some(rise), Some(set)) = (hm(&w.sunrise), hm(&w.sunset)) else {
+            // полярный день или ночь: времени восхода/заката нет
+            p.text(pos2(card.right() - 24.0, card.center().y), Align2::RIGHT_CENTER, "солнце сегодня не восходит или не заходит", FontId::proportional(11.5), DIM);
+            return;
+        };
+        let arc = Rect::from_min_max(pos2(card.center().x + 40.0, card.top() + 12.0), pos2(card.right() - 20.0, card.bottom() - 18.0));
+        let base = arc.bottom();
+        let pt = |f: f32| pos2(arc.left() + arc.width() * f, base - arc.height() * (std::f32::consts::PI * f).sin());
+        let mut line = Vec::new();
+        for i in 0..=40 {
+            line.push(pt(i as f32 / 40.0));
+        }
+        p.line_segment([pos2(arc.left() - 8.0, base), pos2(arc.right() + 8.0, base)], Stroke::new(1.0_f32, rgba(255, 255, 255, 30)));
+        p.add(egui::Shape::dashed_line(&line, Stroke::new(1.2_f32, rgba(255, 210, 120, 110)), 4.0, 3.0));
+        let now_h = city.hour() as f32 + city.minute() as f32 / 60.0;
+        let f = (now_h - rise) / (set - rise).max(0.1);
+        if (0.0..=1.0).contains(&f) {
+            let sun = pt(f);
+            p.circle_filled(sun, 9.0, rgba(255, 200, 90, 50));
+            p.circle_filled(sun, 5.0, Color32::from_rgb(255, 204, 92));
+        }
+        p.text(pos2(arc.left(), base + 9.0), Align2::CENTER_CENTER, &w.sunrise, FontId::proportional(10.5), DIM);
+        p.text(pos2(arc.right(), base + 9.0), Align2::CENTER_CENTER, &w.sunset, FontId::proportional(10.5), DIM);
+        let len = day_length(rise, set);
+        p.text(pos2(arc.center().x, base + 9.0), Align2::CENTER_CENTER, format!("день {} ч {} мин", len / 60, len % 60), FontId::proportional(11.0), FG);
     }
 
     /// Инструменты → Таймер: циферблат с остатком, готовые отрезки, своё время и секундомер.
@@ -6223,8 +6279,9 @@ impl App {
             Tab::Ai if self.api_key().is_empty() => AI_H,
             Tab::Ai => 420.0,
             Tab::Jarvis => 462.0,
-            Tab::Weather if self.weather.as_ref().is_some_and(|w| w.hours.len() >= 4) => 398.0,
-            Tab::Weather if self.weather.is_some() => 292.0,
+            // +74 — карточка Луны и солнца под прогнозом
+            Tab::Weather if self.weather.as_ref().is_some_and(|w| w.hours.len() >= 4) => 398.0 + 74.0,
+            Tab::Weather if self.weather.is_some() => 292.0 + 74.0,
             Tab::Weather => 250.0,
             Tab::Timer => 348.0,
             Tab::Calendar => 360.0,
@@ -6310,6 +6367,109 @@ fn gradient_rrect(p: &egui::Painter, rect: Rect, r: f32, col: impl Fn(Pos2) -> C
         mesh.add_triangle(0, 1 + i, 1 + (i + 1) % n);
     }
     p.add(egui::Shape::mesh(mesh));
+}
+
+/// Синодический месяц, дни.
+const LUNAR: f64 = 29.530_588_9;
+
+/// Возраст Луны в днях от новолуния (опорное новолуние — 6 января 2000, 18:14 UTC). Точность ±1 день.
+fn moon_age(date: chrono::NaiveDate) -> f64 {
+    let base = chrono::NaiveDate::from_ymd_opt(2000, 1, 6).unwrap().and_hms_opt(18, 14, 0).unwrap();
+    let days = (date.and_hms_opt(12, 0, 0).unwrap() - base).num_minutes() as f64 / 1440.0;
+    days.rem_euclid(LUNAR)
+}
+
+/// Освещённость 0..1, название фазы, растёт ли, дней до полнолуния.
+fn moon_phase(age: f64) -> (f32, &'static str, bool, u32) {
+    let illum = ((1.0 - (std::f64::consts::TAU * age / LUNAR).cos()) / 2.0) as f32;
+    let name = match age {
+        a if a < 1.0 || a >= LUNAR - 1.0 => "Новолуние",
+        a if a < 6.4 => "Растущий серп",
+        a if a < 8.4 => "Первая четверть",
+        a if a < 13.8 => "Растущая луна",
+        a if a < 15.8 => "Полнолуние",
+        a if a < 21.1 => "Убывающая луна",
+        a if a < 23.1 => "Последняя четверть",
+        _ => "Убывающий серп",
+    };
+    let full = LUNAR / 2.0;
+    // в пределах полусуток от полнолуния — «сегодня», а не «через 29 дней»
+    let to_full = if (age - full).abs() < 0.5 {
+        0.0
+    } else if age <= full {
+        full - age
+    } else {
+        LUNAR - age + full
+    };
+    (illum, name, age < full, to_full.round() as u32)
+}
+
+/// Долгота дня в минутах по восходу и закату в часах (7.5 = 07:30).
+fn day_length(rise: f32, set: f32) -> u32 {
+    ((set - rise).max(0.0) * 60.0).round() as u32
+}
+
+/// Луна: тёмный диск и освещённая часть — полукруг плюс терминатор-эллипс.
+fn moon_disc(p: &egui::Painter, c: Pos2, r: f32, illum: f32, waxing: bool) {
+    p.circle_filled(c, r + 6.0, rgba(230, 230, 255, 14));
+    p.circle_filled(c, r, Color32::from_rgb(38, 38, 58));
+    let light = Color32::from_rgb(240, 236, 214);
+    if illum < 0.01 {
+        p.circle_stroke(c, r, Stroke::new(1.0_f32, rgba(255, 255, 255, 40)));
+        return;
+    }
+    // освещённый край: справа у растущей (северное полушарие), слева у убывающей
+    let side = if waxing { 1.0 } else { -1.0 };
+    let k = 1.0 - 2.0 * illum; // полуось терминатора: 1 — тонкий серп, -1 — полный диск
+    let n = 40;
+    let mut pts = Vec::with_capacity(2 * n + 2);
+    for i in 0..=n {
+        let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / n as f32;
+        pts.push(c + vec2(side * a.cos() * r, a.sin() * r));
+    }
+    for i in 0..=n {
+        let a = std::f32::consts::FRAC_PI_2 - std::f32::consts::PI * i as f32 / n as f32;
+        pts.push(c + vec2(side * k * a.cos() * r, a.sin() * r));
+    }
+    // фигура может быть невыпуклой (серп) — рисуем веером из центра терминатора треугольниками
+    let mut mesh = egui::Mesh::default();
+    for q in &pts {
+        mesh.colored_vertex(*q, light);
+    }
+    for i in 0..=n as u32 {
+        let (a, b) = (i, 2 * n as u32 + 1 - i);
+        if i < n as u32 {
+            mesh.add_triangle(a, a + 1, b);
+            mesh.add_triangle(a + 1, b - 1, b);
+        }
+    }
+    p.add(egui::Shape::mesh(mesh));
+}
+
+#[cfg(test)]
+mod moon_tests {
+    use super::*;
+    fn d(y: i32, m: u32, day: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+    #[test]
+    fn moon_and_day() {
+        // известные даты: новолуние 8 апреля 2024, полнолуние 23 апреля 2024
+        let new = moon_age(d(2024, 4, 8));
+        assert!(new < 1.2 || new > LUNAR - 1.2, "новолуние: {new}");
+        let full = moon_age(d(2024, 4, 23));
+        assert!((full - 14.8).abs() < 1.2, "полнолуние: {full}");
+        assert_eq!(moon_phase(0.2).1, "Новолуние");
+        assert_eq!(moon_phase(10.0).1, "Растущая луна");
+        assert!(moon_phase(14.77).0 > 0.99);
+        assert_eq!(moon_phase(14.77).3, 0);
+        assert_eq!(moon_phase(15.0).3, 0);
+        assert_eq!(moon_phase(15.4).3, 29);
+        assert_eq!(moon_phase(10.0).3, 5);
+        assert!(!moon_phase(20.0).2);
+        assert_eq!(day_length(7.5, 16.25), 525);
+        assert_eq!(day_length(9.0, 8.0), 0);
+    }
 }
 
 #[cfg(test)]

@@ -297,11 +297,17 @@ pub fn convert(q: &str, rates: Option<&HashMap<String, f64>>) -> Vec<(String, St
 #[derive(Clone, Default)]
 pub struct Rates {
     state: Arc<Mutex<(Option<HashMap<String, f64>>, Option<Instant>, bool)>>,
+    /// последняя попытка не удалась, а сохранённых курсов нет — показываем «нет связи», а не вечное «загружается»
+    failed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Rates {
     pub fn get(&self) -> Option<HashMap<String, f64>> {
         self.state.lock().unwrap().0.clone()
+    }
+
+    pub fn failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Подгружает курсы, если их нет или они старше полусуток. done вызывается, когда пришли новые.
@@ -335,9 +341,11 @@ impl Rates {
                 let _ = std::fs::write(&cache, text);
                 st.0 = Some(map);
                 st.1 = Some(Instant::now());
+                me.failed.store(false, std::sync::atomic::Ordering::Relaxed);
             } else {
                 // не вышло — повторим не раньше чем через пять минут
                 st.1 = Some(Instant::now() - Duration::from_secs(12 * 3600 - 300));
+                me.failed.store(st.0.is_none(), std::sync::atomic::Ordering::Relaxed);
             }
             drop(st);
             done();
