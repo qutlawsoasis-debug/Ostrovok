@@ -81,6 +81,9 @@ pub struct Settings {
     /// закреплённые записи буфера обмена — переживают перезапуск
     #[serde(default)]
     pub pins: Vec<String>,
+    /// «Недавнее» строки поиска: только тексты запросов, не больше пяти
+    #[serde(default)]
+    pub recent: Vec<String>,
     /// папка с движком и моделями Джарвиса; пусто — рядом с настройками
     #[serde(default)]
     pub jarvis_dir: String,
