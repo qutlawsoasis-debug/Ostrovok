@@ -1796,6 +1796,9 @@ impl App {
 
     fn save_city(&mut self, ctx: &egui::Context) {
         let city = self.city_edit.trim().to_string();
+        // новый город — со свежим счётчиком сбоев, без чужой ошибки
+        self.weather_err = None;
+        self.weather_fails = 0;
         if city.is_empty() {
             self.cfg.city.clear();
             self.cfg.city_name.clear();

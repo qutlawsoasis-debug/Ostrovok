@@ -244,7 +244,7 @@ pub fn advice_tips(feels: f64, wind: f64, hours: &[Hour]) -> Vec<(Tip, String)> 
 pub fn empty_text(city_set: bool, err: Option<&str>) -> (&'static str, &'static str) {
     match (city_set, err) {
         (false, _) => ("Город не указан", "Погода появится, когда вы впишете город в настройках."),
-        (true, Some(_)) => ("Нет связи с сервером погоды", "Попробую снова через минуту"),
+        (true, Some(_)) => ("Нет связи с сервером погоды", "Попробую снова чуть позже"),
         (true, None) => ("Загружаю погоду…", ""),
     }
 }
@@ -266,7 +266,7 @@ mod tests {
     fn empty_texts() {
         assert_eq!(empty_text(false, None).0, "Город не указан");
         assert_eq!(empty_text(false, Some("x")).0, "Город не указан");
-        assert_eq!(empty_text(true, Some("x")), ("Нет связи с сервером погоды", "Попробую снова через минуту"));
+        assert_eq!(empty_text(true, Some("x")), ("Нет связи с сервером погоды", "Попробую снова чуть позже"));
         assert_eq!(empty_text(true, None), ("Загружаю погоду…", ""));
     }
     #[test]
