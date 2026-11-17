@@ -32,17 +32,25 @@ pub fn installed() -> bool {
 pub fn install() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let home = home().ok_or("не нашлась папка программ пользователя")?;
+    if exe.parent().is_some_and(|p| same_dir(p, &home)) {
+        return Err("Островок уже установлен и запущен из своей папки".into());
+    }
     std::fs::create_dir_all(&home).map_err(|e| format!("не удалось создать папку: {e}"))?;
     let target = home.join("Ostrovok.exe");
-    std::fs::copy(&exe, &target).map_err(|e| format!("не удалось скопировать: {e}"))?;
-    if let Some(link) = start_menu_link() {
-        if let Err(e) = shortcut(&target, &link) {
-            return Err(format!("остров скопирован, но ярлык не создался: {e}"));
+    std::fs::copy(&exe, &target).map_err(|e| {
+        if e.raw_os_error() == Some(32) {
+            "установленная копия сейчас запущена — закройте её и повторите".to_string()
+        } else {
+            format!("не удалось скопировать: {e}")
         }
-    }
-    // в проверочном запуске реестр не трогаем
+    })?;
+    // автозапуск переносим до ярлыка: ярлык — удобство, без него установка всё равно состоялась.
+    // В проверочном запуске реестр не трогаем.
     if std::env::var_os("OSTROVOK_TEST").is_none() && crate::store::autostart_enabled() {
         crate::store::set_autostart_path(&target);
+    }
+    if let Some(link) = start_menu_link() {
+        let _ = shortcut(&target, &link);
     }
     Ok(target)
 }

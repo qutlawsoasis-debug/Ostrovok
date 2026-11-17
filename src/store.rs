@@ -9,6 +9,9 @@ pub struct Settings {
     pub city: String,
     #[serde(default)]
     pub city_name: String,
+    /// город выбран новой версией (или уже перепроверен по часовому поясу) — больше его не трогаем
+    #[serde(default)]
+    pub city_checked: bool,
     #[serde(default)]
     pub lat: Option<f64>,
     #[serde(default)]

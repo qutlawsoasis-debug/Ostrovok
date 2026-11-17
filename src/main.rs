@@ -151,6 +151,49 @@ struct ShotCard {
     until: Instant,
 }
 
+/// Картинка из истории буфера: полный размер — чтобы вернуть в буфер, миниатюра — для показа.
+struct ClipImg {
+    w: usize,
+    h: usize,
+    px: Vec<u8>,
+    hash: u64,
+    tex: egui::TextureHandle,
+}
+
+/// Быстрый отпечаток картинки: FNV по каждой 97-й точке и размеру — чтобы не хранить одинаковые снимки дважды.
+fn img_hash(px: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64 ^ px.len() as u64;
+    for b in px.iter().step_by(97) {
+        h = (h ^ *b as u64).wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Размер миниатюры в полосе: высота фиксирована, соотношение сторон зажато между 3:4 и 16:9.
+fn thumb_size(w: usize, h: usize, height: f32) -> Vec2 {
+    if w == 0 || h == 0 {
+        return vec2(0.0, 0.0);
+    }
+    vec2(height * (w as f32 / h as f32).clamp(0.75, 16.0 / 9.0), height)
+}
+
+#[cfg(test)]
+mod clip_img_tests {
+    use super::*;
+    #[test]
+    fn thumbs_and_hashes() {
+        assert_eq!(thumb_size(1920, 1080, 54.0), vec2(96.0, 54.0));
+        assert_eq!(thumb_size(100, 1000, 54.0), vec2(40.5, 54.0));
+        assert_eq!(thumb_size(0, 10, 54.0), vec2(0.0, 0.0));
+        let a = vec![7u8; 4000];
+        let mut b = a.clone();
+        assert_eq!(img_hash(&a), img_hash(&a.clone()));
+        b[97 * 3] = 9;
+        assert_ne!(img_hash(&a), img_hash(&b));
+        assert_ne!(img_hash(&a), img_hash(&a[..3996]));
+    }
+}
+
 struct InboxItem {
     app: String,
     title: String,
@@ -319,6 +362,8 @@ enum Msg {
     Download(String),
     Notice(live::Notice),
     Lyrics(String, Vec<(f64, String)>),
+    /// значок программы для строки поиска, загруженный в фоне: путь и точки
+    Icon(String, Option<(usize, usize, Vec<u8>)>),
 }
 
 #[derive(Clone)]
@@ -541,6 +586,8 @@ struct App {
     inbox: Vec<InboxItem>,
     /// сколько пришло с тех пор, как открывали страницу «Уведомления»
     inbox_unread: usize,
+    /// последние картинки из буфера обмена (только в памяти)
+    clip_imgs: Vec<ClipImg>,
     /// город уже перепроверен на совпадение с часовым поясом
     city_rechecked: bool,
     /// запущен из %LOCALAPPDATA%\Programs\Ostrovok
@@ -816,6 +863,7 @@ impl App {
             live,
             inbox: Vec::new(),
             inbox_unread: 0,
+            clip_imgs: Vec::new(),
             city_rechecked: false,
             is_installed: install::installed(),
             call_since: None,
@@ -1027,6 +1075,18 @@ impl App {
                 "clip" => {
                     // для снимков: образцы записей, чтобы страница не была пустой
                     app.clips = ["https://github.com/qutlawsoasis-debug/Ostrovok", "#7C5CFF", "128 * 4 + 16", "Купить хлеб и молоко по дороге домой", r"C:\Windows\System32", "hello@example.org"].map(String::from).to_vec();
+                    // и несколько «снимков» — градиенты разных пропорций
+                    for (k, (w, h)) in [(1920usize, 1080usize), (800, 800), (1280, 720), (600, 900)].into_iter().enumerate() {
+                        let (a, b) = (hue(0.12 + k as f32 * 0.21, 1.0), hue(0.45 + k as f32 * 0.17, 1.0));
+                        let mut px = Vec::with_capacity(w * h * 4);
+                        for y in 0..h {
+                            for x in 0..w {
+                                let c = mix(a, b, (x + y) as f32 / (w + h) as f32);
+                                px.extend_from_slice(&[c.r(), c.g(), c.b(), 255]);
+                            }
+                        }
+                        app.push_clip_img(&cc.egui_ctx, w, h, px);
+                    }
                     Tab::Clip
                 }
                 "todo" => Tab::Todo,
@@ -1109,8 +1169,11 @@ impl App {
         let (Some(lat), Some(lon)) = (self.cfg.lat, self.cfg.lon) else { return };
         // координаты, сохранённые старой версией, могли указать на одноимённый город за океаном
         // (Минден в США вместо Германии). Один раз за запуск переспрашиваем город с учётом часового пояса.
-        if !self.city_rechecked && !self.cfg.city.trim().is_empty() && !weather::fits_zone(lon, weather::local_offset_hours()) {
+        if !self.city_rechecked && !self.cfg.city_checked && !self.cfg.city.trim().is_empty() && !weather::fits_zone(lon, weather::local_offset_hours()) {
             self.city_rechecked = true;
+            // проверяем один раз за всю жизнь настроек: город, выбранный вручную после этого, не трогаем
+            self.cfg.city_checked = true;
+            self.cfg.save();
             let (tx, ctx, city) = (self.tx.clone(), ctx.clone(), self.cfg.city.clone());
             std::thread::spawn(move || {
                 if let Ok(Some((la, lo, name))) = weather::geocode(&city) {
@@ -1328,7 +1391,8 @@ impl App {
             }
             Action::Quick(Quick::Remind(text, at)) => {
                 use chrono::TimeZone;
-                match chrono::Local.from_local_datetime(&at).single() {
+                // .earliest(): в ночь перевода часов время 02:30 бывает дважды — берём первое
+                match chrono::Local.from_local_datetime(&at).earliest() {
                     Some(t) => {
                         self.cfg.reminders.push(store::Reminder { text, at: t.timestamp() });
                         self.cfg.reminders.sort_by_key(|r| r.at);
@@ -1395,6 +1459,10 @@ impl App {
                     self.push_inbox(n, color);
                 }
                 Msg::Download(name) => self.show_toast("\u{E896}", [0x3A, 0x9B, 0xFF], "Загрузка завершена", &name, 6, false),
+                Msg::Icon(path, icon) => {
+                    let tex = icon.map(|(w, h, px)| ctx.load_texture(format!("pal-{path}"), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR));
+                    self.app_icons.insert(path, tex);
+                }
                 Msg::Lyrics(key, lines) => {
                     if key == self.lyrics_key {
                         self.lyrics = lines;
@@ -1422,6 +1490,7 @@ impl App {
                     }
                 }
                 Msg::City(lat, lon, name) => {
+                    self.cfg.city_checked = true;
                     self.cfg.lat = Some(lat);
                     self.cfg.lon = Some(lon);
                     self.cfg.city_name = name.clone();
@@ -1574,7 +1643,18 @@ impl App {
         let seq = sys::clipboard_seq();
         if seq != self.clip_seq {
             self.clip_seq = seq;
-            if let Some(Ok(t)) = self.clipboard.as_mut().map(|cb| cb.get_text()) {
+            let text = self.clipboard.as_mut().map(|cb| cb.get_text());
+            if !matches!(text, Some(Ok(_))) {
+                // в буфере не текст — возможно, картинка (снимок экрана, «копировать изображение»)
+                if !std::mem::take(&mut self.clip_skip) {
+                    if let Some(Ok(img)) = self.clipboard.as_mut().map(|cb| cb.get_image()) {
+                        if img.width > 0 && img.height > 0 && img.bytes.len() < 40_000_000 {
+                            self.push_clip_img(ctx, img.width, img.height, img.bytes.into_owned());
+                        }
+                    }
+                }
+            }
+            if let Some(Ok(t)) = text {
                 if !t.trim().is_empty() && t.len() < 200_000 {
                     // своё же копирование подсказку не вызывает
                     if std::mem::take(&mut self.clip_skip) {
@@ -2207,22 +2287,25 @@ impl App {
                         let dark = x >= 0 && y >= 0 && (x as usize) < n && (y as usize) < n && colors[y as usize * n + x as usize] == qrcode::Color::Dark;
                         if dark { image::Rgba([0, 0, 0, 255]) } else { image::Rgba([255, 255, 255, 255]) }
                     });
-                    if copy {
-                        let ok = self.clipboard.as_mut().is_some_and(|cb| {
-                            cb.set_image(arboard::ImageData { width: size as usize, height: size as usize, bytes: std::borrow::Cow::Owned(img.clone().into_raw()) }).is_ok()
-                        });
-                        self.notify(if ok { "Картинка кода скопирована" } else { "Не удалось скопировать" });
-                    }
                     if save {
-                        let dir = std::env::var_os("USERPROFILE").map(|h| std::path::PathBuf::from(h).join("Pictures")).unwrap_or_else(std::env::temp_dir);
+                        let dir = sys::pictures_dir();
+                        let _ = std::fs::create_dir_all(&dir);
                         let path = dir.join(format!("QR {}.png", chrono::Local::now().format("%Y-%m-%d %H-%M-%S")));
                         match img.save(&path) {
                             Ok(_) => {
                                 self.notify("Сохранено в «Изображения»");
-                                sys::open(&dir.display().to_string());
+                                sys::reveal(&path);
                             }
                             Err(_) => self.notify("Не удалось сохранить"),
                         }
+                    }
+                    if copy {
+                        // свою запись в буфер не принимаем за новый снимок
+                        self.clip_skip = true;
+                        let ok = self.clipboard.as_mut().is_some_and(|cb| {
+                            cb.set_image(arboard::ImageData { width: size as usize, height: size as usize, bytes: std::borrow::Cow::Owned(img.into_raw()) }).is_ok()
+                        });
+                        self.notify(if ok { "Картинка кода скопирована" } else { "Не удалось скопировать" });
                     }
                 }
             }
@@ -2623,7 +2706,12 @@ impl App {
                 let rise = self.weather.as_ref().and_then(|w| hm(&w.sunrise)).unwrap_or(7.0);
                 let set = self.weather.as_ref().and_then(|w| hm(&w.sunset)).unwrap_or(18.0);
                 use chrono::Timelike;
-                let mut h = t.hour() as f32 + t.minute() as f32 / 60.0;
+                // час считаем во времени города: восход и закат приходят в его поясе
+                let city_t = match &self.weather {
+                    Some(w) => chrono::Utc::now().naive_utc() + chrono::Duration::seconds(w.utc_offset as i64),
+                    None => t.naive_local(),
+                };
+                let mut h = city_t.hour() as f32 + city_t.minute() as f32 / 60.0;
                 if test_mode() {
                     if let Some(v) = std::env::var("OSTROVOK_HOUR").ok().and_then(|v| v.parse::<f32>().ok()) {
                         h = v;
@@ -3630,8 +3718,8 @@ impl App {
 
     /// Записи → Буфер: история скопированного; для ссылок, цветов, примеров и путей — готовое действие.
     fn ui_clip(&mut self, ui: &mut egui::Ui) {
-        if self.clips.is_empty() && self.cfg.pins.is_empty() {
-            empty_state(ui, "\u{E77F}", "Буфер пуст", "Скопируйте текст — он появится здесь, а остров подскажет, что с ним сделать");
+        if self.clips.is_empty() && self.cfg.pins.is_empty() && self.clip_imgs.is_empty() {
+            empty_state(ui, "\u{E77F}", "Буфер пуст", "Скопируйте текст или снимок — он появится здесь, а остров подскажет, что с ним сделать");
             return;
         }
         ui.horizontal(|ui| {
@@ -3642,10 +3730,73 @@ impl App {
                     .hint_text(RichText::new("Поиск по буферу. Щелчок по строке копирует её снова").color(DIM))
                     .desired_width(w),
             );
-            if jelly(ui, "Очистить").on_hover_text("Убрать историю. Закреплённые записи останутся").clicked() {
+            if jelly(ui, "Очистить").on_hover_text("Убрать историю и снимки. Закреплённые записи останутся").clicked() {
                 self.clips.clear();
+                self.clip_imgs.clear();
             }
         });
+        // ── снимки: полоса миниатюр. Щелчок — снова в буфер, правый щелчок — текст с картинки
+        if !self.clip_imgs.is_empty() {
+            ui.add_space(6.0);
+            let (strip, _) = ui.allocate_exact_size(vec2(ui.available_width(), 64.0), Sense::hover());
+            let (mut put, mut ocr, mut drop) = (None, None, None);
+            let mut x = strip.left();
+            for (i, im) in self.clip_imgs.iter().enumerate() {
+                let sz = thumb_size(im.w, im.h, 54.0);
+                if x + sz.x > strip.right() {
+                    break;
+                }
+                let r = Rect::from_min_size(pos2(x, strip.top() + 2.0), sz);
+                let resp = ui.interact(r, ui.id().with(("clip-img", im.hash)), Sense::click()).on_hover_text("Щелчок — снова в буфер · правый щелчок — текст с картинки");
+                let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+                let p = ui.painter();
+                rounded_image(p, &im.tex, r, 9.0);
+                p.rect_stroke(r.expand(1.5 * hov), Rounding::same(10.0), Stroke::new(1.0 + 1.0 * hov, mix(rgba(255, 255, 255, 40), accent(), hov)));
+                if hov > 0.0 {
+                    // размер снимка и крестик
+                    let label = format!("{}×{}", im.w, im.h);
+                    let lr = Rect::from_min_size(pos2(r.left() + 4.0, r.bottom() - 17.0), vec2(r.width() - 8.0, 14.0));
+                    p.rect_filled(lr, Rounding::same(5.0), rgba(10, 10, 18, (170.0 * hov) as u8));
+                    p.text(lr.center(), Align2::CENTER_CENTER, label, FontId::proportional(10.0), FG.gamma_multiply(hov));
+                    let xr = Rect::from_center_size(pos2(r.right() - 9.0, r.top() + 9.0), vec2(16.0, 16.0));
+                    let xb = ui.interact(xr, ui.id().with(("clip-img-x", im.hash)), Sense::click());
+                    p.circle_filled(xr.center(), 8.0, rgba(10, 10, 18, (200.0 * hov) as u8));
+                    p.text(xr.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(8.0), FG.gamma_multiply(hov));
+                    if xb.clicked() {
+                        drop = Some(i);
+                    }
+                }
+                if drop != Some(i) {
+                    if resp.clicked() {
+                        put = Some(i);
+                    } else if resp.secondary_clicked() {
+                        ocr = Some(i);
+                    }
+                }
+                x += sz.x + 8.0;
+            }
+            if let Some(i) = drop {
+                self.clip_imgs.remove(i);
+            } else if let Some(i) = put {
+                let im = &self.clip_imgs[i];
+                let data = arboard::ImageData { width: im.w, height: im.h, bytes: std::borrow::Cow::Owned(im.px.clone()) };
+                // свою запись в буфер не принимаем за новый снимок
+                self.clip_skip = true;
+                let ok = self.clipboard.as_mut().is_some_and(|cb| cb.set_image(data).is_ok());
+                self.notify(if ok { "Снимок снова в буфере" } else { "Не удалось положить снимок в буфер" });
+            } else if let Some(i) = ocr {
+                let im = &self.clip_imgs[i];
+                match sys::ocr(im.w, im.h, &im.px) {
+                    Ok(t) if !t.trim().is_empty() => {
+                        let n = t.chars().count();
+                        self.set_clipboard(&t);
+                        self.notify(&format!("Текст с картинки скопирован: {n} симв."));
+                    }
+                    Ok(_) => self.notify("Текст на картинке не найден"),
+                    Err(e) => self.notify(&e),
+                }
+            }
+        }
         let q = self.clip_query.trim().to_lowercase();
         // сначала закреплённые, потом история без повторов
         let rows: Vec<(bool, String)> = self
@@ -3723,6 +3874,21 @@ impl App {
             self.set_clipboard(&text);
             self.notify("Скопировано в буфер");
         }
+    }
+
+    /// Кладёт картинку в историю буфера: повтор переезжает в начало, храним не больше восьми.
+    fn push_clip_img(&mut self, ctx: &egui::Context, w: usize, h: usize, px: Vec<u8>) {
+        let hash = img_hash(&px);
+        if let Some(i) = self.clip_imgs.iter().position(|c| c.hash == hash) {
+            let it = self.clip_imgs.remove(i);
+            self.clip_imgs.insert(0, it);
+            return;
+        }
+        let Some(full) = image::RgbaImage::from_raw(w as u32, h as u32, px.clone()) else { return };
+        let th = image::imageops::thumbnail(&full, (256 * w / w.max(h)).max(1) as u32, (256 * h / w.max(h)).max(1) as u32);
+        let tex = ctx.load_texture(format!("clip{hash:x}"), egui::ColorImage::from_rgba_unmultiplied([th.width() as usize, th.height() as usize], th.as_raw()), egui::TextureOptions::LINEAR);
+        self.clip_imgs.insert(0, ClipImg { w, h, px, hash, tex });
+        self.clip_imgs.truncate(8);
     }
 
     fn push_inbox(&mut self, n: live::Notice, color: [u8; 3]) {
@@ -4879,7 +5045,7 @@ impl App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                for (glyph, text) in [("\u{E916}", "таймер 5"), ("\u{E823}", "напомни через 15 мин чай"), ("\u{E73E}", "дело "), ("\u{E8EF}", "5 км в мили"), ("\u{E8C7}", "100 usd в рубли")] {
+                for (glyph, text) in [("\u{E916}", "таймер 5"), ("\u{E823}", "напомни через 15 мин чай"), ("\u{E73E}", "дело купить хлеб"), ("\u{E8EF}", "5 км в мили")] {
                     let label = format!("{glyph}  {}", text.trim());
                     let w = ui.painter().layout_no_wrap(label.clone(), FontId::proportional(12.5), FG).size().x + 20.0;
                     let (r, resp) = ui.allocate_exact_size(vec2(w, 28.0), Sense::click());
@@ -4923,10 +5089,31 @@ impl App {
                 Action::Quick(Quick::Note(_)) => ("\u{E70B}", Color32::from_rgb(0xFF, 0xD0, 0x60)),
                 Action::Quick(Quick::Remind(..)) => ("\u{E823}", Color32::from_rgb(0xFF, 0x8A, 0x7A)),
             };
+            // значок грузится в фоне: ярлык на отключённый сетевой диск не должен подвешивать поиск
             let tex = match &it.action {
                 Action::Launch(path) => icons
                     .entry(path.clone())
-                    .or_insert_with(|| sys::icon_rgba(path).map(|(w, h, px)| ui.ctx().load_texture(format!("pal-{path}"), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR)))
+                    .or_insert_with(|| {
+                        // один фоновый поток грузит значки по очереди: оболочка Windows не любит параллельных запросов
+                        static WORKER: std::sync::OnceLock<Mutex<mpsc::Sender<String>>> = std::sync::OnceLock::new();
+                        let worker = WORKER.get_or_init(|| {
+                            let (req_tx, req_rx) = mpsc::channel::<String>();
+                            let (tx, ctx) = (self.tx.clone(), ui.ctx().clone());
+                            std::thread::spawn(move || {
+                                unsafe {
+                                    let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+                                }
+                                for path in req_rx {
+                                    let icon = sys::icon_rgba(&path);
+                                    let _ = tx.send(Msg::Icon(path, icon));
+                                    ctx.request_repaint();
+                                }
+                            });
+                            Mutex::new(req_tx)
+                        });
+                        let _ = worker.lock().unwrap().send(path.clone());
+                        None
+                    })
                     .clone(),
                 _ => None,
             };
@@ -5876,7 +6063,7 @@ impl App {
             Tab::Timer => 262.0,
             Tab::Calendar => 360.0,
             Tab::Shot => 306.0,
-            Tab::Clip => 340.0,
+            Tab::Clip => 340.0 + if self.clip_imgs.is_empty() { 0.0 } else { 72.0 },
             Tab::Inbox => 340.0,
             Tab::Notes => 340.0,
             Tab::Todo => 366.0,

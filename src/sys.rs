@@ -568,13 +568,40 @@ pub fn grab_bgrx(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<u8>> {
 }
 
 /// Значок файла или ярлыка, как его показывает Проводник: 32×32, RGBA.
+/// Настоящая папка «Изображения» (её могут перенести в OneDrive или на другой диск).
+pub fn pictures_dir() -> std::path::PathBuf {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_Pictures, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+    unsafe {
+        if let Ok(p) = SHGetKnownFolderPath(&FOLDERID_Pictures, KF_FLAG_DEFAULT, None) {
+            let s = p.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(p.0 as *const _));
+            if !s.is_empty() {
+                return std::path::PathBuf::from(s);
+            }
+        }
+    }
+    std::env::var_os("USERPROFILE").map(|h| std::path::PathBuf::from(h).join("Pictures")).unwrap_or_else(std::env::temp_dir)
+}
+
+/// Показывает файл в Проводнике выделенным.
+pub fn reveal(path: &std::path::Path) {
+    let _ = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
+}
+
 /// Куда указывает ярлык .lnk (пусто у ярлыков без пути, например у некоторых магазинных программ).
 fn lnk_target(path: &str) -> Option<String> {
     use windows::core::Interface;
     use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, STGM_READ};
     use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    thread_local! {
+        // COM на каждом потоке включаем один раз, а не на каждый ярлык
+        static COM: () = unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        };
+    }
+    COM.with(|_| {});
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let sl: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
         sl.cast::<IPersistFile>().ok()?.Load(&HSTRING::from(path), STGM_READ).ok()?;
         let mut buf = [0u16; 520];

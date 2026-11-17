@@ -36,6 +36,8 @@ pub struct Now {
     /// восход и закат сегодня, «07:41»
     pub sunrise: String,
     pub sunset: String,
+    /// смещение часового пояса города от UTC в секундах (восход и закат даны в его времени)
+    pub utc_offset: i32,
 }
 
 pub fn encode(s: &str) -> String {
@@ -136,6 +138,7 @@ pub fn fetch(lat: f64, lon: f64, name: &str) -> Result<Now, String> {
         hours,
         sunrise: clock(&daily["sunrise"][0]),
         sunset: clock(&daily["sunset"][0]),
+        utc_offset: v["utc_offset_seconds"].as_i64().unwrap_or(0) as i32,
     })
 }
 
