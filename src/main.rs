@@ -838,6 +838,12 @@ impl App {
                 app.show_toast("\u{E896}", [0x3A, 0x9B, 0xFF], "Загрузка завершена", "otchet-za-noyabr.pdf", 30, false);
             }
         }
+        // для снимков идущего таймера: OSTROVOK_TIMER=25 — таймер на 25 минут, прошло чуть больше трети
+        if let Some(m) = std::env::var("OSTROVOK_TIMER").ok().and_then(|v| v.parse::<f64>().ok()).filter(|_| test_mode()) {
+            app.start_timer(m);
+            app.timer_end = Some(Instant::now() + Duration::from_secs_f64(m * 60.0 * 0.62));
+            app.note = None;
+        }
         // для снимков пилюли со значком непрочитанных: OSTROVOK_UNREAD=3
         if let Some(n) = std::env::var("OSTROVOK_UNREAD").ok().and_then(|v| v.parse::<usize>().ok()).filter(|_| test_mode()) {
             for _ in 0..n {
@@ -3238,14 +3244,40 @@ impl App {
             None => ("00:00".to_string(), 0.0),
         };
         let live = self.timer_end.is_some();
-        ring(&p, c, 66.0, 7.0, frac, Color32::from_rgb(0xFF, 0xB3, 0x40));
+        let tone = match self.focus {
+            Some((true, _)) => Color32::from_rgb(0x7B, 0xE0, 0x9A), // перерыв — зелёный
+            _ => Color32::from_rgb(0xFF, 0xB3, 0x40),
+        };
+        // циферблат: 60 делений, каждое пятое длиннее; в работе оставшаяся часть подсвечена
+        for i in 0..60 {
+            let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * i as f32 / 60.0;
+            let dir = vec2(a.cos(), a.sin());
+            let major = i % 5 == 0;
+            let (r0, r1) = if major { (50.0, 57.0) } else { (53.5, 57.0) };
+            let lit = live && (i as f32) < frac * 60.0;
+            let col = if lit { mix(tone, BG, if major { 0.1 } else { 0.45 }) } else { rgba(255, 255, 255, if major { 70 } else { 28 }) };
+            p.line_segment([c + dir * r0, c + dir * r1], Stroke::new(if major { 1.6_f32 } else { 1.0 }, col));
+        }
+        ring(&p, c, 66.0, 7.0, frac, tone);
+        if live && frac > 0.003 {
+            // светящаяся точка на конце дуги
+            let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * frac;
+            let tip = c + vec2(a.cos(), a.sin()) * 66.0;
+            p.circle_filled(tip, 9.0, Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), 50));
+            p.circle_filled(tip, 5.0, Color32::WHITE);
+        }
         p.text(c - vec2(0.0, 5.0), Align2::CENTER_CENTER, text, light(30.0), if live { FG } else { DIM });
-        p.text(c + vec2(0.0, 24.0), Align2::CENTER_CENTER, match (live, self.focus) {
-                (true, Some((true, _))) => "перерыв",
-                (true, Some((false, _))) => "фокус",
-                (true, None) => "осталось",
-                _ => "таймер",
-            }, FontId::proportional(11.5), DIM);
+        let sub = match (live, self.focus) {
+            (true, Some((true, _))) => "перерыв".to_string(),
+            (true, Some((false, _))) => "фокус".to_string(),
+            (true, None) => {
+                let left = self.timer_end.map(|e| e.saturating_duration_since(Instant::now())).unwrap_or_default();
+                let at = chrono::Local::now() + chrono::Duration::from_std(left).unwrap_or_default();
+                format!("до {}", at.format("%H:%M"))
+            }
+            _ => "таймер".to_string(),
+        };
+        p.text(c + vec2(0.0, 24.0), Align2::CENTER_CENTER, sub, FontId::proportional(11.5), DIM);
 
         let mut side = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(pos2(area.left() + 178.0, area.top() + 4.0), area.max)));
         let ui = &mut side;
