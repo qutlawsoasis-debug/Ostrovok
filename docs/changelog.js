@@ -62,7 +62,8 @@
       var r = list[i];
       if (!r || typeof r !== 'object' || r.draft) continue;
       var copy = {};
-      for (var k in r) if (Object.prototype.hasOwnProperty.call(r, k)) copy[k] = r[k];
+      // __proto__ из JSON (ответ или подменённый кэш) не должен стать прототипом копии.
+      for (var k in r) if (k !== '__proto__' && Object.prototype.hasOwnProperty.call(r, k)) copy[k] = r[k];
       var d = toDate(releaseDate(r));
       copy._time = d ? d.getTime() : null;
       copy._search = normalize((r.tag_name || '') + ' ' + (r.name || '') + ' ' + (r.body || ''));
@@ -146,8 +147,17 @@
     return blocks.length ? blocks : [{ type: 'p', inline: [{ t: 'text', v: FALLBACK }] }];
   }
 
+  // Только https://github.com/<владелец>/Ostrovok/releases… — после разбора URL, чтобы
+  // «../», «%2e%2e», «\», логин@хост и прочие обходы префикса не уводили на чужую страницу.
   function safeHref(u) {
-    return typeof u === 'string' && u.indexOf('https://github.com/') === 0 ? u : RELEASES;
+    if (typeof u !== 'string' || typeof URL !== 'function') return RELEASES;
+    try {
+      var x = new URL(u);
+      if (x.protocol !== 'https:' || x.hostname !== 'github.com' || x.port || x.username || x.password) return RELEASES;
+      var base = new URL(RELEASES).pathname;
+      if (x.pathname !== base && x.pathname.indexOf(base + '/') !== 0) return RELEASES;
+      return x.href;
+    } catch (e) { return RELEASES; }
   }
 
   // ── ошибки загрузки
