@@ -929,6 +929,8 @@ struct App {
     /// какие программы сейчас звучат — для подписи, когда плеер молчит
     sounding: (String, Instant),
     mixer_at: Instant,
+    /// громкость до «тихого режима» на странице «Звук»
+    quiet_prev: Option<f32>,
     sheen_at: Instant,
     hover_was: bool,
     awake: bool,
@@ -1207,6 +1209,7 @@ impl App {
             beat: 0.0,
             sounding: (String::new(), now),
             mixer_at: now.checked_sub(Duration::from_secs(5)).unwrap_or(now),
+            quiet_prev: None,
             sheen_at: now,
             hover_was: false,
             vol: None,
@@ -1364,6 +1367,10 @@ impl App {
             for _ in 0..n {
                 app.push_inbox(live::Notice { app: "Telegram".into(), title: "Мирон".into(), body: "привет".into() }, [0x2A, 0xAB, 0xEE]);
             }
+        }
+        // для снимков страницы «Звук» во включённом тихом режиме: OSTROVOK_QUIET=1 (системную громкость не трогает)
+        if test_mode() && std::env::var_os("OSTROVOK_QUIET").is_some() {
+            app.quiet_prev = Some(0.6);
         }
         // для снимков ленты дня: OSTROVOK_DAY=1 — три дела сегодня (утро, через час, вечер)
         if test_mode() && std::env::var_os("OSTROVOK_DAY").is_some() {
@@ -3853,6 +3860,8 @@ impl App {
                 if (v - level).abs() > 0.002 {
                     sys::set_volume(v);
                     self.vol = Some((v, muted));
+                    // громкость выбрали рукой — тихий режим больше не держим
+                    self.quiet_prev = None;
                 }
                 let hot = ui.ctx().animate_bool_with_time(resp.id.with("hot"), resp.hovered() || resp.dragged(), 0.12);
                 let tone = if muted { Color32::from_rgb(120, 120, 134) } else { accent() };
@@ -3886,6 +3895,66 @@ impl App {
                 if let Some(m) = self.mic {
                     sys::set_mic_mute(!m);
                     self.mic = Some(!m);
+                }
+            }
+        }
+
+        // ── ряд громкости: «Тихо» (20% и обратно) и четыре пресета
+        {
+            ui.add_space(6.0);
+            let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+            let level = self.vol.map(|v| v.0);
+            let on = level.is_some();
+            let current = level.and_then(preset_index);
+            let moon = Color32::from_rgb(0xB4, 0x9C, 0xFF);
+            let quiet_w = 96.0;
+            let step = (row.width() - quiet_w - 8.0) / VOL_PRESETS.len() as f32;
+            let mut pick: Option<f32> = None;
+            let mut toggle = false;
+            for k in 0..=VOL_PRESETS.len() {
+                let r = if k == 0 {
+                    Rect::from_min_size(row.min, vec2(quiet_w, row.height()))
+                } else {
+                    Rect::from_min_size(pos2(row.left() + quiet_w + 8.0 + step * (k - 1) as f32, row.top()), vec2(step - 6.0, row.height()))
+                };
+                let resp = ui.interact(r, ui.id().with(("vol-chip", k)), if on { Sense::click() } else { Sense::hover() });
+                let resp = if k == 0 { resp.on_hover_text(if self.quiet_prev.is_some() { "Вернуть прежнюю громкость" } else { "Тихо: громкость 20%, повторно — как было" }) } else { resp };
+                let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered() && on, 0.12);
+                let lit = if k == 0 { self.quiet_prev.is_some() } else { current == Some(k - 1) && self.quiet_prev.is_none() };
+                let glow = ui.ctx().animate_bool_with_time(resp.id.with("lit"), lit, 0.18);
+                glass_chip(&p, r, 15.0, 0.4 + 0.5 * hov);
+                let tone = if k == 0 { moon } else { accent() };
+                if glow > 0.0 {
+                    p.rect_filled(r.shrink(1.0), Rounding::same(14.0), Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), (60.0 * glow) as u8));
+                }
+                let ink = if !on { DIM } else { mix(mix(DIM, FG, hov), FG, glow) };
+                if k == 0 {
+                    p.text(pos2(r.left() + 20.0, r.center().y), Align2::CENTER_CENTER, "\u{E708}", FontId::proportional(13.0), if on { moon } else { DIM });
+                    p.text(pos2(r.left() + 36.0, r.center().y), Align2::LEFT_CENTER, if self.quiet_prev.is_some() { "Как было" } else { "Тихо" }, semi(12.0), ink);
+                } else {
+                    p.text(r.center(), Align2::CENTER_CENTER, format!("{:.0}%", VOL_PRESETS[k - 1] * 100.0), semi(12.0), ink);
+                }
+                if resp.clicked() {
+                    if k == 0 { toggle = true } else { pick = Some(VOL_PRESETS[k - 1]) }
+                }
+            }
+            if let Some((lv, muted)) = self.vol {
+                let target = if toggle {
+                    let (v, saved) = quiet_toggle(lv, self.quiet_prev);
+                    self.quiet_prev = saved;
+                    Some(v)
+                } else if let Some(v) = pick {
+                    self.quiet_prev = None;
+                    Some(v)
+                } else {
+                    None
+                };
+                if let Some(v) = target {
+                    sys::set_volume(v);
+                    if muted {
+                        sys::set_mute(false);
+                    }
+                    self.vol = Some((v, false));
                 }
             }
         }
@@ -6781,7 +6850,7 @@ impl App {
         -saved + match self.tab {
             Tab::Home => 396.0,
             Tab::Control => 238.0,
-            Tab::Sound => 286.0,
+            Tab::Sound => 322.0,
             Tab::Music => 388.0,
             Tab::Remind => 320.0,
             Tab::Qr => 350.0,
@@ -6974,6 +7043,43 @@ fn dela_word(n: usize) -> String {
         _ => "дел",
     };
     format!("{n} {w}")
+}
+
+const QUIET_LEVEL: f32 = 0.2;
+const VOL_PRESETS: [f32; 4] = [0.25, 0.5, 0.75, 1.0];
+
+/// Тихий режим: (новая громкость, что запомнить). Есть запомненное — возвращаем его.
+fn quiet_toggle(level: f32, saved: Option<f32>) -> (f32, Option<f32>) {
+    match saved {
+        Some(prev) => (prev, None),
+        None => (level.min(QUIET_LEVEL), Some(level)),
+    }
+}
+
+/// Какой из пресетов громкости сейчас стоит (с допуском в 1%).
+fn preset_index(level: f32) -> Option<usize> {
+    VOL_PRESETS.iter().position(|p| (p - level).abs() < 0.01)
+}
+
+#[cfg(test)]
+mod quiet_tests {
+    use super::*;
+    #[test]
+    fn toggle_remembers_and_restores() {
+        assert_eq!(quiet_toggle(0.7, None), (QUIET_LEVEL, Some(0.7)));
+        assert_eq!(quiet_toggle(QUIET_LEVEL, Some(0.7)), (0.7, None));
+        // громкость уже тише тихого — не поднимаем, но запоминаем
+        assert_eq!(quiet_toggle(0.1, None), (0.1, Some(0.1)));
+        // пока тихо, громкость сдвинули рукой — выход всё равно возвращает прежнюю
+        assert_eq!(quiet_toggle(0.3, Some(0.9)), (0.9, None));
+    }
+    #[test]
+    fn preset_match() {
+        assert_eq!(preset_index(0.5), Some(1));
+        assert_eq!(preset_index(0.995), Some(3));
+        assert_eq!(preset_index(0.252), Some(0));
+        assert_eq!(preset_index(0.4), None);
+    }
 }
 
 #[cfg(test)]
