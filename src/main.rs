@@ -4223,8 +4223,10 @@ impl App {
             let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0 + cell.y * 6.0), Sense::hover());
             let origin = area.min;
             let p = ui.painter().clone();
+            // выходные — мягким коралловым, чтобы неделя читалась с первого взгляда
+            let weekend = Color32::from_rgb(0xFF, 0x9A, 0x8A);
             for (i, name) in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"].into_iter().enumerate() {
-                p.text(origin + vec2(cell.x * (i as f32 + 0.5), 10.0), Align2::CENTER_CENTER, name, FontId::proportional(11.5), DIM);
+                p.text(origin + vec2(cell.x * (i as f32 + 0.5), 10.0), Align2::CENTER_CENTER, name, FontId::proportional(11.5), if i >= 5 { mix(weekend, DIM, 0.25) } else { DIM });
             }
             for day in 1..=days {
                 let Some(date) = NaiveDate::from_ymd_opt(year, month0 + 1, day) else { continue };
@@ -4245,11 +4247,22 @@ impl App {
                 if is_today && is_sel && self.cal_sel.is_some() {
                     p.circle_stroke(at, 15.5, Stroke::new(1.2, accent()));
                 }
-                let color = if is_today { BG } else if date < today { mix(DIM, BG, 0.35) } else if col >= 5 { DIM } else { FG };
+                let color = if is_today {
+                    BG
+                } else if date < today {
+                    mix(if col >= 5 { mix(weekend, DIM, 0.4) } else { DIM }, BG, 0.4)
+                } else if col >= 5 {
+                    weekend
+                } else {
+                    FG
+                };
                 p.text(at, Align2::CENTER_CENTER, day.to_string(), semi(13.5), color);
-                // точка — на этот день есть дела
-                if dated.iter().any(|d| d.1 == date) {
-                    p.circle_filled(at + vec2(0.0, if is_today { 9.0 } else { 11.0 }), 2.0, if is_today { BG } else { accent() });
+                // точки — сколько на этот день дел (не больше трёх)
+                let n = dated.iter().filter(|d| d.1 == date).count().min(3);
+                for k in 0..n {
+                    let dx = (k as f32 - (n as f32 - 1.0) / 2.0) * 5.0;
+                    // у сегодняшнего дня точки под кружком, чтобы не налезали на число
+                    p.circle_filled(at + vec2(dx, if is_today { 16.5 } else { 11.0 }), 1.8, accent());
                 }
                 if resp.clicked() {
                     click = Some(date);
