@@ -66,7 +66,6 @@ pub fn geocode(city: &str) -> Result<Option<(f64, f64, String)>, String> {
     ))?;
     // Городов с одним названием бывает несколько (Минден есть и в Германии, и в США).
     // Берём тот, что лежит в поясе часов этого компьютера: его долгота близка к смещению от Гринвича × 15°.
-    let here = chrono::Local::now().offset().local_minus_utc() as f64 / 3600.0 * 15.0;
     let found: Vec<(f64, f64, String)> = v["results"]
         .as_array()
         .map(|list| {
@@ -75,8 +74,18 @@ pub fn geocode(city: &str) -> Result<Option<(f64, f64, String)>, String> {
                 .collect()
         })
         .unwrap_or_default();
-    let near = |lon: f64| ((lon - here + 540.0).rem_euclid(360.0) - 180.0).abs() <= 25.0;
-    Ok(found.iter().find(|c| near(c.1)).or(found.first()).cloned())
+    let offset = local_offset_hours();
+    Ok(found.iter().find(|c| fits_zone(c.1, offset)).or(found.first()).cloned())
+}
+
+pub fn local_offset_hours() -> f64 {
+    chrono::Local::now().offset().local_minus_utc() as f64 / 3600.0
+}
+
+/// Похожа ли долгота на часовой пояс: долгота примерно равна смещению от Гринвича × 15°.
+/// Запас широкий (пояса кривые, летнее время), но Германию от США отличает уверенно.
+pub fn fits_zone(lon: f64, offset_hours: f64) -> bool {
+    ((lon - offset_hours * 15.0 + 540.0).rem_euclid(360.0) - 180.0).abs() <= 25.0
 }
 
 pub fn fetch(lat: f64, lon: f64, name: &str) -> Result<Now, String> {
@@ -151,6 +160,59 @@ pub fn describe(code: i64) -> (&'static str, &'static str) {
         85 | 86 => ("❄", "Снегопад"),
         95..=99 => ("⚡", "Гроза"),
         _ => ("☁", "Облачно"),
+    }
+}
+
+/// Цвет значка погоды: солнце золотое, облака серо-голубые, дождь синий, гроза сиреневая.
+pub fn tint(code: i64) -> [u8; 3] {
+    match code {
+        0 => [255, 204, 92],
+        1 | 2 => [255, 226, 160],
+        3 | 45 | 48 => [196, 206, 226],
+        51..=67 | 80..=82 => [120, 182, 255],
+        71..=77 | 85 | 86 => [220, 236, 255],
+        95..=99 => [196, 150, 255],
+        _ => [196, 206, 226],
+    }
+}
+
+/// Цвет температуры для полоски диапазона: от холодного синего через бирюзу и жёлтый к оранжевому.
+pub fn temp_rgb(t: f64) -> [u8; 3] {
+    const STOPS: [(f64, [f64; 3]); 5] = [
+        (-15.0, [110.0, 140.0, 255.0]),
+        (0.0, [110.0, 200.0, 255.0]),
+        (10.0, [120.0, 225.0, 190.0]),
+        (20.0, [255.0, 214.0, 100.0]),
+        (30.0, [255.0, 140.0, 80.0]),
+    ];
+    let t = t.clamp(STOPS[0].0, STOPS[4].0);
+    let i = STOPS.windows(2).position(|w| t <= w[1].0).unwrap_or(3);
+    let (a, b) = (STOPS[i], STOPS[i + 1]);
+    let k = (t - a.0) / (b.0 - a.0);
+    let c = |j: usize| (a.1[j] + (b.1[j] - a.1[j]) * k).round() as u8;
+    [c(0), c(1), c(2)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn colors() {
+        assert_eq!(temp_rgb(-40.0), [110, 140, 255]);
+        assert_eq!(temp_rgb(0.0), [110, 200, 255]);
+        assert_eq!(temp_rgb(50.0), [255, 140, 80]);
+        assert_eq!(temp_rgb(15.0), [188, 220, 145]);
+        assert_eq!(tint(0), [255, 204, 92]);
+        assert_eq!(tint(63), [120, 182, 255]);
+    }
+    #[test]
+    fn zones() {
+        assert!(fits_zone(8.9, 1.0)); // Минден, Германия, зимой
+        assert!(fits_zone(8.9, 2.0)); // летом
+        assert!(!fits_zone(-93.3, 1.0)); // Минден, Луизиана, с немецкого компьютера
+        assert!(fits_zone(37.6, 3.0)); // Москва
+        assert!(fits_zone(131.9, 10.0)); // Владивосток
+        assert!(fits_zone(179.0, -11.0) || fits_zone(179.0, 12.0)); // через линию смены дат
     }
 }
 

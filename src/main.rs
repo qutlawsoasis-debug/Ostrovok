@@ -455,6 +455,8 @@ struct App {
     inbox: Vec<InboxItem>,
     /// сколько пришло с тех пор, как открывали страницу «Уведомления»
     inbox_unread: usize,
+    /// город уже перепроверен на совпадение с часовым поясом
+    city_rechecked: bool,
     /// запущен из %LOCALAPPDATA%\Programs\Ostrovok
     is_installed: bool,
     call_since: Option<Instant>,
@@ -728,6 +730,7 @@ impl App {
             live,
             inbox: Vec::new(),
             inbox_unread: 0,
+            city_rechecked: false,
             is_installed: install::installed(),
             call_since: None,
             toast: None,
@@ -1005,6 +1008,20 @@ impl App {
     fn refresh_weather(&mut self, ctx: &egui::Context) {
         self.weather_at = Some(Instant::now());
         let (Some(lat), Some(lon)) = (self.cfg.lat, self.cfg.lon) else { return };
+        // координаты, сохранённые старой версией, могли указать на одноимённый город за океаном
+        // (Минден в США вместо Германии). Один раз за запуск переспрашиваем город с учётом часового пояса.
+        if !self.city_rechecked && !self.cfg.city.trim().is_empty() && !weather::fits_zone(lon, weather::local_offset_hours()) {
+            self.city_rechecked = true;
+            let (tx, ctx, city) = (self.tx.clone(), ctx.clone(), self.cfg.city.clone());
+            std::thread::spawn(move || {
+                if let Ok(Some((la, lo, name))) = weather::geocode(&city) {
+                    if weather::fits_zone(lo, weather::local_offset_hours()) {
+                        let _ = tx.send(Msg::City(la, lo, name));
+                        ctx.request_repaint();
+                    }
+                }
+            });
+        }
         let (tx, ctx, name) = (self.tx.clone(), ctx.clone(), self.cfg.city_name.clone());
         std::thread::spawn(move || {
             if let Ok(w) = weather::fetch(lat, lon, &name) {
@@ -3135,20 +3152,53 @@ impl App {
             }
             let wet = w.hours.iter().map(|h| h.rain).fold(0.0, f64::max);
             if wet >= 15.0 {
-                p.text(area.right_top() + vec2(-12.0, 8.0), Align2::RIGHT_TOP, format!("осадки до {wet:.0}%"), FontId::proportional(11.0), Color32::from_rgb(0x8F, 0xCB, 0xFF));
+                p.text(area.left_top() + vec2(12.0, 8.0), Align2::LEFT_TOP, format!("осадки до {wet:.0}%"), FontId::proportional(11.0), Color32::from_rgb(0x8F, 0xCB, 0xFF));
             }
             ui.add_space(6.0);
         }
 
         if !w.days.is_empty() {
+            // полоски диапазона считаются от самой холодной ночи до самого тёплого дня всей недели
+            let lo = w.days.iter().map(|d| d.min).fold(f64::MAX, f64::min);
+            let hi = w.days.iter().map(|d| d.max).fold(f64::MIN, f64::max).max(lo + 1.0);
+            let now_t = w.temp;
             ui.columns(w.days.len(), |c| {
                 for (i, d) in w.days.iter().enumerate() {
                     let (r, _) = c[i].allocate_exact_size(vec2(c[i].available_width(), 74.0), Sense::hover());
                     let p = c[i].painter();
                     glass_chip(p, r, 12.0, if i == 0 { 0.75 } else { 0.4 });
-                    p.text(r.center_top() + vec2(0.0, 8.0), Align2::CENTER_TOP, if i == 0 { "Сегодня" } else { d.label.as_str() }, FontId::proportional(12.0), DIM);
-                    p.text(r.center() + vec2(0.0, -1.0), Align2::CENTER_CENTER, weather::describe(d.code).0, FontId::proportional(19.0), FG);
-                    p.text(r.center_bottom() - vec2(0.0, 8.0), Align2::CENTER_BOTTOM, format!("{} / {}", weather::deg(d.max), weather::deg(d.min)), semi(12.5), FG);
+                    p.text(r.left_top() + vec2(12.0, 9.0), Align2::LEFT_TOP, if i == 0 { "Сегодня" } else { d.label.as_str() }, semi(12.0), if i == 0 { FG } else { DIM });
+                    let tc = weather::tint(d.code);
+                    let icon_c = Color32::from_rgb(tc[0], tc[1], tc[2]);
+                    let ic = r.right_top() + vec2(-20.0, 17.0);
+                    p.circle_filled(ic, 13.0, Color32::from_rgba_unmultiplied(tc[0], tc[1], tc[2], 12));
+                    p.text(ic, Align2::CENTER_CENTER, weather::describe(d.code).0, FontId::proportional(16.0), icon_c);
+                    // ряд «мин ─── макс»
+                    let y = r.bottom() - 17.0;
+                    let lo_g = p.text(pos2(r.left() + 12.0, y), Align2::LEFT_CENTER, weather::deg(d.min), FontId::proportional(12.0), DIM);
+                    let hi_g = p.text(pos2(r.right() - 12.0, y), Align2::RIGHT_CENTER, weather::deg(d.max), semi(12.5), FG);
+                    let track = Rect::from_min_max(pos2(lo_g.right() + 7.0, y - 2.0), pos2(hi_g.left() - 7.0, y + 2.0));
+                    if track.width() > 8.0 {
+                        p.rect_filled(track, Rounding::same(2.0), rgba(255, 255, 255, 20));
+                        let fx = |t: f64| track.left() + track.width() * ((t - lo) / (hi - lo)).clamp(0.0, 1.0) as f32;
+                        let (a, b) = (fx(d.min), fx(d.max).max(fx(d.min) + 4.0));
+                        // градиент холод→тепло мелкими шагами
+                        let steps = 10;
+                        for s in 0..steps {
+                            let x0 = a + (b - a) * s as f32 / steps as f32;
+                            let x1 = a + (b - a) * (s + 1) as f32 / steps as f32;
+                            let t = d.min + (d.max - d.min) * (s as f64 + 0.5) / steps as f64;
+                            let c = weather::temp_rgb(t);
+                            let round = if s == 0 || s == steps - 1 { 2.0 } else { 0.0 };
+                            p.rect_filled(Rect::from_min_max(pos2(x0, track.top()), pos2(x1 + 0.5, track.bottom())), Rounding::same(round), Color32::from_rgb(c[0], c[1], c[2]));
+                        }
+                        if i == 0 {
+                            // сейчас: белая точка с тёмной обводкой
+                            let x = fx(now_t);
+                            p.circle_filled(pos2(x, y), 4.5, BG);
+                            p.circle_filled(pos2(x, y), 3.2, Color32::WHITE);
+                        }
+                    }
                 }
             });
         }
