@@ -1005,7 +1005,10 @@ impl App {
                 }
                 "music" => Tab::Music,
                 "remind" => Tab::Remind,
-                "qr" => Tab::Qr,
+                "qr" => {
+                    app.qr_text = "https://qutlawsoasis-debug.github.io/Ostrovok/".into();
+                    Tab::Qr
+                }
                 "shelf" => Tab::Shelf,
                 "weather" => Tab::Weather,
                 "timer" => Tab::Timer,
@@ -2150,15 +2153,66 @@ impl App {
         match qrcode::QrCode::new(text.as_bytes()) {
             Ok(code) => {
                 let n = code.width();
+                let colors = code.to_colors();
                 let side = 168.0;
-                let sq = Rect::from_center_size(area.center(), vec2(side, side));
+                let sq = Rect::from_center_size(area.center() - vec2(90.0, 0.0), vec2(side, side));
                 let p = ui.painter();
-                p.rect_filled(sq.expand(10.0), Rounding::same(12.0), Color32::WHITE);
+                p.rect_filled(sq.expand(12.0), Rounding::same(16.0), Color32::WHITE);
                 let cell = side / n as f32;
-                for (i, c) in code.to_colors().iter().enumerate() {
-                    if *c == qrcode::Color::Dark {
-                        let at = sq.min + vec2((i % n) as f32 * cell, (i / n) as f32 * cell);
-                        p.rect_filled(Rect::from_min_size(at, vec2(cell + 0.35, cell + 0.35)), Rounding::ZERO, Color32::BLACK);
+                let ink = mix(Color32::from_rgb(18, 16, 34), accent(), 0.18);
+                // «глазки» по углам рисуются отдельно — скруглёнными квадратами
+                let finder = |x: usize, y: usize| (x < 7 && y < 7) || (x >= n - 7 && y < 7) || (x < 7 && y >= n - 7);
+                for (i, c) in colors.iter().enumerate() {
+                    let (x, y) = (i % n, i / n);
+                    if *c == qrcode::Color::Dark && !finder(x, y) {
+                        let at = sq.min + vec2((x as f32 + 0.5) * cell, (y as f32 + 0.5) * cell);
+                        p.circle_filled(at, cell * 0.49, ink);
+                    }
+                }
+                for (fx, fy) in [(0usize, 0usize), (n - 7, 0), (0, n - 7)] {
+                    let o = sq.min + vec2(fx as f32 * cell, fy as f32 * cell);
+                    let outer = Rect::from_min_size(o, vec2(7.0 * cell, 7.0 * cell));
+                    p.rect_stroke(outer.shrink(cell / 2.0), Rounding::same(cell * 1.8), Stroke::new(cell, ink));
+                    p.rect_filled(outer.shrink(cell * 2.0), Rounding::same(cell * 1.1), ink);
+                }
+                // справа — что в коде и что с ним сделать
+                let side_r = Rect::from_min_max(pos2(sq.right() + 40.0, sq.top() + 6.0), pos2(area.right(), sq.bottom()));
+                let kind = if text.starts_with("http") { "Ссылка" } else if text.starts_with("WIFI:") { "Wi‑Fi" } else { "Текст" };
+                p.text(side_r.min, Align2::LEFT_TOP, kind, semi(14.0), FG);
+                let preview: String = text.chars().take(60).collect::<String>() + if text.chars().count() > 60 { "…" } else { "" };
+                p.with_clip_rect(side_r).text(side_r.min + vec2(0.0, 22.0), Align2::LEFT_TOP, preview, FontId::proportional(12.0), DIM);
+                p.text(side_r.min + vec2(0.0, 42.0), Align2::LEFT_TOP, format!("{n}×{n} точек · наводите камеру телефона"), FontId::proportional(11.5), DIM);
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(side_r.min + vec2(0.0, 74.0), side_r.max)));
+                let (mut copy, mut save) = (false, false);
+                child.horizontal(|ui| {
+                    copy = jelly(ui, "Копировать картинку").clicked();
+                    save = jelly(ui, "Сохранить PNG").clicked();
+                });
+                if copy || save {
+                    // для файла и буфера — строгие квадраты: так код читают любые сканеры
+                    let (scale, quiet) = (10u32, 4u32);
+                    let size = (n as u32 + quiet * 2) * scale;
+                    let img = image::RgbaImage::from_fn(size, size, |px, py| {
+                        let (x, y) = ((px / scale) as i64 - quiet as i64, (py / scale) as i64 - quiet as i64);
+                        let dark = x >= 0 && y >= 0 && (x as usize) < n && (y as usize) < n && colors[y as usize * n + x as usize] == qrcode::Color::Dark;
+                        if dark { image::Rgba([0, 0, 0, 255]) } else { image::Rgba([255, 255, 255, 255]) }
+                    });
+                    if copy {
+                        let ok = self.clipboard.as_mut().is_some_and(|cb| {
+                            cb.set_image(arboard::ImageData { width: size as usize, height: size as usize, bytes: std::borrow::Cow::Owned(img.clone().into_raw()) }).is_ok()
+                        });
+                        self.notify(if ok { "Картинка кода скопирована" } else { "Не удалось скопировать" });
+                    }
+                    if save {
+                        let dir = std::env::var_os("USERPROFILE").map(|h| std::path::PathBuf::from(h).join("Pictures")).unwrap_or_else(std::env::temp_dir);
+                        let path = dir.join(format!("QR {}.png", chrono::Local::now().format("%Y-%m-%d %H-%M-%S")));
+                        match img.save(&path) {
+                            Ok(_) => {
+                                self.notify("Сохранено в «Изображения»");
+                                sys::open(&dir.display().to_string());
+                            }
+                            Err(_) => self.notify("Не удалось сохранить"),
+                        }
                     }
                 }
             }
