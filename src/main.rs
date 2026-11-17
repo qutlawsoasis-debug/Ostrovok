@@ -912,6 +912,9 @@ struct App {
     rates_shown: bool,
     palette_demo: bool,
     shot_card: Option<ShotCard>,
+    /// рамки разметки на снимке (в его координатах) и начало протягивания по миниатюре
+    shot_marks: Vec<[u32; 4]>,
+    shot_drag: Option<Pos2>,
     clip_seq: u32,
 
     hotkey: Arc<AtomicBool>,
@@ -1233,6 +1236,8 @@ impl App {
             rates_shown: false,
             palette_demo: false,
             shot_card: None,
+            shot_marks: Vec::new(),
+            shot_drag: None,
             clip_seq: sys::clipboard_seq(),
             hotkey,
             hotkey_name,
@@ -1555,6 +1560,11 @@ impl App {
                     // для снимков: карточка с тем, что сейчас на экране (файл не создаётся)
                     if let Ok((w, h, px)) = sys::capture_screen() {
                         app.show_shot(&cc.egui_ctx, w, h, px, r"C:\Users\user\Pictures\Островок\Снимок 2026-11-16 20-55-10.png".into());
+                        // две рамки разметки для вида (OSTROVOK_SHOT_MARKS=1)
+                        if std::env::var_os("OSTROVOK_SHOT_MARKS").is_some() {
+                            let (w, h) = (w as u32, h as u32);
+                            app.shot_marks = vec![[w / 10, h / 8, w * 4 / 10, h * 3 / 8], [w * 55 / 100, h / 2, w * 9 / 10, h * 8 / 10]];
+                        }
                     }
                     Tab::Shot
                 }
@@ -5259,6 +5269,8 @@ impl App {
         let small = image::imageops::thumbnail(&img, tw, th);
         let tex = ctx.load_texture("shot-card", egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], small.as_raw()), Default::default());
         self.shot_card = Some(ShotCard { path, tex, size: (w, h), rgba: Arc::new(px), until: Instant::now() + Duration::from_secs(8) });
+        self.shot_marks.clear();
+        self.shot_drag = None;
         self.mode = Mode::Panel;
         self.tab = Tab::Shot;
         self.sticky = true;
@@ -5282,6 +5294,39 @@ impl App {
         let img = Rect::from_center_size(inner.center(), vec2(size.0 as f32 * k, size.1 as f32 * k));
         rounded_image(&p, &tex, img, 9.0);
 
+        // разметка: протянуть мышью по миниатюре — красная рамка вокруг важного
+        const MARK: Color32 = Color32::from_rgb(0xFF, 0x4D, 0x4D);
+        let draw = ui.interact(img, ui.id().with("shot-mark"), Sense::drag()).on_hover_cursor(egui::CursorIcon::Crosshair);
+        if draw.drag_started() {
+            self.shot_drag = draw.interact_pointer_pos();
+        }
+        let to_view = |m: &[u32; 4]| {
+            let (sx, sy) = (img.width() / size.0 as f32, img.height() / size.1 as f32);
+            Rect::from_min_max(pos2(img.left() + m[0] as f32 * sx, img.top() + m[1] as f32 * sy), pos2(img.left() + m[2] as f32 * sx, img.top() + m[3] as f32 * sy))
+        };
+        let clip = p.with_clip_rect(img);
+        for m in &self.shot_marks {
+            clip.rect_stroke(to_view(m), Rounding::same(2.0), Stroke::new(2.0_f32, MARK));
+        }
+        if let (Some(a), Some(b)) = (self.shot_drag, ui.ctx().pointer_latest_pos()) {
+            if let Some(m) = view_to_image(a, b, img, size) {
+                let r = to_view(&m);
+                clip.rect_filled(r, Rounding::same(2.0), MARK.gamma_multiply(0.12));
+                clip.rect_stroke(r, Rounding::same(2.0), Stroke::new(2.0_f32, MARK));
+            }
+            if draw.drag_stopped() || !ui.input(|i| i.pointer.primary_down()) {
+                if let Some(m) = view_to_image(a, b, img, size) {
+                    self.shot_marks.push(m);
+                }
+                self.shot_drag = None;
+            }
+        }
+        if self.shot_marks.is_empty() && draw.hovered() && self.shot_drag.is_none() {
+            let tip = Rect::from_center_size(pos2(img.center().x, img.bottom() - 14.0), vec2(176.0, 20.0));
+            p.rect_filled(tip, Rounding::same(10.0), Color32::from_rgba_unmultiplied(10, 10, 18, 190));
+            p.text(tip.center(), Align2::CENTER_CENTER, "Протяните, чтобы обвести", FontId::proportional(11.5), FG);
+        }
+
         let x = frame.right() + 18.0;
         p.text(pos2(x, row.top() + 4.0), Align2::LEFT_TOP, "Снимок сохранён", semi(17.0), FG);
         p.with_clip_rect(Rect::from_min_max(pos2(x, row.top()), row.max))
@@ -5290,7 +5335,18 @@ impl App {
             .text(pos2(x, row.top() + 48.0), Align2::LEFT_TOP, &name, FontId::proportional(12.0), mix(DIM, BG, 0.25));
         let mut act = None;
         let mut side = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(pos2(x, row.top() + 74.0), row.max)));
+        let marked = !self.shot_marks.is_empty();
         side.horizontal_wrapped(|ui| {
+            if marked {
+                // разметка есть — сначала её кнопки, красным
+                let n = self.shot_marks.len();
+                if jelly(ui, &format!("Применить ({n})")).on_hover_text("Нарисовать рамки на снимке, сохранить файл и снова положить в буфер").clicked() {
+                    act = Some("apply");
+                }
+                if jelly(ui, "Отменить").on_hover_text("Убрать последнюю рамку").clicked() {
+                    act = Some("undo");
+                }
+            }
             for (id, label, tip) in [
                 ("text", "Скопировать текст", "Распознать текст на снимке и положить его в буфер обмена"),
                 ("open", "Открыть", "Открыть снимок в программе просмотра"),
@@ -5310,6 +5366,29 @@ impl App {
             }
         }
         match act {
+            Some("undo") => {
+                self.shot_marks.pop();
+            }
+            Some("apply") => {
+                // толщина рамки — от размера снимка, чтобы на 4K она не терялась
+                let t = (size.0.max(size.1) / 400).max(3);
+                let mut px = (*rgba).clone();
+                for m in &self.shot_marks {
+                    draw_frame_rgba(&mut px, size.0, size.1, *m, t, [MARK.r(), MARK.g(), MARK.b()]);
+                }
+                // проверочный запуск ничего не пишет на диск
+                let saved = !test_mode() && image::save_buffer(&path, &px, size.0 as u32, size.1 as u32, image::ExtendedColorType::Rgba8).is_ok();
+                self.clip_skip = true;
+                let data = arboard::ImageData { width: size.0, height: size.1, bytes: std::borrow::Cow::Borrowed(&px) };
+                let copied = self.clipboard.as_mut().is_some_and(|cb| cb.set_image(data).is_ok());
+                self.show_shot(ui.ctx(), size.0, size.1, px, path);
+                self.notify(match (saved, copied) {
+                    (true, true) => "Разметка сохранена и в буфере",
+                    (true, false) => "Разметка сохранена, в буфер не вышло",
+                    (false, true) => "Разметка в буфере, файл сохранить не вышло",
+                    (false, false) => "Не удалось сохранить разметку",
+                });
+            }
             Some("text") => {
                 self.notify("Распознаю текст…");
                 let (tx, ctx) = (self.tx.clone(), ui.ctx().clone());
@@ -8997,6 +9076,66 @@ fn load_thumb(path: &str) -> Option<(usize, usize, Vec<u8>)> {
     reader.limits(limits);
     let img = reader.decode().ok()?.thumbnail(176, 176).into_rgba8();
     Some((img.width() as usize, img.height() as usize, img.into_raw()))
+}
+
+/// Рамка, протянутая мышью от a до b по миниатюре img, в координатах снимка size: [x0, y0, x1, y1), x1/y1 не включительно.
+/// Выход за край обрезается; рамка меньше двух точек миниатюры (просто щелчок) не считается.
+fn view_to_image(a: Pos2, b: Pos2, img: Rect, size: (usize, usize)) -> Option<[u32; 4]> {
+    let (a, b) = (img.clamp(a), img.clamp(b));
+    let r = Rect::from_two_pos(a, b);
+    if r.width() < 2.0 || r.height() < 2.0 || img.width() <= 0.0 || img.height() <= 0.0 {
+        return None;
+    }
+    let sx = |x: f32| (((x - img.left()) / img.width()) * size.0 as f32).round().clamp(0.0, size.0 as f32) as u32;
+    let sy = |y: f32| (((y - img.top()) / img.height()) * size.1 as f32).round().clamp(0.0, size.1 as f32) as u32;
+    Some([sx(r.left()), sy(r.top()), sx(r.right()), sy(r.bottom())])
+}
+
+/// Рисует прямоугольную рамку толщиной t прямо в RGBA-снимке w×h; всё за краем пропускается.
+fn draw_frame_rgba(px: &mut [u8], w: usize, h: usize, r: [u32; 4], t: usize, color: [u8; 3]) {
+    let (x0, y0) = (r[0] as usize, r[1] as usize);
+    let (x1, y1) = ((r[2] as usize).min(w), (r[3] as usize).min(h));
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let edge = x < x0 + t || x >= x1.saturating_sub(t) || y < y0 + t || y >= y1.saturating_sub(t);
+            let i = (y * w + x) * 4;
+            if edge && i + 4 <= px.len() {
+                px[i..i + 4].copy_from_slice(&[color[0], color[1], color[2], 255]);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod shot_mark_tests {
+    use super::*;
+
+    #[test]
+    fn view_to_image_scales_and_clamps() {
+        // миниатюра 100×50 в точке (10,20) показывает снимок 1000×500
+        let img = Rect::from_min_size(pos2(10.0, 20.0), vec2(100.0, 50.0));
+        assert_eq!(view_to_image(pos2(20.0, 30.0), pos2(60.0, 45.0), img, (1000, 500)), Some([100, 100, 500, 250]));
+        // протянули справа налево и за край — упорядочиваем и обрезаем
+        assert_eq!(view_to_image(pos2(200.0, 90.0), pos2(60.0, 0.0), img, (1000, 500)), Some([500, 0, 1000, 500]));
+        assert_eq!(view_to_image(pos2(20.0, 30.0), pos2(20.5, 30.2), img, (1000, 500)), None, "просто щелчок — не рамка");
+        assert_eq!(view_to_image(pos2(0.0, 0.0), pos2(5.0, 5.0), img, (1000, 500)), None, "целиком мимо снимка");
+    }
+
+    #[test]
+    fn frame_drawn_only_on_border() {
+        let (w, h) = (10usize, 8usize);
+        let mut px = vec![0u8; w * h * 4];
+        draw_frame_rgba(&mut px, w, h, [2, 2, 8, 6], 1, [255, 0, 0]);
+        let at = |px: &[u8], x: usize, y: usize| px[(y * w + x) * 4..(y * w + x) * 4 + 4].to_vec();
+        assert_eq!(at(&px, 2, 2), [255, 0, 0, 255]);
+        assert_eq!(at(&px, 7, 5), [255, 0, 0, 255]);
+        assert_eq!(at(&px, 5, 2), [255, 0, 0, 255]);
+        assert_eq!(at(&px, 4, 4), [0, 0, 0, 0], "внутри пусто");
+        assert_eq!(at(&px, 9, 7), [0, 0, 0, 0], "снаружи не тронуто");
+        // толщина больше рамки и выход за край не роняют программу
+        draw_frame_rgba(&mut px, w, h, [0, 0, 99, 99], 50, [0, 255, 0]);
+        assert_eq!(at(&px, 9, 7), [0, 255, 0, 255]);
+    }
 }
 
 #[cfg(test)]
