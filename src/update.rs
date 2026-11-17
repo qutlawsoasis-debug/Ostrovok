@@ -81,6 +81,10 @@ fn check() -> Result<Option<(String, PathBuf)>, String> {
         if !newer(tag, &cur) {
             continue;
         }
+        // с этой версии уже пришлось откатиться — не ставим её снова, ждём следующую
+        if bad_version().is_some_and(|b| b == tag.trim_start_matches('v')) {
+            continue;
+        }
         let Some(asset) = r["assets"].as_array().and_then(|a| a.iter().find(|a| a["name"].as_str() == Some(ASSET))) else { continue };
         let url = asset["browser_download_url"].as_str().unwrap_or("");
         if !url.starts_with(ASSET_PREFIX) {
@@ -115,8 +119,8 @@ fn check() -> Result<Option<(String, PathBuf)>, String> {
         }
         std::fs::rename(&part, &ready).map_err(io)?;
     }
-    // описание релиза пригодится новой версии: она покажет, что изменилось
-    let _ = std::fs::write(crate::store::dir().join("whatsnew.txt"), notes);
+    // описание релиза кладём рядом со скачанным файлом; в «что нового» оно попадёт только при установке
+    let _ = std::fs::write(ready.with_extension("txt"), notes);
     Ok(Some((version, ready)))
 }
 
@@ -156,29 +160,113 @@ pub fn spawn(state: Arc<Mutex<State>>, wake: impl Fn() + Send + 'static) {
 pub fn apply(new: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let old = exe.with_extension("old.exe");
+    // сначала целиком копируем рядом: если место кончится, рабочая программа останется нетронутой
+    let staged = exe.with_extension("new.exe");
+    std::fs::copy(new, &staged).map_err(|e| {
+        let _ = std::fs::remove_file(&staged);
+        format!("не удалось подготовить новую версию: {e}")
+    })?;
     let _ = std::fs::remove_file(&old);
-    std::fs::rename(&exe, &old).map_err(|e| format!("не удалось заменить файл программы: {e}"))?;
-    if let Err(e) = std::fs::copy(new, &exe) {
-        let _ = std::fs::rename(&old, &exe);
-        return Err(format!("не удалось поставить новую версию: {e}"));
+    std::fs::rename(&exe, &old).map_err(|e| {
+        let _ = std::fs::remove_file(&staged);
+        format!("не удалось заменить файл программы: {e}")
+    })?;
+    if let Err(e) = std::fs::rename(&staged, &exe) {
+        let back = std::fs::rename(&old, &exe);
+        return Err(match back {
+            Ok(_) => format!("не удалось поставить новую версию: {e}"),
+            Err(_) => format!("не удалось поставить новую версию, прежняя лежит в {}", old.display()),
+        });
     }
+    // «что нового» — только теперь, когда версия действительно ставится
+    if let Ok(notes) = std::fs::read_to_string(new.with_extension("txt")) {
+        let _ = std::fs::write(crate::store::dir().join("whatsnew.txt"), notes);
+    }
+    // новая версия «на испытании»: отметку ставим ДО запуска, чтобы откат сработал, даже если она упадёт мгновенно
+    let version = new.file_stem().and_then(|s| s.to_str()).and_then(|s| s.strip_prefix("Ostrovok-")).unwrap_or("").to_string();
+    let _ = std::fs::write(trial_mark(), format!("{}\n{}", version, exe.display()));
     match std::process::Command::new(&exe).arg("--updated").env_remove("OSTROVOK_FAKE_VERSION").spawn() {
         Ok(_) => Ok(()),
         Err(e) => {
             // новая версия не запустилась (например, её остановил антивирус) — возвращаем прежнюю
-            let _ = std::fs::remove_file(&exe);
-            let _ = std::fs::rename(&old, &exe);
+            let _ = std::fs::remove_file(trial_mark());
+            let _ = std::fs::remove_file(crate::store::dir().join("whatsnew.txt"));
+            let broken = exe.with_extension("broken.exe");
+            let _ = std::fs::remove_file(&broken);
+            if std::fs::rename(&exe, &broken).is_ok() && std::fs::rename(&old, &exe).is_err() {
+                let _ = std::fs::copy(&old, &exe);
+            }
             Err(format!("новая версия не запустилась: {e}"))
         }
     }
 }
 
-/// Убирает следы прошлого обновления: старый файл программы и скачанные установщики.
+fn trial_mark() -> PathBuf {
+    crate::store::dir().join("update-trial")
+}
+
+fn bad_mark() -> PathBuf {
+    crate::store::dir().join("update-bad")
+}
+
+/// Версия, с которой пришлось откатиться: её обновление пропускает.
+fn bad_version() -> Option<String> {
+    std::fs::read_to_string(bad_mark()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Испытание пройдено (или остров закрыт штатно) — отметку снимаем, откат больше не нужен.
+pub fn trial_passed() {
+    let _ = std::fs::remove_file(trial_mark());
+}
+
+/// Решает, надо ли откатываться: отметка испытания стоит именно на этот файл программы и на эту версию.
+pub fn should_roll_back(mark: &str, exe: &Path, version: &str) -> bool {
+    // файл мог сохранить редактор с невидимой меткой BOM в начале
+    let mut lines = mark.trim_start_matches('\u{FEFF}').lines();
+    let (Some(v), Some(p)) = (lines.next(), lines.next()) else { return false };
+    v.trim() == version && Path::new(p.trim()) == exe
+}
+
+/// Новая версия упала, не дожив до конца испытания, а прежняя лежит рядом — возвращаем прежнюю и запускаем.
+/// Вызывать только когда этот процесс захватил «единственный экземпляр»: значит, новая версия точно не работает.
+/// true — откат сделан, этой копии надо выйти.
+pub fn rollback_if_failed() -> bool {
+    let (Ok(exe), Some(old)) = (std::env::current_exe(), old_exe()) else { return false };
+    let Ok(mark) = std::fs::read_to_string(trial_mark()) else { return false };
+    if !old.exists() || !should_roll_back(&mark, &exe, &current()) {
+        return false;
+    }
+    let _ = std::fs::remove_file(trial_mark());
+    // запоминаем неудачную версию, чтобы прежняя не поставила её снова по кругу, и убираем её «что нового»
+    let _ = std::fs::write(bad_mark(), current());
+    let _ = std::fs::remove_file(crate::store::dir().join("whatsnew.txt"));
+    let broken = exe.with_extension("broken.exe");
+    let _ = std::fs::remove_file(&broken);
+    if std::fs::rename(&exe, &broken).is_err() {
+        return false;
+    }
+    if std::fs::rename(&old, &exe).is_err() {
+        let _ = std::fs::rename(&broken, &exe);
+        return false;
+    }
+    // --updated: прежняя версия подождёт, пока эта копия отпустит «единственный экземпляр»
+    std::process::Command::new(&exe).arg("--updated").spawn().is_ok()
+}
+
+/// Убирает следы прошлого обновления. Старый файл программы удаляется только после минуты нормальной
+/// работы новой версии — до этого он нужен для отката.
 pub fn cleanup() {
     std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(6));
+        // падения при запуске случаются в первые секунды: после 10 секунд работы испытание пройдено,
+        // и закрытие острова вручную уже не вызовет ложный откат
+        std::thread::sleep(Duration::from_secs(10));
+        trial_passed();
+        std::thread::sleep(Duration::from_secs(50));
         if let Some(old) = old_exe() {
             let _ = std::fs::remove_file(old);
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::fs::remove_file(exe.with_extension("broken.exe"));
         }
         let _ = std::fs::remove_dir_all(dir());
     });
@@ -195,5 +283,17 @@ mod tests {
         assert!(!newer("v0.1.7", "0.1.7"));
         assert!(!newer("v0.1.6", "0.1.7"));
         assert!(!newer("мусор", "0.1.7"));
+    }
+
+    #[test]
+    fn rollback_only_for_same_exe_and_version() {
+        let exe = Path::new(r"C:\Users\a\Ostrovok\Ostrovok.exe");
+        let mark = "0.1.46\nC:\\Users\\a\\Ostrovok\\Ostrovok.exe";
+        assert!(should_roll_back(mark, exe, "0.1.46"));
+        assert!(!should_roll_back(mark, exe, "0.1.45")); // уже откатились или другая версия
+        assert!(!should_roll_back(mark, Path::new(r"D:\portable\Ostrovok.exe"), "0.1.46")); // другая копия
+        assert!(!should_roll_back("0.1.46", exe, "0.1.46")); // старый формат без пути
+        assert!(!should_roll_back("", exe, "0.1.46"));
+        assert!(should_roll_back("\u{FEFF}0.1.46\r\nC:\\Users\\a\\Ostrovok\\Ostrovok.exe", exe, "0.1.46"));
     }
 }

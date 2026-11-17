@@ -488,15 +488,18 @@ pub fn spawn_downloads(report: impl Fn(String) + Send + 'static, progress: Arc<s
         let mut seen = list();
         let (mut last, mut quiet, mut tick) = (partial(), 0u32, 0u32);
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            // пока ничего не качается, папку смотрим раз в три секунды, а не каждую — меньше работы диску во время игр
+            let busy = last > 0;
+            std::thread::sleep(std::time::Duration::from_secs(if busy { 1 } else { 3 }));
             let size = partial();
-            let speed = size.saturating_sub(last) as f32;
+            let dt = if busy { 1.0 } else { 3.0 };
+            let speed = size.saturating_sub(last) as f32 / dt;
             last = size;
             // загрузка считается идущей, пока файл растёт; три секунды без роста — пауза или конец
-            quiet = if speed > 0.0 { 0 } else { quiet + 1 };
+            quiet = if speed > 0.0 { 0 } else { quiet + dt as u32 };
             *progress.lock().unwrap() = (size > 0 && quiet < 3).then_some((size, speed));
             tick += 1;
-            if tick % 3 != 0 {
+            if busy && tick % 3 != 0 {
                 continue;
             }
             let now = list();

@@ -364,6 +364,8 @@ enum Msg {
     Lyrics(String, Vec<(f64, String)>),
     /// значок программы для строки поиска, загруженный в фоне: путь и точки
     Icon(String, Option<(usize, usize, Vec<u8>)>),
+    /// картинка из буфера обмена, прочитанная в фоне
+    ClipImg(usize, usize, Vec<u8>),
 }
 
 #[derive(Clone)]
@@ -435,6 +437,79 @@ fn parse_quick(q: &str, now: chrono::NaiveDateTime) -> Option<Quick> {
         }
     }
     None
+}
+
+/// Прибавляет минуты фокуса к дню; лог отсортирован по дате и хранит 60 последних дней.
+fn add_focus(log: &mut Vec<(String, u32)>, day: chrono::NaiveDate, min: u32) {
+    let key = day.format("%Y-%m-%d").to_string();
+    match log.iter_mut().find(|e| e.0 == key) {
+        Some(e) => e.1 += min,
+        None => log.push((key, min)),
+    }
+    log.sort_by(|a, b| a.0.cmp(&b.0));
+    let extra = log.len().saturating_sub(60);
+    log.drain(..extra);
+}
+
+fn focus_on(log: &[(String, u32)], day: chrono::NaiveDate) -> u32 {
+    let key = day.format("%Y-%m-%d").to_string();
+    log.iter().find(|e| e.0 == key).map_or(0, |e| e.1)
+}
+
+/// Минуты за последние 7 дней, сегодня — последним.
+fn week_minutes(log: &[(String, u32)], today: chrono::NaiveDate) -> [u32; 7] {
+    std::array::from_fn(|i| focus_on(log, today - chrono::Duration::days(6 - i as i64)))
+}
+
+/// Сколько дней подряд был фокус. Если сегодня ещё не занимались — считаем со вчера, чтобы утром серия не обнулялась.
+fn focus_streak(log: &[(String, u32)], today: chrono::NaiveDate) -> u32 {
+    let mut day = if focus_on(log, today) > 0 { today } else { today - chrono::Duration::days(1) };
+    let mut n = 0;
+    while focus_on(log, day) > 0 {
+        n += 1;
+        day -= chrono::Duration::days(1);
+    }
+    n
+}
+
+/// «45 мин», «1 ч», «1 ч 15 мин».
+fn fmt_minutes(m: u32) -> String {
+    match (m / 60, m % 60) {
+        (0, r) => format!("{r} мин"),
+        (h, 0) => format!("{h} ч"),
+        (h, r) => format!("{h} ч {r} мин"),
+    }
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use super::*;
+    fn d(y: i32, m: u32, day: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+    #[test]
+    fn focus_stats() {
+        let mut log = Vec::new();
+        assert_eq!(focus_streak(&log, d(2026, 1, 2)), 0);
+        add_focus(&mut log, d(2025, 12, 31), 25);
+        add_focus(&mut log, d(2026, 1, 1), 25);
+        add_focus(&mut log, d(2026, 1, 1), 50);
+        assert_eq!(focus_on(&log, d(2026, 1, 1)), 75);
+        // через Новый год, сегодня ещё 0 — серия со вчера
+        assert_eq!(focus_streak(&log, d(2026, 1, 2)), 2);
+        add_focus(&mut log, d(2026, 1, 2), 10);
+        assert_eq!(focus_streak(&log, d(2026, 1, 2)), 3);
+        // разрыв
+        assert_eq!(focus_streak(&log, d(2026, 1, 4)), 0);
+        assert_eq!(week_minutes(&log, d(2026, 1, 2)), [0, 0, 0, 0, 25, 75, 10]);
+        for k in 0..80 {
+            add_focus(&mut log, d(2026, 3, 1) + chrono::Duration::days(k), 5);
+        }
+        assert_eq!(log.len(), 60);
+        assert_eq!(fmt_minutes(45), "45 мин");
+        assert_eq!(fmt_minutes(60), "1 ч");
+        assert_eq!(fmt_minutes(75), "1 ч 15 мин");
+    }
 }
 
 #[cfg(test)]
@@ -982,6 +1057,15 @@ impl App {
         if let Some(m) = std::env::var("OSTROVOK_SOON").ok().and_then(|v| v.parse::<i64>().ok()).filter(|_| test_mode()) {
             app.cfg.reminders.push(store::Reminder { text: "Позвонить".into(), at: chrono::Local::now().timestamp() + m * 60 - 5 });
         }
+        // для снимков недели фокуса: OSTROVOK_FOCUS=30,55,0,80,25,110,50 — минуты за 7 дней, сегодня последним
+        if let Some(list) = std::env::var("OSTROVOK_FOCUS").ok().filter(|_| test_mode()) {
+            let today = chrono::Local::now().date_naive();
+            for (i, m) in list.split(',').filter_map(|v| v.trim().parse::<u32>().ok()).take(7).enumerate() {
+                if m > 0 {
+                    add_focus(&mut app.cfg.focus_log, today - chrono::Duration::days(6 - i as i64), m);
+                }
+            }
+        }
         // для снимков пилюли со значком непрочитанных: OSTROVOK_UNREAD=3
         if let Some(n) = std::env::var("OSTROVOK_UNREAD").ok().and_then(|v| v.parse::<usize>().ok()).filter(|_| test_mode()) {
             for _ in 0..n {
@@ -1004,7 +1088,10 @@ impl App {
             app.hint = smart_hint(&t);
             app.hint_until = Instant::now() + Duration::from_secs(60);
         }
-        update::cleanup();
+        // проверочная копия не трогает файлы обновления настоящего острова
+        if !test_mode() {
+            update::cleanup();
+        }
         if !test_mode() && app.cfg.last_version != env!("CARGO_PKG_VERSION") {
             if !app.cfg.last_version.is_empty() {
                 // вторая строка — что нового, если описание релиза сохранилось при загрузке
@@ -1459,6 +1546,7 @@ impl App {
                     self.push_inbox(n, color);
                 }
                 Msg::Download(name) => self.show_toast("\u{E896}", [0x3A, 0x9B, 0xFF], "Загрузка завершена", &name, 6, false),
+                Msg::ClipImg(w, h, px) => self.push_clip_img(ctx, w, h, px),
                 Msg::Icon(path, icon) => {
                     let tex = icon.map(|(w, h, px)| ctx.load_texture(format!("pal-{path}"), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR));
                     self.app_icons.insert(path, tex);
@@ -1647,11 +1735,16 @@ impl App {
             if !matches!(text, Some(Ok(_))) {
                 // в буфере не текст — возможно, картинка (снимок экрана, «копировать изображение»)
                 if !std::mem::take(&mut self.clip_skip) {
-                    if let Some(Ok(img)) = self.clipboard.as_mut().map(|cb| cb.get_image()) {
+                    // большой снимок (4K — десятки мегабайт) читаем в фоне, чтобы интерфейс не дёргался
+                    let (tx, ctx2) = (self.tx.clone(), ctx.clone());
+                    std::thread::spawn(move || {
+                        let Ok(mut cb) = arboard::Clipboard::new() else { return };
+                        let Ok(img) = cb.get_image() else { return };
                         if img.width > 0 && img.height > 0 && img.bytes.len() < 40_000_000 {
-                            self.push_clip_img(ctx, img.width, img.height, img.bytes.into_owned());
+                            let _ = tx.send(Msg::ClipImg(img.width, img.height, img.bytes.into_owned()));
+                            ctx2.request_repaint();
                         }
-                    }
+                    });
                 }
             }
             if let Some(Ok(t)) = text {
@@ -1675,6 +1768,7 @@ impl App {
             match self.focus {
                 // работа кончилась — перерыв; перерыв кончился — снова работа
                 Some((false, rounds)) => {
+                    self.log_focus(25);
                     self.focus = Some((true, rounds + 1));
                     self.start_timer(5.0);
                     self.show_toast("\u{E916}", [0x30, 0xD1, 0x58], "Перерыв 5 минут", &format!("круг {} пройден — отдохните", rounds + 1), 6, false);
@@ -2210,7 +2304,10 @@ impl App {
             Tab::System => self.ui_system(ui),
             Tab::Sound => self.ui_sound(ui),
             Tab::Weather => self.ui_weather(ui),
-            Tab::Timer => self.ui_timer(ui),
+            Tab::Timer => {
+                self.ui_timer(ui);
+                self.ui_focus_week(ui);
+            }
             Tab::Clip => self.ui_clip(ui),
             Tab::Inbox => self.ui_inbox(ui),
             Tab::Notes => self.ui_notes(ui),
@@ -3676,6 +3773,14 @@ impl App {
                 start = self.timer_custom.trim().replace(',', ".").parse::<f64>().ok();
             }
             if live && jelly(ui, "Стоп").clicked() {
+                // остановили посреди рабочего круга — прошедшее время засчитываем, если набралось от 5 минут
+                if let (Some((false, _)), Some(end)) = (self.focus, self.timer_end) {
+                    let left = end.saturating_duration_since(Instant::now()).as_secs_f32();
+                    let done = ((self.timer_total - left) / 60.0).floor() as u32;
+                    if done >= 5 {
+                        self.log_focus(done);
+                    }
+                }
                 self.timer_end = None;
                 self.focus = None;
             }
@@ -3713,6 +3818,55 @@ impl App {
                 Some(t) => self.sw_acc += t.elapsed(),
                 None => self.sw_start = Some(Instant::now()),
             }
+        }
+    }
+
+    /// Под таймером: минуты «Фокуса» за неделю столбиками и серия дней подряд.
+    fn ui_focus_week(&mut self, ui: &mut egui::Ui) {
+        use chrono::Datelike;
+        ui.add_space(8.0);
+        let (card, _) = ui.allocate_exact_size(vec2(ui.available_width(), 78.0), Sense::hover());
+        let p = ui.painter().clone();
+        glass_chip(&p, card, 16.0, 0.45);
+        let today = chrono::Local::now().date_naive();
+        let week = week_minutes(&self.cfg.focus_log, today);
+        let streak = focus_streak(&self.cfg.focus_log, today);
+        let tone = Color32::from_rgb(0xFF, 0xB3, 0x40);
+        let total: u32 = week.iter().sum();
+        if total == 0 {
+            p.text(pos2(card.left() + 18.0, card.center().y - 9.0), Align2::LEFT_CENTER, "Неделя фокуса", semi(13.0), FG);
+            p.text(pos2(card.left() + 18.0, card.center().y + 11.0), Align2::LEFT_CENTER, "Запустите «Фокус 25/5» — здесь появится ваша неделя и серия дней", FontId::proportional(11.5), DIM);
+            return;
+        }
+        // слева — итоги
+        p.text(pos2(card.left() + 18.0, card.top() + 16.0), Align2::LEFT_TOP, format!("Сегодня {}", fmt_minutes(week[6])), semi(13.5), FG);
+        p.text(pos2(card.left() + 18.0, card.top() + 38.0), Align2::LEFT_TOP, format!("за неделю {}", fmt_minutes(total)), FontId::proportional(11.5), DIM);
+        if streak > 1 {
+            p.text(pos2(card.left() + 18.0, card.top() + 54.0), Align2::LEFT_TOP, format!("\u{E945} серия {} {}", streak, count_ru(streak as usize, ["день", "дня", "дней"]).split_once(' ').map_or("", |s| s.1)), FontId::proportional(11.5), tone);
+        }
+        // справа — семь столбиков, сегодня последним
+        const DAYS: [&str; 7] = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"];
+        let area = Rect::from_min_max(pos2(card.left() + 210.0, card.top() + 10.0), pos2(card.right() - 16.0, card.bottom() - 20.0));
+        let step = area.width() / 7.0;
+        let bw = (step * 0.42).min(22.0);
+        let top = (*week.iter().max().unwrap_or(&0)).max(25) as f32;
+        for (i, m) in week.iter().enumerate() {
+            let cx = area.left() + step * (i as f32 + 0.5);
+            let day = today - chrono::Duration::days(6 - i as i64);
+            let is_today = i == 6;
+            if *m == 0 {
+                p.circle_filled(pos2(cx, area.bottom() - 2.0), 2.0, rgba(255, 255, 255, 28));
+            } else {
+                let h = (area.height() * *m as f32 / top).max(4.0);
+                let r = Rect::from_min_max(pos2(cx - bw / 2.0, area.bottom() - h), pos2(cx + bw / 2.0, area.bottom()));
+                if is_today {
+                    p.rect_filled(r.expand(3.0), Rounding::same(6.0), Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), 46));
+                }
+                p.rect_filled(r, Rounding::same(4.0), if is_today { tone } else { mix(tone, BG, 0.45) });
+            }
+            let hit = Rect::from_center_size(pos2(cx, area.center().y), vec2(step, area.height() + 20.0));
+            ui.interact(hit, ui.id().with(("focus-day", i)), Sense::hover()).on_hover_text(format!("{} · {}", DAYS[day.weekday().num_days_from_monday() as usize], fmt_minutes(*m)));
+            p.text(pos2(cx, card.bottom() - 10.0), Align2::CENTER_CENTER, DAYS[day.weekday().num_days_from_monday() as usize], FontId::proportional(10.5), if is_today { FG } else { DIM });
         }
     }
 
@@ -3874,6 +4028,11 @@ impl App {
             self.set_clipboard(&text);
             self.notify("Скопировано в буфер");
         }
+    }
+
+    fn log_focus(&mut self, min: u32) {
+        add_focus(&mut self.cfg.focus_log, chrono::Local::now().date_naive(), min);
+        self.cfg.save();
     }
 
     /// Кладёт картинку в историю буфера: повтор переезжает в начало, храним не больше восьми.
@@ -5144,6 +5303,10 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // штатное закрытие — не падение: откат при следующем запуске не нужен
+        if !test_mode() {
+            update::trial_passed();
+        }
         store::save_notes(&self.notes);
         self.jarvis.stop();
         self.ears.stop_server();
@@ -5828,7 +5991,10 @@ impl eframe::App for App {
 
         // частота перерисовки: быстро только когда есть на что смотреть
         let playing = self.media_now.as_ref().is_some_and(|m| m.playing);
-        if animating || self.shot.is_some() {
+        if self.hidden && self.shot.is_none() && !animating {
+            // остров спрятан (полноэкранная игра): кадры не нужны, только изредка проверяем, не пора ли показаться
+            ctx.request_repaint_after(Duration::from_millis(400));
+        } else if animating || self.shot.is_some() {
             ctx.request_repaint();
         } else if self.mode != Mode::Pill || dist < 420.0 || playing {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -6060,7 +6226,7 @@ impl App {
             Tab::Weather if self.weather.as_ref().is_some_and(|w| w.hours.len() >= 4) => 398.0,
             Tab::Weather if self.weather.is_some() => 292.0,
             Tab::Weather => 250.0,
-            Tab::Timer => 262.0,
+            Tab::Timer => 348.0,
             Tab::Calendar => 360.0,
             Tab::Shot => 306.0,
             Tab::Clip => 340.0 + if self.clip_imgs.is_empty() { 0.0 } else { 72.0 },
@@ -6743,6 +6909,13 @@ fn main() -> eframe::Result<()> {
     }
     let updated = std::env::args().any(|a| a == "--updated");
     if !test && !(if updated { sys::wait_single_instance() } else { sys::single_instance() }) {
+        return Ok(());
+    }
+    // мы — единственная копия, значит новая версия сейчас не работает. Если она не прошла испытание
+    // (упала в первые секунды), возвращаем прежнюю и запускаем её; та подождёт, пока эта копия выйдет.
+    // OSTROVOK_TEST_ROLLBACK — только для проверки отката проверочной копией во временной папке
+    let rollback_on = !test || std::env::var_os("OSTROVOK_TEST_ROLLBACK").is_some();
+    if rollback_on && !updated && update::rollback_if_failed() {
         return Ok(());
     }
     let test_x = std::env::var("OSTROVOK_TEST_X").ok().and_then(|v| v.parse::<f32>().ok());
