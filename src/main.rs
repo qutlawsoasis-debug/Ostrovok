@@ -4512,6 +4512,30 @@ impl App {
                 self.clip_imgs.clear();
             }
         });
+        // ── быстрые преобразования последней текстовой записи: результат сразу в буфер
+        // считаются каждый кадр, поэтому для огромных записей полосу не показываем
+        if let Some(last) = self.clips.first().or(self.cfg.pins.first()).filter(|t| t.len() <= 20_000).cloned() {
+            ui.add_space(4.0);
+            let mut done = None;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(RichText::new("\u{E8AC}").size(12.0).color(accent()));
+                ui.label(RichText::new("Последнее:").color(DIM).size(11.5));
+                for (tx, name, tip) in ClipTx::ALL {
+                    let out = clip_transform(tx, &last);
+                    let same = out == last;
+                    let sample: String = out.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(60).collect();
+                    let b = ui.add_enabled(!same, egui::Button::new(RichText::new(name).size(11.5)).rounding(9.0).min_size(vec2(0.0, 22.0)));
+                    if b.on_hover_text(format!("{tip}\n→ {sample}")).on_disabled_hover_text("Текст от этого не изменится").clicked() {
+                        done = Some((out, name));
+                    }
+                }
+            });
+            if let Some((out, name)) = done {
+                self.set_clipboard(&out);
+                self.notify(&format!("«{name}» — готово, скопировано"));
+            }
+        }
         // ── снимки: полоса миниатюр. Щелчок — снова в буфер, правый щелчок — текст с картинки
         if !self.clip_imgs.is_empty() {
             ui.add_space(6.0);
@@ -7884,4 +7908,122 @@ fn main() -> eframe::Result<()> {
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("Островок", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+}
+
+/// Быстрые преобразования текста на странице «Буфер».
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ClipTx {
+    Upper,
+    Lower,
+    OneLine,
+    Translit,
+    Layout,
+}
+
+impl ClipTx {
+    const ALL: [(ClipTx, &'static str, &'static str); 5] = [
+        (ClipTx::Upper, "ВЕРХНИЙ", "Все буквы заглавные"),
+        (ClipTx::Lower, "нижний", "Все буквы строчные"),
+        (ClipTx::OneLine, "Одной строкой", "Убрать переносы и лишние пробелы"),
+        (ClipTx::Translit, "Транслит", "Русские буквы латиницей: Щука → Shchuka"),
+        (ClipTx::Layout, "Раскладка", "Набрано не в той раскладке: ghbdtn → привет"),
+    ];
+}
+
+fn clip_transform(tx: ClipTx, text: &str) -> String {
+    match tx {
+        ClipTx::Upper => text.to_uppercase(),
+        ClipTx::Lower => text.to_lowercase(),
+        ClipTx::OneLine => text.split_whitespace().collect::<Vec<_>>().join(" "),
+        ClipTx::Translit => translit(text),
+        ClipTx::Layout => fix_layout(text),
+    }
+}
+
+fn translit(text: &str) -> String {
+    let cs: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    for (i, &c) in cs.iter().enumerate() {
+        let low = c.to_lowercase().next().unwrap_or(c);
+        let lat = match low {
+            'а' => "a", 'б' => "b", 'в' => "v", 'г' => "g", 'д' => "d", 'е' => "e", 'ё' => "yo", 'ж' => "zh", 'з' => "z", 'и' => "i", 'й' => "y",
+            'к' => "k", 'л' => "l", 'м' => "m", 'н' => "n", 'о' => "o", 'п' => "p", 'р' => "r", 'с' => "s", 'т' => "t", 'у' => "u", 'ф' => "f",
+            'х' => "kh", 'ц' => "ts", 'ч' => "ch", 'ш' => "sh", 'щ' => "shch", 'ъ' | 'ь' => "", 'ы' => "y", 'э' => "e", 'ю' => "yu", 'я' => "ya",
+            _ => {
+                out.push(c);
+                continue;
+            }
+        };
+        if c == low {
+            out.push_str(lat);
+            continue;
+        }
+        // заглавная: всё слово заглавными (ЖУК → ZHUK) или только первая буква (Щука → Shchuka)
+        let next_up = cs.get(i + 1).is_some_and(|n| n.is_uppercase());
+        let next_letter = cs.get(i + 1).is_some_and(|n| n.is_alphabetic());
+        let prev_up = i > 0 && cs[i - 1].is_uppercase();
+        if next_up || (!next_letter && prev_up) {
+            out.push_str(&lat.to_uppercase());
+        } else {
+            let mut l = lat.chars();
+            if let Some(f) = l.next() {
+                out.extend(f.to_uppercase());
+                out.push_str(l.as_str());
+            }
+        }
+    }
+    out
+}
+
+/// Текст, набранный не в той раскладке: латиницу в кириллицу или наоборот — куда больше букв просится.
+fn fix_layout(text: &str) -> String {
+    const EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
+    const RU: &str = "йцукенгшщзхъфывапролджэячсмитьбюё";
+    let (en, ru): (Vec<char>, Vec<char>) = (EN.chars().collect(), RU.chars().collect());
+    let latin = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    let cyr = text.chars().filter(|c| ru.contains(&c.to_lowercase().next().unwrap_or(*c))).count();
+    let to_ru = latin >= cyr;
+    let cs: Vec<char> = text.chars().collect();
+    cs.iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let low = c.to_lowercase().next().unwrap_or(c);
+            let (from, to) = if to_ru { (&en, &ru) } else { (&ru, &en) };
+            let Some(k) = from.iter().position(|f| *f == low) else { return c };
+            // знаки препинания меняем только внутри слова: «j,tl» → «обед», а запятая в «ghbdtn, vbh» остаётся
+            if to_ru && !low.is_ascii_alphabetic() && !cs.get(i + 1).is_some_and(|n| n.is_ascii_alphabetic()) {
+                return c;
+            }
+            let t = to[k];
+            if c != low { t.to_uppercase().next().unwrap_or(t) } else { t }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod clip_transform_tests {
+    use super::*;
+
+    #[test]
+    fn case_and_one_line() {
+        assert_eq!(clip_transform(ClipTx::Upper, "Привет, world"), "ПРИВЕТ, WORLD");
+        assert_eq!(clip_transform(ClipTx::Lower, "ПРИВЕТ, World"), "привет, world");
+        assert_eq!(clip_transform(ClipTx::OneLine, "  первая\r\nвторая\n\n\tтретья  "), "первая вторая третья");
+        assert_eq!(clip_transform(ClipTx::OneLine, ""), "");
+    }
+
+    #[test]
+    fn translit_keeps_case_and_other_chars() {
+        assert_eq!(clip_transform(ClipTx::Translit, "Щука ёж, Юля!"), "Shchuka yozh, Yulya!");
+        assert_eq!(clip_transform(ClipTx::Translit, "объём 5 GB"), "obyom 5 GB");
+        assert_eq!(clip_transform(ClipTx::Translit, "ЖУК"), "ZHUK");
+    }
+
+    #[test]
+    fn layout_both_ways() {
+        assert_eq!(clip_transform(ClipTx::Layout, "ghbdtn, vbh!"), "привет, мир!");
+        assert_eq!(clip_transform(ClipTx::Layout, "Ghbdtn"), "Привет");
+        assert_eq!(clip_transform(ClipTx::Layout, "руддщ цщкдв"), "hello world");
+        assert_eq!(clip_transform(ClipTx::Layout, "123 - !"), "123 - !");
+    }
 }
