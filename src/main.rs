@@ -4668,7 +4668,7 @@ impl App {
                 ui.add_space(2.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.query)
-                        .hint_text(RichText::new("Программа, сайт, пример, «5 км в мили», «100 usd в рубли» или «таймер 5»").color(DIM))
+                        .hint_text(RichText::new("Программа, сайт, пример или команда").color(DIM))
                         .desired_width(f32::INFINITY)
                         .frame(false)
                         .font(FontId::proportional(17.0)),
@@ -4726,6 +4726,31 @@ impl App {
         }
         ui.add_space(4.0);
         ui.spacing_mut().item_spacing.y = 2.0;
+        if self.query.trim().is_empty() {
+            // примеры: щелчок подставляет запрос
+            let mut pick: Option<&str> = None;
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (glyph, text) in [("\u{E916}", "таймер 5"), ("\u{E823}", "напомни через 15 мин чай"), ("\u{E73E}", "дело "), ("\u{E8EF}", "5 км в мили"), ("\u{E8C7}", "100 usd в рубли")] {
+                    let label = format!("{glyph}  {}", text.trim());
+                    let w = ui.painter().layout_no_wrap(label.clone(), FontId::proportional(12.5), FG).size().x + 20.0;
+                    let (r, resp) = ui.allocate_exact_size(vec2(w, 28.0), Sense::click());
+                    let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
+                    glass_chip(ui.painter(), r, 14.0, 0.4 + 0.5 * hov);
+                    ui.painter().text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.5), mix(DIM, FG, hov));
+                    if resp.clicked() {
+                        pick = Some(text);
+                    }
+                }
+            });
+            if let Some(t) = pick {
+                self.query = t.to_string();
+                self.build_results();
+                self.sel = 0;
+                self.focus_query = true;
+            }
+        }
         let icons = &mut self.app_icons;
         for (i, it) in self.results.iter().enumerate() {
             let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H - 2.0), Sense::click());
@@ -4941,7 +4966,9 @@ impl eframe::App for App {
             Mode::Panel => vec2(PANEL_W, self.panel_height()),
             Mode::Palette => {
                 let n = self.results.len() as f32;
-                vec2(PANEL_W, 50.0 + n * ROW_H + if n > 0.0 { 10.0 } else { 0.0 })
+                // пустой запрос — под полем ряд примеров
+                let hints = if self.query.trim().is_empty() { 40.0 } else { 0.0 };
+                vec2(PANEL_W, 50.0 + n * ROW_H + if n > 0.0 { 10.0 } else { 0.0 } + hints)
             }
         };
         let target = self.upd_shape.unwrap_or(target);
