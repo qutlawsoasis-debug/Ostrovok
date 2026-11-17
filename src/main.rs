@@ -365,6 +365,7 @@ enum Msg {
     Note(String),
     City(f64, f64, String),
     Weather(weather::Now),
+    WeatherFailed(String),
     Ai(Result<String, String>),
     Jarvis(jarvis::Ev),
     Heard(ears::Heard),
@@ -676,6 +677,20 @@ mod date_tests {
 /// Сколько городов помещается в ряд под календарём.
 const WORLD_MAX: usize = 3;
 
+/// Чистит список мировых часов: только известные города, в каноническом написании, без повторов, не больше WORLD_MAX.
+fn sanitize_world(list: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for c in list.iter().filter_map(|n| find_city(n)) {
+        if out.len() >= WORLD_MAX {
+            break;
+        }
+        if !out.iter().any(|w| w == c.show) {
+            out.push(c.show.to_string());
+        }
+    }
+    out
+}
+
 fn find_city(q: &str) -> Option<&'static City> {
     let q = q.trim().to_lowercase().replace('ё', "е");
     if q.is_empty() {
@@ -747,6 +762,20 @@ fn world_label(here: chrono::NaiveDateTime, there: chrono::NaiveDateTime) -> Str
 #[cfg(test)]
 mod world_tests {
     use super::*;
+    #[test]
+    fn sanitize_world_list() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(sanitize_world(&[]).is_empty());
+        assert!(sanitize_world(&v(&["атлантида"])).is_empty());
+        let ny = find_city("нью йорк").unwrap().show;
+        let tk = find_city("токио").unwrap().show;
+        let ld = find_city("лондон").unwrap().show;
+        let br = find_city("berlin").unwrap().show;
+        assert_eq!(sanitize_world(&v(&["атлантида", "нью йорк", "Токио"])), v(&[ny, tk]));
+        assert_eq!(sanitize_world(&v(&["токио", "ТОКИО", tk])), v(&[tk]));
+        assert_eq!(sanitize_world(&v(&["токио", "лондон", "x", "berlin", "нью йорк"])).len(), WORLD_MAX);
+        assert_eq!(sanitize_world(&v(&["токио", "лондон", "berlin", "нью йорк"])), v(&[tk, ld, br]));
+    }
     fn t(y: i32, m: u32, d: u32, h: u32, mi: u32) -> chrono::NaiveDateTime {
         chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, mi, 0).unwrap()
     }
@@ -916,6 +945,8 @@ struct App {
 
     weather: Option<weather::Now>,
     weather_at: Option<Instant>,
+    weather_err: Option<String>,
+    weather_fails: u32,
     cfg: store::Settings,
     city_edit: String,
     autostart: bool,
@@ -1201,7 +1232,8 @@ impl App {
         }
         let (lens_tx, lens_rx) = glass::spawn(ctx.clone());
         let fx = cc.gl.as_ref().and_then(|gl| fx::Fx::new(gl)).map(Arc::new);
-        let cfg = store::Settings::load();
+        let mut cfg = store::Settings::load();
+        cfg.world = sanitize_world(&cfg.world);
         THEME.store((cfg.theme as usize).min(THEMES.len() - 1), Ordering::Relaxed);
         if let Some(t) = std::env::var("OSTROVOK_THEME").ok().and_then(|v| v.parse::<usize>().ok()) {
             THEME.store(t.min(THEMES.len() - 1), Ordering::Relaxed);
@@ -1236,6 +1268,8 @@ impl App {
             thumb_gen: 0,
             weather: None,
             weather_at: None,
+            weather_err: None,
+            weather_fails: 0,
             city_edit: cfg.city.clone(),
             jarvis: jarvis::Jarvis::new(jarvis_ui::default_dir(&cfg)),
             ears: ears::Ears::new(jarvis_ui::default_dir(&cfg)),
@@ -1752,10 +1786,11 @@ impl App {
         }
         let (tx, ctx, name) = (self.tx.clone(), ctx.clone(), self.cfg.city_name.clone());
         std::thread::spawn(move || {
-            if let Ok(w) = weather::fetch(lat, lon, &name) {
-                let _ = tx.send(Msg::Weather(w));
-                ctx.request_repaint();
-            }
+            let _ = tx.send(match weather::fetch(lat, lon, &name) {
+                Ok(w) => Msg::Weather(w),
+                Err(e) => Msg::WeatherFailed(e),
+            });
+            ctx.request_repaint();
         });
     }
 
@@ -2029,7 +2064,13 @@ impl App {
                             w.city = city;
                         }
                     }
-                    self.weather = Some(w)
+                    self.weather = Some(w);
+                    self.weather_err = None;
+                    self.weather_fails = 0;
+                }
+                Msg::WeatherFailed(e) => {
+                    self.weather_err = Some(e);
+                    self.weather_fails = self.weather_fails.saturating_add(1);
                 }
                 Msg::Notice(n) => {
                     // цвет значка — по мессенджеру
@@ -2346,7 +2387,7 @@ impl App {
             _ => {}
         }
 
-        if self.cfg.lat.is_some() && self.weather_at.map_or(true, |t| now.duration_since(t) > Duration::from_secs(900)) {
+        if self.cfg.lat.is_some() && self.weather_at.map_or(true, |t| now.duration_since(t) > weather::retry_after(self.weather_fails)) {
             self.refresh_weather(ctx);
         }
 
@@ -3622,8 +3663,12 @@ impl App {
                 clip.text(weather_r.min + vec2(17.0, 75.0), Align2::LEFT_TOP, &w.city, FontId::proportional(11.5), DIM);
             }
             None => {
+                let city_set = self.cfg.lat.is_some();
+                let (head, _) = weather::empty_text(city_set, self.weather_err.as_deref());
+                let sub = if city_set { head } else { "укажите город" };
                 p.text(weather_r.min + vec2(16.0, 30.0), Align2::LEFT_TOP, "Погода", semi(14.0), FG);
-                p.text(weather_r.min + vec2(16.0, 51.0), Align2::LEFT_TOP, "укажите город", FontId::proportional(12.0), DIM);
+                let clip = p.with_clip_rect(weather_r.shrink2(vec2(10.0, 0.0)));
+                clip.text(weather_r.min + vec2(16.0, 51.0), Align2::LEFT_TOP, sub, FontId::proportional(12.0), DIM);
             }
         }
         if wresp.clicked() {
@@ -4487,12 +4532,18 @@ impl App {
     fn ui_weather(&mut self, ui: &mut egui::Ui) {
         let Some(w) = self.weather.clone() else {
             ui.add_space(30.0);
+            let city_set = self.cfg.lat.is_some();
+            let (head, sub) = weather::empty_text(city_set, self.weather_err.as_deref());
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new("Город не указан").font(semi(16.5)));
-                ui.label(RichText::new("Погода появится, когда вы впишете город в настройках.").color(DIM));
-                ui.add_space(6.0);
-                if jelly(ui, "Открыть настройки").clicked() {
-                    self.tab = Tab::Settings;
+                ui.label(RichText::new(head).font(semi(16.5)));
+                if !sub.is_empty() {
+                    ui.label(RichText::new(sub).color(DIM));
+                }
+                if !city_set {
+                    ui.add_space(6.0);
+                    if jelly(ui, "Открыть настройки").clicked() {
+                        self.tab = Tab::Settings;
+                    }
                 }
             });
             return;

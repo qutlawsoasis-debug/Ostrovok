@@ -240,9 +240,46 @@ pub fn advice_tips(feels: f64, wind: f64, hours: &[Hour]) -> Vec<(Tip, String)> 
     out
 }
 
+/// Подписи на месте погоды, пока данных нет: (заголовок, пояснение).
+pub fn empty_text(city_set: bool, err: Option<&str>) -> (&'static str, &'static str) {
+    match (city_set, err) {
+        (false, _) => ("Город не указан", "Погода появится, когда вы впишете город в настройках."),
+        (true, Some(_)) => ("Нет связи с сервером погоды", "Попробую снова через минуту"),
+        (true, None) => ("Загружаю погоду…", ""),
+    }
+}
+
+/// Через сколько снова спрашивать погоду: 15 минут в норме, после сбоев 1, 2, 4… минуты, не больше 15.
+pub fn retry_after(fails: u32) -> std::time::Duration {
+    const MAX: u64 = 900;
+    if fails == 0 {
+        return std::time::Duration::from_secs(MAX);
+    }
+    let secs = 1u64.checked_shl(fails - 1).and_then(|m| m.checked_mul(60)).map_or(MAX, |v| v.min(MAX));
+    std::time::Duration::from_secs(secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_texts() {
+        assert_eq!(empty_text(false, None).0, "Город не указан");
+        assert_eq!(empty_text(false, Some("x")).0, "Город не указан");
+        assert_eq!(empty_text(true, Some("x")), ("Нет связи с сервером погоды", "Попробую снова через минуту"));
+        assert_eq!(empty_text(true, None), ("Загружаю погоду…", ""));
+    }
+    #[test]
+    fn retry_backoff() {
+        use std::time::Duration as D;
+        assert_eq!(retry_after(0), D::from_secs(900));
+        assert_eq!(retry_after(1), D::from_secs(60));
+        assert_eq!(retry_after(2), D::from_secs(120));
+        assert_eq!(retry_after(4), D::from_secs(480));
+        assert_eq!(retry_after(5), D::from_secs(900));
+        assert_eq!(retry_after(64), D::from_secs(900));
+        assert_eq!(retry_after(u32::MAX), D::from_secs(900));
+    }
     #[test]
     fn colors() {
         assert_eq!(temp_rgb(-40.0), [110, 140, 255]);
