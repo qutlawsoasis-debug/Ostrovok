@@ -6804,7 +6804,11 @@ impl App {
             Tab::Shot => 306.0,
             Tab::Clip => 340.0 + if self.clip_imgs.is_empty() { 0.0 } else { 72.0 },
             Tab::Inbox => 340.0,
-            Tab::Notes => 340.0,
+            // заметка с чек-листом: страница выше, чтобы пункты и редактор не теснили друг друга
+            Tab::Notes => {
+                let items = self.notes.get(self.note_sel).map_or(0, |n| store::check_items(n).len());
+                340.0 + (items.min(5) as f32 * 34.0 + if items > 0 { 30.0 } else { 0.0 })
+            }
             Tab::Todo => 366.0,
             Tab::System => if self.stats.battery.is_some() { 416.0 } else { 394.0 },
             Tab::Settings => 528.0,
