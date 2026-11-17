@@ -1410,6 +1410,18 @@ impl App {
                 app.push_inbox(live::Notice { app: "Telegram".into(), title: "Мирон".into(), body: "привет".into() }, [0x2A, 0xAB, 0xEE]);
             }
         }
+        // для снимков праздников в календаре: OSTROVOK_CALDAY=11-04 — открыть этот день (ближайший впереди)
+        if let Some(v) = std::env::var("OSTROVOK_CALDAY").ok().filter(|_| test_mode()) {
+            use chrono::Datelike;
+            let today = chrono::Local::now().date_naive();
+            if let Some((m, d)) = v.split_once('-').and_then(|(m, d)| Some((m.parse::<u32>().ok()?, d.parse::<u32>().ok()?))) {
+                let pick = chrono::NaiveDate::from_ymd_opt(today.year(), m, d).map(|x| if x < today { chrono::NaiveDate::from_ymd_opt(today.year() + 1, m, d).unwrap_or(x) } else { x });
+                if let Some(x) = pick {
+                    app.cal_sel = Some(x);
+                    app.cal_shift = (x.year() * 12 + x.month0() as i32) - (today.year() * 12 + today.month0() as i32);
+                }
+            }
+        }
         // для снимков отложенного сна на «Управлении»: OSTROVOK_POWERTIMER=30 (в тестовом режиме по истечении ничего не делает)
         if let Some(m) = std::env::var("OSTROVOK_POWERTIMER").ok().and_then(|v| v.parse::<u64>().ok()).filter(|_| test_mode()) {
             app.power_timer = Some(("sleep", Instant::now() + Duration::from_secs(m * 60 - 19), false));
@@ -5760,6 +5772,7 @@ impl App {
                 let resp = ui.interact(Rect::from_center_size(at, vec2(cell.x.min(40.0), 29.0)), ui.id().with(("cal-day", year, month0, day)), Sense::click());
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
                 let (is_today, is_sel) = (date == today, date == sel);
+                let fest = ru_holiday(month0 + 1, day).is_some();
                 if is_today {
                     p.circle_filled(at, 13.0, accent());
                 } else if is_sel {
@@ -5774,13 +5787,20 @@ impl App {
                 let color = if is_today {
                     BG
                 } else if date < today {
-                    mix(if col >= 5 { mix(weekend, DIM, 0.4) } else { DIM }, BG, 0.4)
-                } else if col >= 5 {
+                    mix(if col >= 5 || fest { mix(weekend, DIM, 0.4) } else { DIM }, BG, 0.4)
+                } else if col >= 5 || fest {
                     weekend
                 } else {
                     FG
                 };
                 p.text(at, Align2::CENTER_CENTER, day.to_string(), semi(13.5), color);
+                // праздник — маленькая коралловая звёздочка справа сверху
+                if fest {
+                    let star = at + vec2(10.5, -9.5);
+                    let tone = if date < today { mix(weekend, BG, 0.4) } else { weekend };
+                    p.circle_filled(star, 2.6, tone);
+                    p.circle_filled(star, 4.5, Color32::from_rgba_unmultiplied(weekend.r(), weekend.g(), weekend.b(), 40));
+                }
                 // точки — сколько на этот день дел (не больше трёх)
                 let n = dated.iter().filter(|d| d.1 == date).count().min(3);
                 for k in 0..n {
@@ -5806,9 +5826,14 @@ impl App {
             };
             ui.label(RichText::new(format!("{} {}", sel.day(), OF_MONTH[sel.month0() as usize])).font(light(26.0)).color(FG));
             ui.label(RichText::new(format!("{} · {when}", DAYS[sel.weekday().num_days_from_monday() as usize])).color(DIM));
+            // праздник выбранного дня: строка коралловым, список дел на неё короче — страница не растёт
+            let fest = ru_holiday(sel.month(), sel.day());
+            if let Some(name) = fest {
+                ui.label(RichText::new(format!("\u{E734}  {name}")).font(semi(12.5)).color(Color32::from_rgb(0xFF, 0x9A, 0x8A)));
+            }
             ui.add_space(6.0);
             let mine: Vec<&(usize, NaiveDate, String, String)> = dated.iter().filter(|d| d.1 == sel).collect();
-            egui::ScrollArea::vertical().max_height(118.0).auto_shrink([false, true]).show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(if fest.is_some() { 98.0 } else { 118.0 }).auto_shrink([false, true]).show(ui, |ui| {
                 if mine.is_empty() {
                     ui.label(RichText::new(if sel < today { "В этот день дел не было." } else { "На этот день дел нет." }).color(DIM));
                 }
@@ -7483,6 +7508,42 @@ fn glass_shade(g: [u8; 3]) -> [u8; 3] {
 /// Ширина мини-пилюли: глаза слева (28), название, поле справа (12).
 fn theme_preview_w(name_w: f32) -> f32 {
     28.0 + name_w + 12.0
+}
+
+/// Официальные праздничные дни России (ст. 112 ТК РФ). Переносы выходных не учитываются.
+fn ru_holiday(month: u32, day: u32) -> Option<&'static str> {
+    Some(match (month, day) {
+        (1, 1) => "Новый год",
+        (1, 7) => "Рождество Христово",
+        (1, 2..=8) => "Новогодние каникулы",
+        (2, 23) => "День защитника Отечества",
+        (3, 8) => "Международный женский день",
+        (5, 1) => "Праздник Весны и Труда",
+        (5, 9) => "День Победы",
+        (6, 12) => "День России",
+        (11, 4) => "День народного единства",
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod holiday_tests {
+    use super::*;
+    #[test]
+    fn russian_holidays() {
+        assert_eq!(ru_holiday(1, 1), Some("Новый год"));
+        assert_eq!(ru_holiday(1, 5), Some("Новогодние каникулы"));
+        assert_eq!(ru_holiday(1, 7), Some("Рождество Христово"));
+        assert_eq!(ru_holiday(1, 9), None);
+        assert_eq!(ru_holiday(2, 23), Some("День защитника Отечества"));
+        assert_eq!(ru_holiday(3, 8), Some("Международный женский день"));
+        assert_eq!(ru_holiday(5, 1), Some("Праздник Весны и Труда"));
+        assert_eq!(ru_holiday(5, 9), Some("День Победы"));
+        assert_eq!(ru_holiday(6, 12), Some("День России"));
+        assert_eq!(ru_holiday(11, 4), Some("День народного единства"));
+        assert_eq!(ru_holiday(11, 17), None);
+        assert_eq!(ru_holiday(13, 1), None);
+    }
 }
 
 #[cfg(test)]
