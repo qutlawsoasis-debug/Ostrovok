@@ -4726,7 +4726,9 @@ impl App {
                     .enumerate()
                     .map(|(i, v)| {
                         let val = if which == 0 { v.0 } else { v.1 };
-                        pos2(plot.right() - plot.width() * (n - 1 - i) as f32 / 119.0, plot.bottom() - plot.height() * val.clamp(0.0, 1.0))
+                        // пока замеров мало, график растянут шире: первые точки не жмутся к правому краю
+                        let span = (n.max(30) - 1) as f32;
+                        pos2(plot.right() - plot.width() * (n - 1 - i) as f32 / span.min(119.0), plot.bottom() - plot.height() * val.clamp(0.0, 1.0))
                     })
                     .collect();
                 let mut mesh = egui::Mesh::default();
