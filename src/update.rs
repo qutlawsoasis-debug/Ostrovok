@@ -268,8 +268,23 @@ pub fn cleanup() {
         if let Ok(exe) = std::env::current_exe() {
             let _ = std::fs::remove_file(exe.with_extension("broken.exe"));
         }
-        let _ = std::fs::remove_dir_all(dir());
+        // папку целиком не стираем: проверка за эту минуту могла уже скачать (или качать) новую версию
+        if let Ok(list) = std::fs::read_dir(dir()) {
+            let cur = current();
+            for e in list.flatten() {
+                if stale_update_file(&e.file_name().to_string_lossy(), &cur) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
     });
+}
+
+/// Устаревший файл в папке обновлений: «Ostrovok-<версия>.exe/.txt» не новее работающей версии.
+fn stale_update_file(name: &str, cur: &str) -> bool {
+    let Some(rest) = name.strip_prefix("Ostrovok-") else { return false };
+    let ver = rest.strip_suffix(".exe").or_else(|| rest.strip_suffix(".txt"));
+    ver.is_some_and(|v| parse(v).is_some() && !newer(v, cur))
 }
 
 #[cfg(test)]
@@ -283,6 +298,17 @@ mod tests {
         assert!(!newer("v0.1.7", "0.1.7"));
         assert!(!newer("v0.1.6", "0.1.7"));
         assert!(!newer("мусор", "0.1.7"));
+    }
+
+    #[test]
+    fn cleanup_keeps_fresh_download() {
+        // уборка после обновления не должна стирать то, что проверка только что скачала (или качает)
+        assert!(stale_update_file("Ostrovok-0.1.58.exe", "0.1.59"));
+        assert!(stale_update_file("Ostrovok-0.1.59.txt", "0.1.59"));
+        assert!(!stale_update_file("Ostrovok-0.1.60.exe", "0.1.59"), "скачанная новая версия ждёт установки");
+        assert!(!stale_update_file("Ostrovok-0.1.60.txt", "0.1.59"));
+        assert!(!stale_update_file("Ostrovok.part", "0.1.59"), "идёт загрузка");
+        assert!(!stale_update_file("что-то.exe", "0.1.59"));
     }
 
     #[test]
