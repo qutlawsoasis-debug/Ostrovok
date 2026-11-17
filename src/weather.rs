@@ -275,6 +275,11 @@ fn city_reply_generations() {
     assert!(!city_reply_fresh(0, u64::MAX));
 }
 
+/// Ответ о городе принимается, только если это ответ на последний запрос и поколение актуально.
+pub fn city_reply_accept(gen: u64, cur_gen: u64, req: u64, cur_req: u64) -> bool {
+    req == cur_req && city_reply_fresh(gen, cur_gen)
+}
+
 pub fn reply_fresh(reply: u64, current: u64) -> bool {
     reply == current
 }
@@ -361,4 +366,14 @@ mod tests {
 pub fn deg(t: f64) -> String {
     let r = t.round() as i64;
     format!("{r}°")
+}
+
+#[cfg(test)]
+#[test]
+fn city_reply_last_request_wins() {
+    assert!(!city_reply_accept(1, 0, 1, 2));
+    assert!(city_reply_accept(1, 0, 2, 2));
+    assert!(city_reply_accept(1, 1, 2, 2));
+    assert!(!city_reply_accept(0, 0, 3, 4));
+    assert!(!city_reply_accept(1, 1, 1, 2));
 }

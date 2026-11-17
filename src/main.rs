@@ -363,7 +363,9 @@ enum Emotion {
 
 enum Msg {
     Note(String),
-    City(u64, f64, f64, String),
+    City(u64, u64, f64, f64, String),
+    /// неудача поиска города: (номер запроса, текст)
+    CityFailed(u64, String),
     Weather(u64, weather::Now),
     WeatherFailed(u64, String),
     Ai(Result<String, String>),
@@ -949,6 +951,8 @@ struct App {
     weather_fails: u32,
     /// поколение запросов погоды: ответы для прежнего города отбрасываются
     weather_gen: u64,
+    /// номер последнего запроса города: принимается только ответ на него
+    city_req: u64,
     cfg: store::Settings,
     city_edit: String,
     autostart: bool,
@@ -1281,6 +1285,7 @@ impl App {
             weather_err: None,
             weather_fails: 0,
             weather_gen: 0,
+            city_req: 0,
             city_edit: cfg.city.clone(),
             jarvis: jarvis::Jarvis::new(jarvis_ui::default_dir(&cfg)),
             ears: ears::Ears::new(jarvis_ui::default_dir(&cfg)),
@@ -1850,11 +1855,12 @@ impl App {
             // проверяем один раз за всю жизнь настроек: город, выбранный вручную после этого, не трогаем
             self.cfg.city_checked = true;
             self.cfg.save();
+            let req = self.city_req;
             let (tx, ctx, city) = (self.tx.clone(), ctx.clone(), self.cfg.city.clone());
             std::thread::spawn(move || {
                 if let Ok(Some((la, lo, name))) = weather::geocode(&city) {
                     if weather::fits_zone(lo, weather::local_offset_hours()) {
-                        let _ = tx.send(Msg::City(gen, la, lo, name));
+                        let _ = tx.send(Msg::City(gen, req, la, lo, name));
                         ctx.request_repaint();
                     }
                 }
@@ -1871,6 +1877,8 @@ impl App {
     }
 
     fn save_city(&mut self, ctx: &egui::Context) {
+        self.city_req += 1;
+        let req = self.city_req;
         // ответ о новом городе придёт с поколением +1 и только тогда сделает прежние запросы устаревшими:
         // если город не найдётся, текущая погода и её повторы продолжают работать
         let gen = self.weather_gen + 1;
@@ -1892,9 +1900,9 @@ impl App {
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let msg = match weather::geocode(&city) {
-                Ok(Some((lat, lon, name))) => Msg::City(gen, lat, lon, name),
-                Ok(None) => Msg::Note("Город не найден".into()),
-                Err(_) => Msg::Note("Нет связи с сервером погоды".into()),
+                Ok(Some((lat, lon, name))) => Msg::City(gen, req, lat, lon, name),
+                Ok(None) => Msg::CityFailed(req, "Город не найден".into()),
+                Err(_) => Msg::CityFailed(req, "Нет связи с сервером погоды".into()),
             };
             let _ = tx.send(msg);
             ctx.request_repaint();
@@ -2283,8 +2291,13 @@ impl App {
                         }
                     }
                 }
-                Msg::City(gen, lat, lon, name) => {
-                    if !weather::city_reply_fresh(gen, self.weather_gen) {
+                Msg::CityFailed(req, text) => {
+                    if req == self.city_req {
+                        self.notify(&text);
+                    }
+                }
+                Msg::City(gen, req, lat, lon, name) => {
+                    if !weather::city_reply_accept(gen, self.weather_gen, req, self.city_req) {
                         continue;
                     }
                     if gen != self.weather_gen {
@@ -2687,6 +2700,7 @@ impl App {
 
     /// Персонаж в пилюле. Прорисовка глаз и персонажей перенесена из Atoll (Views/CharacterView.cs, MIT).
     fn draw_face(&self, p: &egui::Painter, o: Pos2, look: Vec2, now: Instant) {
+        // все множители t в sin/cos должны быть кратны 0.1: фаза оборачивается по RIPPLE_PERIOD = 150π
         let t = self.ripple_phase / 7.5;
         let playing = self.media_now.as_ref().is_some_and(|m| m.playing);
         let emo = self.emotion;
@@ -6928,7 +6942,7 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let now = Instant::now();
-        let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.05);
+        let dt = frame_dt(ctx.input(|i| i.stable_dt));
         let time = ctx.input(|i| i.time);
         self.pump(ctx, now);
         let palette_open = self.mode == Mode::Palette;
@@ -7141,12 +7155,12 @@ impl eframe::App for App {
         if self.ripple < 0.03 {
             self.ripple = 0.0;
         }
-        self.ripple_phase += dt * 7.5;
-        self.drip_phase += dt * 2.6;
+        self.ripple_phase = wrap_phase(self.ripple_phase + dt * 7.5, RIPPLE_PERIOD);
+        self.drip_phase = wrap_phase(self.drip_phase + dt * 2.6, DRIP_PERIOD);
         // остров-колба: жидкость внутри пилюли. Уровень что-то значит, поверхность живая.
         let flask = self.flask_on();
         let mut sloshing = false;
-        if flask {
+        if flask && !self.liq_h.is_empty() && self.liq_v.len() == self.liq_h.len() {
             let n = self.liq_h.len();
             if let Some(c) = cursor {
                 // курсор рядом баламутит поверхность, как палец у воды
@@ -7826,9 +7840,13 @@ impl App {
         let half = (rin * rin - dxc * dxc).max(0.0).sqrt();
         let (top_b, bot_b) = (cy - half, cy + half);
         let n = self.liq_h.len();
-        let f = ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0) * (n as f32 - 1.0);
-        let i = f as usize;
-        let wave = self.liq_h[i] + (self.liq_h[(i + 1).min(n - 1)] - self.liq_h[i]) * (f - i as f32);
+        let wave = if n == 0 {
+            0.0
+        } else {
+            let f = ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0) * (n as f32 - 1.0);
+            let i = f as usize;
+            self.liq_h[i] + (self.liq_h[(i + 1).min(n - 1)] - self.liq_h[i]) * (f - i as f32)
+        };
         let ys = cy + rin - self.level * 2.0 * rin + wave;
         (ys.clamp(top_b, bot_b), bot_b, ys > top_b + 0.3 && ys < bot_b - 0.3)
     }
@@ -10024,5 +10042,54 @@ mod wipe_tests {
         let mut s = String::from("пароль123");
         super::wipe_string(&mut s);
         assert!(s.is_empty());
+    }
+}
+
+/// Шаг кадра: мусор (NaN, бесконечность) — как обычный кадр 60 Гц, иначе в разумных пределах.
+fn frame_dt(raw: f32) -> f32 {
+    if raw.is_finite() { raw.clamp(0.001, 0.05) } else { 1.0 / 60.0 }
+}
+
+/// Период фазы волны: phase идёт в sin с множителем 1, а лицо берёт t = phase/7.5
+/// с множителями, кратными 0.1, — t повторяется через 20π, фаза через 150π.
+const RIPPLE_PERIOD: f32 = 150.0 * std::f32::consts::PI;
+/// Период фазы капель: множители 1, 0.7, 2.6, 37 — все кратны 0.1, общий период 20π.
+const DRIP_PERIOD: f32 = 20.0 * std::f32::consts::PI;
+
+/// Держит растущую фазу в [0, period), чтобы f32 не терял точность за дни работы.
+fn wrap_phase(p: f32, period: f32) -> f32 {
+    if !p.is_finite() {
+        return 0.0;
+    }
+    let w = p.rem_euclid(period);
+    if w >= period { 0.0 } else { w }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    #[test]
+    fn frame_dt_sane() {
+        assert_eq!(frame_dt(0.0), 0.001);
+        assert_eq!(frame_dt(-1.0), 0.001);
+        assert_eq!(frame_dt(1e9), 0.05);
+        assert_eq!(frame_dt(f32::NAN), 1.0 / 60.0);
+        assert_eq!(frame_dt(f32::INFINITY), 1.0 / 60.0);
+        assert_eq!(frame_dt(0.02), 0.02);
+    }
+
+    #[test]
+    fn phases_wrap_without_jump() {
+        for &(p, m) in &[(RIPPLE_PERIOD, [1.0f32, 1.0 / 7.5 * 2.2, 1.0 / 7.5 * 55.0]), (DRIP_PERIOD, [0.7, 2.6, 37.0])] {
+            let before = p - 0.01;
+            let after = wrap_phase(before + 0.02, p);
+            assert!(after < 0.02 && after >= 0.0);
+            for k in m {
+                assert!((((before + 0.02) * k).sin() - (after * k).sin()).abs() < 2e-3, "рывок при множителе {k}");
+            }
+        }
+        assert_eq!(wrap_phase(1.0, DRIP_PERIOD), 1.0);
+        assert!(wrap_phase(f32::NAN, DRIP_PERIOD) == 0.0);
     }
 }
