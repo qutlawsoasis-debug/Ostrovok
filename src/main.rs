@@ -395,6 +395,24 @@ enum Action {
     Quick(Quick),
 }
 
+/// Запоминать ли запрос в «Недавнем»: программы, сайты, ответы и таймеры. Быстрые команды
+/// («заметка …», «дело …», «напомни …») и вопросы к ИИ несут личный текст — их не храним.
+fn recent_worthy(a: &Action) -> bool {
+    matches!(a, Action::Launch(_) | Action::Url(_) | Action::Copy(_) | Action::Timer(_))
+}
+
+/// Кладёт запрос в начало «Недавнего»: без повторов (без учёта регистра), не больше пяти, до 60 символов.
+fn push_recent(list: &mut Vec<String>, q: &str) {
+    let q = q.trim();
+    if q.is_empty() || q.chars().count() > 60 {
+        return;
+    }
+    let low = q.to_lowercase();
+    list.retain(|r| r.to_lowercase() != low);
+    list.insert(0, q.to_string());
+    list.truncate(5);
+}
+
 /// Быстрые команды строки поиска: «дело …», «заметка …», «напомни 18:30 …».
 #[derive(Clone, Debug, PartialEq)]
 enum Quick {
@@ -1479,6 +1497,10 @@ impl App {
         }
         // для снимков: открыть строку поиска с готовым запросом
         if let Ok(q) = std::env::var("OSTROVOK_QUERY") {
+            // для снимка пустого поля — выдуманное «Недавнее» вместо настоящего
+            if test_mode() {
+                app.cfg.recent = ["100 usd в рублях", "время токио", "калькулятор", "таймер 25"].map(String::from).to_vec();
+            }
             app.query = q;
             app.build_results();
             app.palette_demo = true;
@@ -6296,6 +6318,56 @@ impl App {
         ui.add_space(4.0);
         ui.spacing_mut().item_spacing.y = 2.0;
         if self.query.trim().is_empty() {
+            // недавнее: последние запросы, по которым что-то запускали; щелчок подставляет
+            let mut pick_recent: Option<String> = None;
+            let mut forget = false;
+            if !self.cfg.recent.is_empty() {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(RichText::new("\u{E81C}").size(12.0).color(DIM));
+                    ui.label(RichText::new("Недавнее").size(11.5).color(DIM));
+                    let room = ui.available_width() - 30.0;
+                    let mut used = 0.0;
+                    for q in &self.cfg.recent {
+                        let w = ui.painter().layout_no_wrap(q.clone(), FontId::proportional(12.5), FG).size().x + 22.0;
+                        if used + w > room {
+                            break; // не помещается — остальные не показываем, чтобы ряд не переносился
+                        }
+                        used += w + 6.0;
+                        let (r, resp) = ui.allocate_exact_size(vec2(w, 26.0), Sense::click());
+                        let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
+                        let p = ui.painter();
+                        p.rect_filled(r, Rounding::same(13.0), mix(rgba(255, 255, 255, 10), accent().gamma_multiply(0.25), hov));
+                        p.rect_stroke(r, Rounding::same(13.0), Stroke::new(1.0_f32, mix(rgba(255, 255, 255, 26), accent(), hov)));
+                        p.text(r.center(), Align2::CENTER_CENTER, q, FontId::proportional(12.5), mix(DIM, FG, 0.6 + 0.4 * hov));
+                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            pick_recent = Some(q.clone());
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (r, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
+                        let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
+                        if hov > 0.0 {
+                            ui.painter().circle_filled(r.center(), 11.0, rgba(255, 255, 255, (30.0 * hov) as u8));
+                        }
+                        ui.painter().text(r.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(9.5), mix(DIM, FG, hov));
+                        if resp.on_hover_text("Забыть недавнее").clicked() {
+                            forget = true;
+                        }
+                    });
+                });
+            }
+            if forget {
+                self.cfg.recent.clear();
+                self.cfg.save();
+            }
+            if let Some(q) = pick_recent {
+                self.query = q;
+                self.build_results();
+                self.sel = 0;
+                self.focus_query = true;
+            }
             // примеры: щелчок подставляет запрос
             let mut pick: Option<&str> = None;
             ui.add_space(4.0);
@@ -6389,6 +6461,14 @@ impl App {
         }
         if let Some(i) = run {
             let action = self.results[i].action.clone();
+            // cfg.save сам ничего не пишет в проверочном запуске
+            // вставленное из буфера (там бывают пароли и личное) на диск не попадает
+            let pasted = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()).is_some_and(|t| t.trim() == self.query.trim());
+            if recent_worthy(&action) && !pasted {
+                let q = self.query.clone();
+                push_recent(&mut self.cfg.recent, &q);
+                self.cfg.save();
+            }
             self.run(action);
         }
     }
@@ -6561,7 +6641,9 @@ impl eframe::App for App {
             Mode::Palette => {
                 let n = self.results.len() as f32;
                 // пустой запрос — под полем ряд примеров
-                let hints = if self.query.trim().is_empty() { 40.0 } else { 0.0 };
+                // и, если есть, ряд «Недавнее» над ним (26 px + отступы)
+                let recent = if self.cfg.recent.is_empty() { 0.0 } else { 34.0 };
+                let hints = if self.query.trim().is_empty() { 40.0 + recent } else { 0.0 };
                 vec2(PANEL_W, 50.0 + n * ROW_H + if n > 0.0 { 10.0 } else { 0.0 } + hints)
             }
         };
@@ -8722,6 +8804,37 @@ fn load_thumb(path: &str) -> Option<(usize, usize, Vec<u8>)> {
     reader.limits(limits);
     let img = reader.decode().ok()?.thumbnail(176, 176).into_rgba8();
     Some((img.width() as usize, img.height() as usize, img.into_raw()))
+}
+
+#[cfg(test)]
+mod recent_tests {
+    use super::*;
+
+    #[test]
+    fn push_dedup_cap() {
+        let mut r = Vec::new();
+        for q in ["таймер 5", "notepad", "100 usd в рублях", "время токио", "до нового года", "калькулятор"] {
+            push_recent(&mut r, q);
+        }
+        assert_eq!(r, vec!["калькулятор", "до нового года", "время токио", "100 usd в рублях", "notepad"]);
+        push_recent(&mut r, "  Время Токио ");
+        assert_eq!(r[0], "Время Токио", "повтор поднимается наверх, без дубля");
+        assert_eq!(r.len(), 5);
+        push_recent(&mut r, "   ");
+        push_recent(&mut r, &"я".repeat(61));
+        assert_eq!(r[0], "Время Токио", "пустое и слишком длинное не сохраняем");
+    }
+
+    #[test]
+    fn what_is_remembered() {
+        assert!(recent_worthy(&Action::Launch("C:\\x.exe".into())));
+        assert!(recent_worthy(&Action::Url("https://ya.ru".into())));
+        assert!(recent_worthy(&Action::Copy("42".into())));
+        assert!(recent_worthy(&Action::Timer(5.0)));
+        assert!(!recent_worthy(&Action::Ask("вопрос".into())));
+        assert!(!recent_worthy(&Action::Quick(Quick::Note("личное".into()))));
+        assert!(!recent_worthy(&Action::Quick(Quick::Todo("дело".into()))));
+    }
 }
 
 #[cfg(test)]
