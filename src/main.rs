@@ -1178,6 +1178,10 @@ struct App {
     sw_start: Option<Instant>,
     sw_acc: Duration,
     cal_shift: i32,
+    /// кэш календаря: ключ и (номер напоминания, срок) в окне месяца
+    cal_occ: Option<(u64, Vec<(usize, i64)>)>,
+    /// кэш ленты дня: ключ и отметки (доля суток, текст)
+    marks_occ: Option<(u64, Vec<(f32, String)>)>,
     /// выбранный в календаре день (None — сегодня) и поля нового дела на него
     cal_sel: Option<chrono::NaiveDate>,
     cal_text: String,
@@ -1467,6 +1471,8 @@ impl App {
             sw_start: None,
             sw_acc: Duration::ZERO,
             cal_shift: 0,
+            cal_occ: None,
+            marks_occ: None,
             cal_sel: None,
             cal_text: String::new(),
             cal_time: String::new(),
@@ -2033,9 +2039,9 @@ impl App {
         // ответ про дату не прячет «Спросить ИИ» (быстрые команды и конвертер — прячут)
         let converted = self.results.len() > date_items;
 
-        let is_expr = q.chars().all(|c| c.is_ascii_digit() || " +-*/().,".contains(c))
+        let is_expr = q.chars().all(|c| c.is_ascii_digit() || " +-*/^().,".contains(c))
             && q.chars().any(|c| c.is_ascii_digit())
-            && q.chars().any(|c| "+-*/".contains(c));
+            && q.chars().any(|c| "+-*/^".contains(c));
         if is_expr {
             if let Some(v) = sys::eval(&q) {
                 let s = fmt_num(v);
@@ -4196,7 +4202,11 @@ impl App {
         let midnight = now.date_naive().and_hms_opt(0, 0, 0).and_then(|m| m.and_local_timezone(chrono::Local).earliest()).map_or(now.timestamp() - 43_200, |m| m.timestamp());
         // в день перевода часов сутки длятся 23 или 25 часов
         let day_len = now.date_naive().succ_opt().and_then(|d| d.and_hms_opt(0, 0, 0)).and_then(resolve_here).map(|m| m.timestamp() - midnight).filter(|l| *l > 0).unwrap_or(86_400);
-        let marks = day_marks(&self.cfg.reminders, midnight, day_len);
+        let mkey = reminders_key(&self.cfg.reminders, midnight, midnight + day_len);
+        if self.marks_occ.as_ref().map(|c| c.0) != Some(mkey) {
+            self.marks_occ = Some((mkey, day_marks(&self.cfg.reminders, midnight, day_len)));
+        }
+        let marks = self.marks_occ.as_ref().map(|c| c.1.clone()).unwrap_or_default();
         let frac_now = ((now.timestamp() - midnight) as f32 / day_len as f32).clamp(0.0, 1.0);
         let left_n = marks.iter().filter(|m| m.0 > frac_now).count();
         let shov = ui.ctx().animate_bool_with_time(sresp.id.with("hov"), sresp.hovered(), 0.12);
@@ -6176,6 +6186,7 @@ impl App {
             }
             if switch_row(ui, &mut self.autostart, "Запуск вместе с Windows", "") {
                 store::set_autostart(self.autostart);
+                self.autostart = store::autostart_enabled();
             }
             let state = self.upd.lock().unwrap().clone();
             let note = match &state {
@@ -6437,14 +6448,32 @@ impl App {
         let days = next.map_or(30, |n| (n - first).num_days()) as u32;
         let offset = first.weekday().num_days_from_monday();
         // на какой день приходится каждое напоминание
-        let dated: Vec<(usize, NaiveDate, String, String)> = self
-            .cfg
-            .reminders
+        // окно: весь видимый месяц и выбранный день; повторы разворачиваются в отдельные сроки
+        let midnight = |d: NaiveDate| resolve_here(d.and_time(NaiveTime::MIN)).map_or(0, |x| x.timestamp());
+        let win_from = midnight(first.min(sel));
+        let win_to = midnight(next.unwrap_or(first + chrono::Duration::days(31)).max(sel + chrono::Duration::days(1)));
+        let ckey = reminders_key(&self.cfg.reminders, win_from, win_to);
+        if self.cal_occ.as_ref().map(|c| c.0) != Some(ckey) {
+            let occ: Vec<(usize, i64)> = self
+                .cfg
+                .reminders
+                .iter()
+                .enumerate()
+                .flat_map(|(i, r)| occurrences(r, win_from, win_to).into_iter().map(move |ts| (i, ts)))
+                .collect();
+            self.cal_occ = Some((ckey, occ));
+        }
+        let reminders = &self.cfg.reminders;
+        let dated: Vec<(usize, NaiveDate, String, String, i64, bool)> = self
+            .cal_occ
+            .as_ref()
+            .map(|c| c.1.as_slice())
+            .unwrap_or_default()
             .iter()
-            .enumerate()
-            .filter_map(|(i, r)| {
-                let d = chrono::DateTime::from_timestamp(r.at, 0)?.with_timezone(&Local);
-                Some((i, d.date_naive(), d.format("%H:%M").to_string(), r.text.clone()))
+            .filter_map(|&(i, ts)| {
+                let r = reminders.get(i)?;
+                let d = chrono::DateTime::from_timestamp(ts, 0)?.with_timezone(&Local);
+                Some((i, d.date_naive(), d.format("%H:%M").to_string(), r.text.clone(), ts, ts == r.at))
             })
             .collect();
 
@@ -6545,12 +6574,13 @@ impl App {
                 ui.label(RichText::new(format!("\u{E734}  {name}")).font(semi(12.5)).color(Color32::from_rgb(0xFF, 0x9A, 0x8A)));
             }
             ui.add_space(6.0);
-            let mine: Vec<&(usize, NaiveDate, String, String)> = dated.iter().filter(|d| d.1 == sel).collect();
+            let mut mine: Vec<&(usize, NaiveDate, String, String, i64, bool)> = dated.iter().filter(|d| d.1 == sel).collect();
+            mine.sort_by_key(|d| d.4);
             egui::ScrollArea::vertical().max_height(if fest.is_some() { 98.0 } else { 118.0 }).auto_shrink([false, true]).show(ui, |ui| {
                 if mine.is_empty() {
                     ui.label(RichText::new(if sel < today { "В этот день дел не было." } else { "На этот день дел нет." }).color(DIM));
                 }
-                for (i, _, time, text) in mine {
+                for (i, _, time, text, ts, orig) in mine {
                     let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
                     glass_chip(ui.painter(), row, 10.0, 0.45);
                     let p = ui.painter().with_clip_rect(row.shrink2(vec2(0.0, 0.0)));
@@ -6558,10 +6588,15 @@ impl App {
                     p.with_clip_rect(Rect::from_min_max(pos2(row.left() + 58.0, row.top()), pos2(row.right() - 34.0, row.bottom())))
                         .text(pos2(row.left() + 58.0, row.center().y), Align2::LEFT_CENTER, text, FontId::proportional(13.0), FG);
                     let x = Rect::from_center_size(pos2(row.right() - 18.0, row.center().y), vec2(26.0, 26.0));
-                    let resp = ui.interact(x, ui.id().with(("cal-del", *i)), Sense::click());
-                    ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(12.0), if resp.hovered() { FG } else { DIM });
-                    if resp.clicked() {
-                        remove = Some(*i);
+                    if *orig {
+                        let resp = ui.interact(x, ui.id().with(("cal-del", *i, *ts)), Sense::click());
+                        ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(12.0), if resp.hovered() { FG } else { DIM });
+                        if resp.clicked() {
+                            remove = Some(*i);
+                        }
+                    } else {
+                        ui.interact(x, ui.id().with(("cal-rep", *i, *ts)), Sense::hover()).on_hover_text("Повтор");
+                        ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E8EE}", FontId::proportional(12.0), DIM);
                     }
                     ui.add_space(3.0);
                 }
@@ -8148,11 +8183,22 @@ fn apply_city(cfg: &mut store::Settings, query: &str, lat: f64, lon: f64, name: 
     cfg.city_checked = true;
 }
 
+/// Ключ кэша развёрнутых повторов: окно и (срок, повтор, текст) каждого напоминания.
+fn reminders_key(list: &[store::Reminder], from: i64, to: i64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (from, to, list.len()).hash(&mut h);
+    for r in list {
+        (r.at, r.repeat, &r.text).hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Лента дня: сегодняшние напоминания как доля суток (0..1) и текст, по порядку.
 fn day_marks(list: &[store::Reminder], day_start: i64, day_len: i64) -> Vec<(f32, String)> {
-    let mut v: Vec<&store::Reminder> = list.iter().filter(|r| r.at >= day_start && r.at < day_start + day_len).collect();
-    v.sort_by_key(|r| r.at);
-    v.into_iter().map(|r| ((r.at - day_start) as f32 / day_len as f32, r.text.clone())).collect()
+    let mut v: Vec<(i64, &store::Reminder)> = list.iter().flat_map(|r| occurrences(r, day_start, day_start + day_len).into_iter().map(move |ts| (ts, r))).collect();
+    v.sort_by_key(|(ts, _)| *ts);
+    v.into_iter().map(|(ts, r)| ((ts - day_start) as f32 / day_len as f32, r.text.clone())).collect()
 }
 
 /// «1 дело», «3 дела», «5 дел».
@@ -8547,6 +8593,43 @@ fn next_due(at: chrono::NaiveDateTime, repeat: u8, now: chrono::NaiveDateTime) -
     None
 }
 
+/// Сроки напоминания в окне [from, to): исходный и будущие повторы (только для показа).
+/// `start` — местное время исходного срока, `from_naive` — местное начало окна.
+#[allow(clippy::too_many_arguments)]
+fn occurrences_in<T: chrono::TimeZone>(start: chrono::NaiveDateTime, from_naive: chrono::NaiveDateTime, at: i64, repeat: u8, from: i64, to: i64, max: usize, lookup: impl Fn(chrono::NaiveDateTime) -> chrono::LocalResult<chrono::DateTime<T>>) -> Vec<i64> {
+    let mut out = Vec::new();
+    if from <= at && at < to {
+        out.push(at);
+    }
+    if repeat == 0 || at >= to {
+        return out;
+    }
+    let skip = (from_naive - chrono::Duration::days(1)).max(start);
+    let Some(mut n) = next_due(start, repeat, skip) else { return out };
+    for _ in 0..max {
+        let Some(ts) = resolve_local(n, &lookup).map(|d| d.timestamp()) else { break };
+        if ts >= to {
+            break;
+        }
+        if ts >= from && ts > at {
+            out.push(ts);
+        }
+        match next_due(n, repeat, n) {
+            Some(x) => n = x,
+            None => break,
+        }
+    }
+    out
+}
+
+/// То же для пояса машины.
+fn occurrences(r: &store::Reminder, from: i64, to: i64) -> Vec<i64> {
+    use chrono::TimeZone;
+    let local = |ts: i64| chrono::DateTime::from_timestamp(ts, 0).map(|d| d.with_timezone(&chrono::Local).naive_local());
+    let (Some(start), Some(from_naive)) = (local(r.at), local(from)) else { return Vec::new() };
+    occurrences_in(start, from_naive, r.at, r.repeat, from, to, 64, |x| chrono::Local.from_local_datetime(&x))
+}
+
 /// Новый срок сработавшего повторяющегося напоминания — строго позже `stamp`.
 /// В двусмысленный осенний час «первый из двух» мог дать момент раньше текущего,
 /// и напоминание удалялось навсегда; теперь проматываем дальше.
@@ -8708,6 +8791,74 @@ mod dst_tests {
         assert!(at.timestamp() > berlin(t(2026, 3, 28, 2, 31)).single().unwrap().timestamp());
         let next = next_due(t(2026, 10, 24, 2, 30), 1, t(2026, 10, 24, 2, 31)).unwrap();
         assert!(resolve_local(next, berlin).is_some());
+    }
+    fn bts(n: NaiveDateTime) -> i64 {
+        resolve_local(n, berlin).unwrap().timestamp()
+    }
+    fn occ(start: NaiveDateTime, repeat: u8, from: NaiveDateTime, to: NaiveDateTime) -> Vec<i64> {
+        occurrences_in(start, from, bts(start), repeat, bts(from), bts(to), 64, berlin)
+    }
+    #[test]
+    fn occ_no_repeat_inside_and_outside() {
+        let s = t(2026, 11, 10, 9, 0);
+        assert_eq!(occ(s, 0, t(2026, 11, 10, 0, 0), t(2026, 11, 11, 0, 0)), vec![bts(s)]);
+        assert!(occ(s, 0, t(2026, 11, 11, 0, 0), t(2026, 11, 12, 0, 0)).is_empty());
+    }
+    #[test]
+    fn occ_daily_seven() {
+        let s = t(2026, 11, 2, 9, 0);
+        let v = occ(s, 1, t(2026, 11, 2, 0, 0), t(2026, 11, 9, 0, 0));
+        assert_eq!(v.len(), 7);
+        assert!(v.windows(2).all(|w| w[1] - w[0] == 86400));
+    }
+    #[test]
+    fn occ_weekdays_skip_weekend() {
+        // пт 06.11 → пн 09.11
+        let v = occ(t(2026, 11, 6, 9, 0), 2, t(2026, 11, 6, 0, 0), t(2026, 11, 10, 0, 0));
+        assert_eq!(v, vec![bts(t(2026, 11, 6, 9, 0)), bts(t(2026, 11, 9, 9, 0))]);
+    }
+    #[test]
+    fn occ_weekdays_original_on_saturday_shown() {
+        let v = occ(t(2026, 11, 7, 9, 0), 2, t(2026, 11, 7, 0, 0), t(2026, 11, 10, 0, 0));
+        assert_eq!(v, vec![bts(t(2026, 11, 7, 9, 0)), bts(t(2026, 11, 9, 9, 0))]);
+    }
+    #[test]
+    fn occ_weekly() {
+        let v = occ(t(2026, 11, 2, 9, 0), 3, t(2026, 11, 1, 0, 0), t(2026, 12, 1, 0, 0));
+        assert_eq!(v.len(), 5);
+        assert!(v.windows(2).all(|w| w[1] - w[0] == 7 * 86400));
+    }
+    #[test]
+    fn occ_spring_dst_23h() {
+        let v = occ(t(2026, 3, 29, 2, 30), 1, t(2026, 3, 29, 0, 0), t(2026, 3, 31, 0, 0));
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[1] - v[0], 23 * 3600);
+    }
+    #[test]
+    fn occ_autumn_dst_one_per_day() {
+        let v = occ(t(2026, 10, 20, 2, 30), 1, t(2026, 10, 25, 0, 0), t(2026, 10, 26, 0, 0));
+        assert_eq!(v.len(), 1);
+    }
+    #[test]
+    fn occ_years_later_is_fast_and_bounded() {
+        let s = t(2026, 1, 1, 9, 0);
+        let v = occurrences_in(s, t(2034, 6, 1, 0, 0), bts(s), 1, bts(t(2034, 6, 1, 0, 0)), bts(t(2035, 6, 1, 0, 0)), 10, berlin);
+        assert!(!v.is_empty() && v.len() <= 10);
+        assert!(v[0] >= bts(t(2034, 6, 1, 0, 0)) && v[0] < bts(t(2034, 6, 2, 0, 0)));
+    }
+    #[test]
+    fn occ_at_after_window_empty() {
+        assert!(occ(t(2026, 12, 1, 9, 0), 1, t(2026, 11, 1, 0, 0), t(2026, 11, 8, 0, 0)).is_empty());
+    }
+    #[test]
+    fn day_marks_daily_from_yesterday() {
+        use chrono::Local;
+        let today = Local::now().date_naive();
+        let y = (today - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap();
+        let r = store::Reminder { text: "x".into(), at: resolve_here(y).unwrap().timestamp(), repeat: 1 };
+        let ds = resolve_here(today.and_hms_opt(0, 0, 0).unwrap()).unwrap().timestamp();
+        let de = resolve_here((today + chrono::Duration::days(1)).and_hms_opt(0, 0, 0).unwrap()).unwrap().timestamp();
+        assert_eq!(day_marks(&[r], ds, de - ds).len(), 1);
     }
 }
 
@@ -9567,12 +9718,20 @@ fn fmt_secs(s: u64) -> String {
 }
 
 fn fmt_num(v: f64) -> String {
-    if (v - v.round()).abs() < 1e-9 && v.abs() < 1e15 {
+    if v == 0.0 {
+        return "0".into(); // и -0.0
+    }
+    if v.abs() >= 1e15 {
+        return format!("{v:e}");
+    }
+    let s = if (v - v.round()).abs() < 1e-9 {
         format!("{}", v.round() as i64)
     } else {
         let s = format!("{v:.6}");
         s.trim_end_matches('0').trim_end_matches('.').to_string()
-    }
+    };
+    // крошечное ненулевое число не должно превращаться в «0»
+    if s == "0" || s == "-0" { format!("{v:e}") } else { s }
 }
 
 /// Полужирный Segoe UI — заголовки, вкладки, кнопки, часы.
@@ -10301,5 +10460,45 @@ mod frame_tests {
         }
         assert_eq!(wrap_phase(1.0, DRIP_PERIOD), 1.0);
         assert!(wrap_phase(f32::NAN, DRIP_PERIOD) == 0.0);
+    }
+}
+
+#[cfg(test)]
+mod brigade_a_tests {
+    use super::*;
+    fn r(text: &str, at: i64, repeat: u8) -> store::Reminder {
+        store::Reminder { text: text.into(), at, repeat }
+    }
+    #[test]
+    fn reminders_key_changes() {
+        let a = vec![r("купить", 100, 0), r("позвонить", 200, 1)];
+        let k = reminders_key(&a, 0, 1000);
+        assert_eq!(k, reminders_key(&a.clone(), 0, 1000));
+        assert_ne!(k, reminders_key(&a, 0, 1001));
+        assert_ne!(k, reminders_key(&a, 1, 1000));
+        assert_ne!(k, reminders_key(&a[..1], 0, 1000));
+        // текст той же длины, но другой — ключ обязан смениться
+        let mut c = a.clone();
+        c[0].text = "абвгде".into();
+        let mut d = a.clone();
+        d[0].text = "ежзийк".into();
+        assert_ne!(reminders_key(&c, 0, 1000), reminders_key(&d, 0, 1000));
+        let mut e = a.clone();
+        e[1].repeat = 2;
+        assert_ne!(k, reminders_key(&e, 0, 1000));
+        let mut f = a.clone();
+        f[1].at = 201;
+        assert_ne!(k, reminders_key(&f, 0, 1000));
+    }
+    #[test]
+    fn fmt_num_edges() {
+        assert_eq!(fmt_num(2.5), "2.5");
+        assert_eq!(fmt_num(1000000.0), "1000000");
+        assert_eq!(fmt_num(-0.0), "0");
+        assert_eq!(fmt_num(0.0), "0");
+        for v in [1e-7, -1e-7, 1e20, -3e18] {
+            let s = fmt_num(v);
+            assert!(s.contains('e') && s.parse::<f64>().unwrap() == v, "{v} → {s}");
+        }
     }
 }

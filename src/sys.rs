@@ -289,17 +289,24 @@ pub fn dedup_apps(list: Vec<(String, String, String)>) -> Vec<(String, String)> 
     list.into_iter().filter(|(n, _, t)| seen.insert((n.to_lowercase(), t.to_lowercase()))).map(|(n, l, _)| (n, l)).collect()
 }
 
-/// Простой калькулятор: + - * / скобки и унарный минус.
+/// Простой калькулятор: + - * / ^ (степень, правоассоциативна), скобки и унарный минус.
+/// Приоритет: -2^2 = -4. Глубина вложенности ограничена (200), длина входа — 1000 символов.
 pub fn eval(expr: &str) -> Option<f64> {
+    const MAX_DEPTH: usize = 200;
     struct P<'a> {
         s: &'a [u8],
         i: usize,
+        depth: usize,
     }
     impl P<'_> {
         fn ws(&mut self) {
             while self.i < self.s.len() && self.s[self.i] == b' ' {
                 self.i += 1;
             }
+        }
+        fn enter(&mut self) -> Option<()> {
+            self.depth += 1;
+            (self.depth <= MAX_DEPTH).then_some(())
         }
         fn expr(&mut self) -> Option<f64> {
             let mut v = self.term()?;
@@ -313,23 +320,49 @@ pub fn eval(expr: &str) -> Option<f64> {
             }
         }
         fn term(&mut self) -> Option<f64> {
-            let mut v = self.atom()?;
+            let mut v = self.unary()?;
             loop {
                 self.ws();
                 match self.s.get(self.i) {
-                    Some(b'*') => { self.i += 1; v *= self.atom()?; }
-                    Some(b'/') => { self.i += 1; v /= self.atom()?; }
+                    Some(b'*') => { self.i += 1; v *= self.unary()?; }
+                    Some(b'/') => { self.i += 1; v /= self.unary()?; }
                     _ => return Some(v),
                 }
             }
         }
+        fn unary(&mut self) -> Option<f64> {
+            self.ws();
+            if self.s.get(self.i) == Some(&b'-') {
+                self.i += 1;
+                self.enter()?;
+                let v = self.unary()?;
+                self.depth -= 1;
+                Some(-v)
+            } else {
+                self.power()
+            }
+        }
+        fn power(&mut self) -> Option<f64> {
+            let base = self.atom()?;
+            self.ws();
+            if self.s.get(self.i) != Some(&b'^') {
+                return Some(base);
+            }
+            self.i += 1;
+            self.enter()?;
+            let exp = self.unary()?;
+            self.depth -= 1;
+            let v = base.powf(exp);
+            v.is_finite().then_some(v)
+        }
         fn atom(&mut self) -> Option<f64> {
             self.ws();
             match self.s.get(self.i)? {
-                b'-' => { self.i += 1; Some(-self.atom()?) }
                 b'(' => {
                     self.i += 1;
+                    self.enter()?;
                     let v = self.expr()?;
+                    self.depth -= 1;
                     self.ws();
                     if self.s.get(self.i) == Some(&b')') { self.i += 1; Some(v) } else { None }
                 }
@@ -343,8 +376,11 @@ pub fn eval(expr: &str) -> Option<f64> {
             }
         }
     }
+    if expr.chars().count() > 1000 {
+        return None;
+    }
     let clean = expr.replace(',', ".");
-    let mut p = P { s: clean.as_bytes(), i: 0 };
+    let mut p = P { s: clean.as_bytes(), i: 0, depth: 0 };
     let v = p.expr()?;
     p.ws();
     (p.i == p.s.len() && v.is_finite()).then_some(v)
@@ -1478,5 +1514,38 @@ mod remote_and_mixer_tests {
         let mut w = vec![av("A", r"C:\a\a.exe", 1.0, false, false), av("A", r"c:\A\A.EXE", 1.0, false, false)];
         disambiguate(&mut w);
         assert_eq!(w[0].name, "A");
+    }
+}
+
+#[cfg(test)]
+mod eval_power_tests {
+    use super::eval;
+    fn close(e: &str, want: f64) {
+        let v = eval(e).unwrap_or_else(|| panic!("{e} → None"));
+        assert!((v - want).abs() < 1e-9, "{e} = {v}, ждали {want}");
+    }
+    #[test]
+    fn power_basics() {
+        close("2^3^2", 512.0);
+        close("-2^2", -4.0);
+        close("2^-1", 0.5);
+        close("(-2)^2", 4.0);
+        close("2*3^2", 18.0);
+        close("1,5*2", 3.0);
+        close("--2", 2.0);
+    }
+    #[test]
+    fn power_invalid() {
+        for e in ["10^400", "0^-1", "(-8)^(1/3)", "1/0", "0/0", "(1+2", "1+2)", "5+", "2^"] {
+            assert_eq!(eval(e), None, "{e}");
+        }
+    }
+    #[test]
+    fn deep_input_no_overflow() {
+        assert_eq!(eval(&"(".repeat(100000)), None);
+        assert_eq!(eval(&"-".repeat(100000)), None);
+        assert_eq!(eval(&"2^".repeat(300)), None);
+        let e = format!("{}1{}", "(".repeat(50), ")".repeat(50));
+        close(&e, 1.0);
     }
 }
