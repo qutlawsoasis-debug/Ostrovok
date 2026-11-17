@@ -568,10 +568,30 @@ pub fn grab_bgrx(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<u8>> {
 }
 
 /// Значок файла или ярлыка, как его показывает Проводник: 32×32, RGBA.
+/// Куда указывает ярлык .lnk (пусто у ярлыков без пути, например у некоторых магазинных программ).
+fn lnk_target(path: &str) -> Option<String> {
+    use windows::core::Interface;
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, STGM_READ};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let sl: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        sl.cast::<IPersistFile>().ok()?.Load(&HSTRING::from(path), STGM_READ).ok()?;
+        let mut buf = [0u16; 520];
+        sl.GetPath(&mut buf, std::ptr::null_mut(), 0).ok()?;
+        let end = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+        let target = String::from_utf16_lossy(&buf[..end]);
+        (!target.is_empty() && std::path::Path::new(&target).exists()).then_some(target)
+    }
+}
+
 pub fn icon_rgba(path: &str) -> Option<(usize, usize, Vec<u8>)> {
     use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
     use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
     const N: i32 = 32;
+    // у ярлыка значок берём с самой программы — так на нём нет стрелки ярлыка
+    let resolved = if path.to_lowercase().ends_with(".lnk") { lnk_target(path) } else { None };
+    let path = resolved.as_deref().unwrap_or(path);
     unsafe {
         let mut info = SHFILEINFOW::default();
         let ok = SHGetFileInfoW(
