@@ -389,16 +389,14 @@ pub fn run_value(exe: &std::path::Path) -> String {
     format!("\"{}\"", exe.display())
 }
 
-/// Включён ли автозапуск именно этого файла (без учёта регистра).
+/// Есть ли запись автозапуска. Путь не сверяем: установщик по этой отметке переносит
+/// автозапуск на установленную копию, даже если запущен другой скачанный файл.
 pub fn autostart_enabled() -> bool {
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
-    let Ok(v) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(RUN_KEY).and_then(|k| k.get_value::<String, _>(RUN_NAME)) else {
-        return false;
-    };
-    match std::env::current_exe() {
-        Ok(exe) => v.to_lowercase() == run_value(&exe).to_lowercase(),
-        Err(_) => true,
-    }
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(RUN_KEY)
+        .and_then(|k| k.get_value::<String, _>(RUN_NAME))
+        .is_ok()
 }
 
 /// Переносит автозапуск на другой файл (после установки в свою папку).
