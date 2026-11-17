@@ -489,6 +489,131 @@ const CITIES: &[City] = &[
     City { names: &["utc", "гринвич", "gmt"], show: "UTC", offset: 0, dst: Dst::No },
 ];
 
+const MONTHS_GEN: [&str; 12] = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
+const WEEKDAYS: [&str; 7] = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"];
+
+/// «сегодня», «завтра», «через 44 дня», «3 дня назад».
+fn days_phrase(n: i64) -> String {
+    match n {
+        0 => "сегодня".into(),
+        1 => "завтра".into(),
+        -1 => "вчера".into(),
+        n if n > 0 => format!("через {}", count_ru(n as usize, ["день", "дня", "дней"])),
+        n => format!("{} назад", count_ru((-n) as usize, ["день", "дня", "дней"])),
+    }
+}
+
+/// Счёт дней в поиске: «через 45 дней», «через 2 месяца», «до нового года», «до 8 марта», «15.02.2027».
+/// Возвращает дату и строку ответа.
+fn date_query(q: &str, today: chrono::NaiveDate) -> Option<(chrono::NaiveDate, String)> {
+    use chrono::Datelike;
+    let q = q.trim().to_lowercase();
+    let pretty = |d: chrono::NaiveDate| format!("{} {} {}", d.day(), MONTHS_GEN[d.month0() as usize], d.year());
+    let wd = |d: chrono::NaiveDate| WEEKDAYS[d.weekday().num_days_from_monday() as usize];
+    // дата без года: если уже прошла — в следующем году
+    // ищем ближайший год, где такая дата есть и ещё не прошла (29 февраля — до 8 лет вперёд)
+    let ahead = |d: u32, m: u32| -> Option<chrono::NaiveDate> {
+        (today.year()..=today.year() + 8).filter_map(|y| chrono::NaiveDate::from_ymd_opt(y, m, d)).find(|x| *x >= today)
+    };
+    // «ДД.ММ» или «ДД.ММ.ГГГГ» — только если вся строка дата (чтобы не мешать калькулятору: «12.5»)
+    let parse_dot = |s: &str| -> Option<chrono::NaiveDate> {
+        let parts: Vec<&str> = s.split('.').collect();
+        if !(2..=3).contains(&parts.len()) || parts.iter().any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit())) {
+            return None;
+        }
+        let (d, m) = (parts[0].parse::<u32>().ok()?, parts[1].parse::<u32>().ok()?);
+        if parts[1].len() != 2 && parts.len() == 2 {
+            return None; // «12.5» — это число, а не дата
+        }
+        match parts.get(2) {
+            Some(y) => {
+                let y: i32 = y.parse().ok()?;
+                chrono::NaiveDate::from_ymd_opt(if y < 100 { 2000 + y } else { y }, m, d)
+            }
+            None => ahead(d, m),
+        }
+    };
+    if let Some(rest) = q.strip_prefix("через ") {
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        let (n, unit) = match words.as_slice() {
+            [n, u] => (n.parse::<u32>().ok()?, *u),
+            [u] => (1, *u),
+            _ => return None,
+        };
+        let d = if unit.starts_with("дн") || unit.starts_with("ден") || unit.starts_with("сут") {
+            today.checked_add_days(chrono::Days::new(n as u64))?
+        } else if unit.starts_with("нед") {
+            today.checked_add_days(chrono::Days::new(7 * n as u64))?
+        } else if unit.starts_with("мес") {
+            today.checked_add_months(chrono::Months::new(n))?
+        } else if unit.starts_with("год") || unit.starts_with("лет") {
+            today.checked_add_months(chrono::Months::new(n.checked_mul(12)?))?
+        } else {
+            return None; // «через 15 мин» — не наше
+        };
+        return Some((d, format!("{}, {}", pretty(d), wd(d))));
+    }
+    let (target, label) = if let Some(rest) = q.strip_prefix("до ") {
+        let rest = rest.trim();
+        let d = if rest.starts_with("нового года") || rest == "нг" {
+            chrono::NaiveDate::from_ymd_opt(today.year() + 1, 1, 1)?
+        } else if let Some(d) = parse_dot(rest) {
+            d
+        } else {
+            // «8 марта» или «8 марта 2027»
+            let words: Vec<&str> = rest.split_whitespace().collect();
+            let (day, month) = (words.first()?.parse::<u32>().ok()?, *words.get(1)?);
+            let m = MONTHS_GEN.iter().position(|x| *x == month)? as u32 + 1;
+            match words.get(2).and_then(|y| y.parse::<i32>().ok()) {
+                Some(y) => chrono::NaiveDate::from_ymd_opt(if y < 100 { 2000 + y } else { y }, m, day)?,
+                None => ahead(day, m)?,
+            }
+        };
+        (d, true)
+    } else {
+        (parse_dot(&q)?, false)
+    };
+    let n = (target - today).num_days();
+    let weeks = match (n >= 14, n % 7) {
+        (true, 0) => format!(" ({} нед.)", n / 7),
+        (true, r) => format!(" ({} нед. {r} дн.)", n / 7),
+        _ => String::new(),
+    };
+    Some((target, if label { format!("{}{weeks} · {}, {}", days_phrase(n), pretty(target), wd(target)) } else { format!("{}, {} · {}", pretty(target), wd(target), days_phrase(n)) }))
+}
+
+#[cfg(test)]
+mod date_tests {
+    use super::*;
+    fn d(y: i32, m: u32, day: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+    #[test]
+    fn date_queries() {
+        let today = d(2026, 11, 17);
+        assert_eq!(date_query("через 45 дней", today).unwrap().0, d(2027, 1, 1));
+        assert_eq!(date_query("через 3 недели", today).unwrap().0, d(2026, 12, 8));
+        assert_eq!(date_query("через месяц", d(2026, 1, 31)).unwrap().0, d(2026, 2, 28));
+        assert_eq!(date_query("через 2 года", today).unwrap().0, d(2028, 11, 17));
+        let (ny, t) = date_query("до нового года", today).unwrap();
+        assert_eq!(ny, d(2027, 1, 1));
+        assert!(t.starts_with("через 45 дней (6 нед. 3 дн.)"), "{t}");
+        assert_eq!(date_query("до 31.12", today).unwrap().0, d(2026, 12, 31));
+        assert_eq!(date_query("до 8 марта", today).unwrap().0, d(2027, 3, 8));
+        assert!(date_query("до нового года", d(2026, 12, 31)).unwrap().1.starts_with("завтра"));
+        assert_eq!(date_query("15.02.2027", today).unwrap().0, d(2027, 2, 15));
+        assert!(date_query("15.11.2026", today).unwrap().1.ends_with("2 дня назад"));
+        assert!(date_query("12.5", today).is_none());
+        assert!(date_query("2*3", today).is_none());
+        assert!(date_query("через 15 мин", today).is_none());
+        assert!(date_query("31.02", today).is_none());
+        assert_eq!(date_query("до 29 февраля", today).unwrap().0, d(2028, 2, 29));
+        assert_eq!(date_query("до 8 марта 2027", today).unwrap().0, d(2027, 3, 8));
+        assert!(date_query("через 400000000 лет", today).is_none());
+        assert!(date_query("до 1 января", d(2026, 12, 4)).unwrap().1.contains("(4 нед.)"));
+    }
+}
+
 /// Сколько городов помещается в ряд под календарём.
 const WORLD_MAX: usize = 3;
 
@@ -1533,6 +1658,15 @@ impl App {
             self.results.push(Item { title, sub: "Enter".into(), action: Action::Quick(cmd) });
         }
 
+        // счёт дней: «через 45 дней», «до нового года», «15.02.2027» (быстрые команды важнее)
+        let mut date_items = 0;
+        if self.results.is_empty() {
+            if let Some((d, title)) = date_query(&q, chrono::Local::now().date_naive()) {
+                self.results.push(Item { title, sub: "скопировать".into(), action: Action::Copy(d.format("%d.%m.%Y").to_string()) });
+                date_items = 1;
+            }
+        }
+
         // «время токио» — местное время в городе
         for prefix in ["время ", "time "] {
             if let Some(city) = low.strip_prefix(prefix).and_then(find_city) {
@@ -1567,7 +1701,8 @@ impl App {
             let action = if value.is_empty() { Action::Copy(String::new()) } else { Action::Copy(value) };
             self.results.push(Item { title, sub: sub.into(), action });
         }
-        let converted = !self.results.is_empty();
+        // ответ про дату не прячет «Спросить ИИ» (быстрые команды и конвертер — прячут)
+        let converted = self.results.len() > date_items;
 
         let is_expr = q.chars().all(|c| c.is_ascii_digit() || " +-*/().,".contains(c))
             && q.chars().any(|c| c.is_ascii_digit())
@@ -5528,7 +5663,7 @@ impl App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                for (glyph, text) in [("\u{E916}", "таймер 5"), ("\u{E823}", "напомни через 15 мин чай"), ("\u{E73E}", "дело купить хлеб"), ("\u{E8EF}", "5 км в мили")] {
+                for (glyph, text) in [("\u{E916}", "таймер 5"), ("\u{E823}", "напомни через 15 мин чай"), ("\u{E73E}", "дело купить хлеб"), ("\u{E787}", "до нового года")] {
                     let label = format!("{glyph}  {}", text.trim());
                     let w = ui.painter().layout_no_wrap(label.clone(), FontId::proportional(12.5), FG).size().x + 20.0;
                     let (r, resp) = ui.allocate_exact_size(vec2(w, 28.0), Sense::click());
