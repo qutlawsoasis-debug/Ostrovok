@@ -2519,7 +2519,7 @@ impl App {
                 gradient_rrect(&p, now_r.shrink(1.0), 19.0, |q| {
                     let k = ((q.y - now_r.top()) / now_r.height()).clamp(0.0, 1.0);
                     let side = ((q.x - now_r.left()) / now_r.width()).clamp(0.0, 1.0);
-                    mix(top, low, k * 0.8 + side * 0.2)
+                    mix_a(top, low, k * 0.8 + side * 0.2)
                 });
                 if day_phase(h, rise, set) == 3 {
                     for (i, (x, y)) in [(0.70, 0.18), (0.82, 0.30), (0.90, 0.14), (0.62, 0.36), (0.77, 0.52), (0.93, 0.44), (0.55, 0.12)].into_iter().enumerate() {
@@ -2623,6 +2623,15 @@ impl App {
         match &self.weather {
             Some(w) => {
                 let (icon, text) = weather::describe(w.code);
+                // свечение в верхнем правом углу — цвета погоды
+                let tc = weather::tint(w.code);
+                let glow = Color32::from_rgba_unmultiplied(tc[0], tc[1], tc[2], 52);
+                let corner = weather_r.right_top();
+                let reach = weather_r.width().max(weather_r.height());
+                gradient_rrect(&p, weather_r.shrink(1.0), 19.0, |q| {
+                    let d = ((q - corner).length() / reach).clamp(0.0, 1.0);
+                    mix_a(glow, Color32::TRANSPARENT, d)
+                });
                 let clip = p.with_clip_rect(weather_r.shrink2(vec2(10.0, 0.0)));
                 clip.text(weather_r.min + vec2(16.0, 8.0), Align2::LEFT_TOP, format!("{icon} {}", weather::deg(w.temp)), light(30.0), FG);
                 clip.text(weather_r.min + vec2(17.0, 54.0), Align2::LEFT_TOP, text, FontId::proportional(12.5), FG);
@@ -6289,6 +6298,14 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let ch = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
     Color32::from_rgb(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()))
+}
+
+/// Как mix, но сохраняет прозрачность: смешивает и цвет, и непрозрачность (в egui цвета хранятся
+/// уже умноженными на прозрачность, поэтому каналы можно смешивать напрямую).
+fn mix_a(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let ch = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_premultiplied(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()), ch(a.a(), b.a()))
 }
 
 fn rounded_image(p: &egui::Painter, tex: &egui::TextureHandle, rect: Rect, radius: f32) {
