@@ -2375,6 +2375,31 @@ impl App {
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
             glass_chip(&p, now_r, 20.0, 0.6 + 0.4 * hov);
             let t = chrono::Local::now();
+            // небо за часами: рассвет, день, закат или ночь со звёздами — по восходу и закату из погоды
+            {
+                let hm = |s: &str| s.split_once(':').and_then(|(h, m)| Some(h.trim().parse::<f32>().ok()? + m.trim().parse::<f32>().ok()? / 60.0));
+                let rise = self.weather.as_ref().and_then(|w| hm(&w.sunrise)).unwrap_or(7.0);
+                let set = self.weather.as_ref().and_then(|w| hm(&w.sunset)).unwrap_or(18.0);
+                use chrono::Timelike;
+                let mut h = t.hour() as f32 + t.minute() as f32 / 60.0;
+                if test_mode() {
+                    if let Some(v) = std::env::var("OSTROVOK_HOUR").ok().and_then(|v| v.parse::<f32>().ok()) {
+                        h = v;
+                    }
+                }
+                let (top, low) = sky_colors(day_phase(h, rise, set));
+                gradient_rrect(&p, now_r.shrink(1.0), 19.0, |q| {
+                    let k = ((q.y - now_r.top()) / now_r.height()).clamp(0.0, 1.0);
+                    let side = ((q.x - now_r.left()) / now_r.width()).clamp(0.0, 1.0);
+                    mix(top, low, k * 0.8 + side * 0.2)
+                });
+                if day_phase(h, rise, set) == 3 {
+                    for (i, (x, y)) in [(0.70, 0.18), (0.82, 0.30), (0.90, 0.14), (0.62, 0.36), (0.77, 0.52), (0.93, 0.44), (0.55, 0.12)].into_iter().enumerate() {
+                        let at = now_r.min + vec2(now_r.width() * x, now_r.height() * y);
+                        p.circle_filled(at, if i % 3 == 0 { 1.4 } else { 0.9 }, rgba(255, 255, 255, if i % 2 == 0 { 170 } else { 110 }));
+                    }
+                }
+            }
             const DAYS: [&str; 7] = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"];
             const MONTHS: [&str; 12] = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
             p.text(now_r.min + vec2(16.0, 6.0), Align2::LEFT_TOP, t.format("%H:%M").to_string(), light(38.0), FG);
@@ -5590,6 +5615,58 @@ fn hwnd_of(frame: &eframe::Frame) -> Option<isize> {
 }
 
 /// Чистый цвет радуги: h от 0 до 1, a — непрозрачность.
+/// Время суток: 0 — рассвет, 1 — день, 2 — закат, 3 — ночь. Рассвет и закат длятся по часу в обе стороны.
+fn day_phase(h: f32, rise: f32, set: f32) -> u8 {
+    if (h - rise).abs() < 1.0 {
+        0
+    } else if (h - set).abs() < 1.0 {
+        2
+    } else if h > rise && h < set {
+        1
+    } else {
+        3
+    }
+}
+
+/// Цвета неба (верх, низ) для фаза суток — полупрозрачные, чтобы цифры поверх читались.
+fn sky_colors(phase: u8) -> (Color32, Color32) {
+    let c = |r: u8, g: u8, b: u8, a: u8| Color32::from_rgba_unmultiplied(r, g, b, a);
+    match phase {
+        0 => (c(120, 110, 220, 40), c(255, 160, 120, 46)),
+        1 => (c(90, 165, 255, 46), c(120, 200, 255, 8)),
+        2 => (c(150, 90, 200, 40), c(255, 120, 110, 50)),
+        _ => (c(70, 70, 170, 56), c(20, 20, 60, 10)),
+    }
+}
+
+/// Скруглённый прямоугольник, залитый градиентом: цвет каждой точки контура задаёт функция.
+fn gradient_rrect(p: &egui::Painter, rect: Rect, r: f32, col: impl Fn(Pos2) -> Color32) {
+    let pts = contour(rect, r.min(rect.width() / 2.0).min(rect.height() / 2.0), 0.0, 8);
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.center(), col(rect.center()));
+    for (q, _) in &pts {
+        mesh.colored_vertex(*q, col(*q));
+    }
+    let n = pts.len() as u32;
+    for i in 0..n {
+        mesh.add_triangle(0, 1 + i, 1 + (i + 1) % n);
+    }
+    p.add(egui::Shape::mesh(mesh));
+}
+
+#[cfg(test)]
+mod sky_tests {
+    use super::*;
+    #[test]
+    fn phases() {
+        assert_eq!(day_phase(7.5, 7.8, 16.5), 0);
+        assert_eq!(day_phase(12.0, 7.8, 16.5), 1);
+        assert_eq!(day_phase(16.0, 7.8, 16.5), 2);
+        assert_eq!(day_phase(2.5, 7.8, 16.5), 3);
+        assert_eq!(day_phase(22.0, 7.8, 16.5), 3);
+    }
+}
+
 /// Обложка-заглушка: диагональный градиент двух соседних оттенков, выбранных по названию трека,
 /// мягкий блик сверху и нота. У каждого трека свой цвет, но всегда в спокойной гамме.
 fn art_placeholder(p: &egui::Painter, rect: Rect, r: f32, seed: &str, glyph: f32) {
