@@ -1081,6 +1081,10 @@ struct App {
     focus: Option<(bool, u32)>,
     /// размеры файлов на полке: None — файла нет, u64::MAX — папка
     shelf_meta: std::collections::HashMap<String, Option<u64>>,
+    /// миниатюры картинок на полке: None — читается или не получилось (тогда остаётся значок)
+    shelf_thumbs: std::collections::HashMap<String, Option<egui::TextureHandle>>,
+    /// готовые картинки из фонового потока
+    shelf_thumb_q: Arc<Mutex<Vec<(String, Option<(usize, usize, Vec<u8>)>)>>>,
     mem_hot: u8,
     mem_alert_at: Option<Instant>,
     kill_arm: Option<(String, Instant)>,
@@ -1334,6 +1338,8 @@ impl App {
             todo_edit: String::new(),
             focus: None,
             shelf_meta: Default::default(),
+            shelf_thumbs: Default::default(),
+            shelf_thumb_q: Default::default(),
             mem_hot: 0,
             mem_alert_at: None,
             kill_arm: None,
@@ -1416,7 +1422,7 @@ impl App {
             .to_vec();
         }
         if test_mode() && std::env::var_os("OSTROVOK_SHELF").is_some() {
-            app.cfg.shelf = ["C:\\Windows\\explorer.exe", "C:\\Windows\\System32\\notepad.exe", "C:\\Windows\\win.ini", "C:\\Windows\\Fonts", "C:\\нет\\такого.txt"].map(String::from).to_vec();
+            app.cfg.shelf = ["C:\\Windows\\Web\\Wallpaper\\Theme1\\img1.jpg", "C:\\Windows\\explorer.exe", "C:\\Windows\\Web\\Wallpaper\\Theme1\\img13.jpg", "C:\\Windows\\System32\\notepad.exe", "C:\\Windows\\win.ini", "C:\\Windows\\Fonts", "C:\\нет\\такого.txt"].map(String::from).to_vec();
         }
         // для снимков: открыть строку поиска с готовым запросом
         if let Ok(q) = std::env::var("OSTROVOK_QUERY") {
@@ -3085,6 +3091,11 @@ impl App {
                 }
             });
         });
+        // забираем миниатюры, прочитанные в фоне
+        for (path, px) in std::mem::take(&mut *self.shelf_thumb_q.lock().unwrap()) {
+            let tex = px.map(|(w, h, px)| ui.ctx().load_texture(format!("shelf-thumb-{path}"), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR));
+            self.shelf_thumbs.insert(path, tex);
+        }
         let mut drag: Option<String> = None;
         let (mut open, mut remove) = (None, None);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -3108,10 +3119,31 @@ impl App {
                     let icon = self.app_icons.entry(path.clone()).or_insert_with(|| {
                         sys::icon_rgba(path).map(|(w, h, px)| ui.ctx().load_texture(format!("shelf-{i}"), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR))
                     });
+                    // картинки: читаем в фоне один раз, пока читается — обычный значок
+                    if shelf_thumb_ok(path, size) && !self.shelf_thumbs.contains_key(path) {
+                        self.shelf_thumbs.insert(path.clone(), None);
+                        let (q, p, ctx) = (self.shelf_thumb_q.clone(), path.clone(), ui.ctx().clone());
+                        std::thread::spawn(move || {
+                            let px = load_thumb(&p);
+                            q.lock().unwrap().push((p, px));
+                            ctx.request_repaint();
+                        });
+                    }
+                    let thumb = if size.is_some() { self.shelf_thumbs.get(path).and_then(|t| t.as_ref()) } else { None };
                     let side = 36.0 + 3.0 * hov - 3.0 * down;
                     let icon_r = Rect::from_center_size(pos2(cell.center().x, cell.top() + 30.0), vec2(side, side));
-                    match icon {
-                        Some(tex) if size.is_some() => rounded_image(ui.painter(), tex, icon_r, 0.0),
+                    match (thumb, icon) {
+                        (Some(tex), _) => {
+                            let [w, h] = tex.size();
+                            let grow = 1.0 + 0.06 * hov - 0.05 * down;
+                            let (tw, th) = thumb_fit(w as u32, h as u32, 84.0 * grow, 44.0 * grow);
+                            let r = Rect::from_center_size(pos2(cell.center().x, cell.top() + 30.0), vec2(tw, th));
+                            // мягкая тень, сама картинка со скруглением и тонкая светлая рамка
+                            ui.painter().rect_filled(r.translate(vec2(0.0, 2.0)).expand(1.0), Rounding::same(8.0), rgba(0, 0, 0, 60));
+                            rounded_image(ui.painter(), tex, r, 7.0);
+                            ui.painter().rect_stroke(r, Rounding::same(7.0), Stroke::new(1.0_f32, rgba(255, 255, 255, (40.0 + 60.0 * hov) as u8)));
+                        }
+                        (None, Some(tex)) if size.is_some() => rounded_image(ui.painter(), tex, icon_r, 0.0),
                         _ => {
                             ui.painter().text(icon_r.center(), Align2::CENTER_CENTER, "\u{E7C3}", FontId::proportional(26.0), DIM);
                         }
@@ -3156,6 +3188,7 @@ impl App {
         if let Some(i) = remove {
             let path = self.cfg.shelf.remove(i);
             self.shelf_meta.remove(&path);
+            self.shelf_thumbs.remove(&path);
             self.cfg.save();
         }
     }
@@ -8263,6 +8296,60 @@ fn fix_layout(text: &str) -> String {
             if c != low { t.to_uppercase().next().unwrap_or(t) } else { t }
         })
         .collect()
+}
+
+/// Показывать ли на полке миниатюру вместо значка: png/jpg до 40 МБ, файл на месте и это не папка.
+fn shelf_thumb_ok(path: &str, size: Option<u64>) -> bool {
+    let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg") && size.is_some_and(|b| b <= 40 << 20)
+}
+
+/// Размер картинки w×h, вписанной в max_w×max_h с сохранением пропорций.
+fn thumb_fit(w: u32, h: u32, max_w: f32, max_h: f32) -> (f32, f32) {
+    if w == 0 || h == 0 {
+        return (0.0, 0.0);
+    }
+    let k = (max_w / w as f32).min(max_h / h as f32);
+    (w as f32 * k, h as f32 * k)
+}
+
+/// Читает картинку и уменьшает до 176 px по большей стороне: (ширина, высота, RGBA).
+fn load_thumb(path: &str) -> Option<(usize, usize, Vec<u8>)> {
+    // файл может быть чужим: ограничиваем размеры и память, чтобы маленький «раздутый» PNG не съел гигабайты
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_000);
+    limits.max_image_height = Some(16_000);
+    limits.max_alloc = Some(300 << 20);
+    let mut reader = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+    reader.limits(limits);
+    let img = reader.decode().ok()?.thumbnail(176, 176).into_rgba8();
+    Some((img.width() as usize, img.height() as usize, img.into_raw()))
+}
+
+#[cfg(test)]
+mod shelf_thumb_tests {
+    use super::*;
+
+    #[test]
+    fn which_files_get_thumbs() {
+        assert!(shelf_thumb_ok("C:\\Windows\\Web\\Wallpaper\\Theme1\\img1.jpg", Some(500_000)));
+        assert!(shelf_thumb_ok("D:\\a\\Снимок.PNG", Some(1)));
+        assert!(shelf_thumb_ok("x.jpeg", Some(10)));
+        assert!(!shelf_thumb_ok("x.gif", Some(10)));
+        assert!(!shelf_thumb_ok("C:\\папка.jpg", Some(u64::MAX)), "папка с «картиночным» именем");
+        assert!(!shelf_thumb_ok("x.png", None), "файла нет");
+        assert!(!shelf_thumb_ok("x.png", Some(41 << 20)), "слишком большой");
+        assert!(!shelf_thumb_ok("png", Some(10)));
+    }
+
+    #[test]
+    fn fit_keeps_aspect() {
+        let near = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 1e-3 && (a.1 - b.1).abs() < 1e-3;
+        assert!(near(thumb_fit(1920, 1080, 88.0, 46.0), (81.7778, 46.0)));
+        assert!(near(thumb_fit(100, 400, 88.0, 46.0), (11.5, 46.0)));
+        assert!(near(thumb_fit(4000, 100, 88.0, 46.0), (88.0, 2.2)));
+        assert_eq!(thumb_fit(0, 0, 88.0, 46.0), (0.0, 0.0));
+    }
 }
 
 #[cfg(test)]
