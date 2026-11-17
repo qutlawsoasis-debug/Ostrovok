@@ -2903,10 +2903,11 @@ impl App {
         let wifi_text;
         let text: &str = if self.qr_wifi {
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.wifi_ssid).margin(egui::Margin::symmetric(9.0, 7.0)).hint_text(RichText::new("Сеть").color(DIM)).desired_width(150.0));
+                ui.add(egui::TextEdit::singleline(&mut self.wifi_ssid).char_limit(1000).margin(egui::Margin::symmetric(9.0, 7.0)).hint_text(RichText::new("Сеть").color(DIM)).desired_width(150.0));
                 if self.wifi_secure {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.wifi_pass)
+                            .char_limit(1000)
                             .password(!self.wifi_show)
                             .margin(egui::Margin::symmetric(9.0, 7.0))
                             .hint_text(RichText::new("Пароль").color(DIM))
@@ -2927,6 +2928,7 @@ impl App {
                 let w = (ui.available_width() - 120.0).max(120.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.qr_text)
+                        .char_limit(1000)
                         .margin(egui::Margin::symmetric(9.0, 7.0))
                         .hint_text(RichText::new("Текст или ссылка").color(DIM))
                         .desired_width(w),
@@ -2945,8 +2947,8 @@ impl App {
             empty_at(ui.painter(), area.center(), "\u{ED14}", "Кода пока нет", hint);
             return;
         }
-        match qrcode::QrCode::new(text.as_bytes()) {
-            Ok(code) => {
+        match qr_encode(text) {
+            Some(code) => {
                 let n = code.width();
                 let colors = code.to_colors();
                 let side = 168.0;
@@ -2972,7 +2974,7 @@ impl App {
                 }
                 // справа — что в коде и что с ним сделать
                 let side_r = Rect::from_min_max(pos2(sq.right() + 40.0, sq.top() + 6.0), pos2(area.right(), sq.bottom()));
-                let kind = if text.starts_with("http") { "Ссылка" } else if text.starts_with("WIFI:") { "Wi‑Fi" } else { "Текст" };
+                let kind = qr_kind(text);
                 p.text(side_r.min, Align2::LEFT_TOP, kind, semi(14.0), FG);
                 // у Wi‑Fi показываем только сеть и защиту — пароль на экран не выводим
                 let preview: String = if self.qr_wifi {
@@ -3019,7 +3021,7 @@ impl App {
                     }
                 }
             }
-            Err(_) => {
+            None => {
                 ui.painter().text(area.center(), Align2::CENTER_CENTER, "Текст слишком длинный для кода", FontId::proportional(13.5), DIM);
             }
         }
@@ -3299,12 +3301,17 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if jelly(ui, "Очистить").clicked() {
                     self.cfg.shelf.clear();
+                    self.shelf_meta.clear();
+                    self.shelf_thumbs.clear();
                     self.cfg.save();
                 }
             });
         });
         // забираем миниатюры, прочитанные в фоне
         for (path, px) in std::mem::take(&mut *self.shelf_thumb_q.lock().unwrap()) {
+            if !self.cfg.shelf.contains(&path) {
+                continue;
+            }
             let tex = px.map(|(w, h, px)| ui.ctx().load_texture(format!("shelf-thumb-{path}"), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR));
             self.shelf_thumbs.insert(path, tex);
         }
@@ -3329,7 +3336,7 @@ impl App {
                     // размер файла узнаём один раз; None — файла уже нет на месте
                     let size = *self.shelf_meta.entry(path.clone()).or_insert_with(|| std::fs::metadata(path).ok().map(|m| if m.is_dir() { u64::MAX } else { m.len() }));
                     let icon = self.app_icons.entry(path.clone()).or_insert_with(|| {
-                        sys::icon_rgba(path).map(|(w, h, px)| ui.ctx().load_texture(format!("shelf-{i}"), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR))
+                        sys::icon_rgba(path).map(|(w, h, px)| ui.ctx().load_texture(format!("shelf-{path}"), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR))
                     });
                     // картинки: читаем в фоне один раз, пока читается — обычный значок
                     if shelf_thumb_ok(path, size) && !self.shelf_thumbs.contains_key(path) {
@@ -6794,11 +6801,15 @@ impl eframe::App for App {
         self.web_slot = None;
         let dropped: Vec<String> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.as_ref().map(|p| p.display().to_string())).collect());
         if !dropped.is_empty() {
+            // app_icons не чистим: ключи общие с ярлыками палитры/запуска
             for path in dropped {
-                self.cfg.shelf.retain(|p| p != &path);
-                self.cfg.shelf.insert(0, path);
+                self.shelf_meta.remove(&path);
+                self.shelf_thumbs.remove(&path);
+                shelf_add(&mut self.cfg.shelf, path);
             }
-            self.cfg.shelf.truncate(30);
+            let shelf = &self.cfg.shelf;
+            self.shelf_meta.retain(|k, _| shelf.contains(k));
+            self.shelf_thumbs.retain(|k, _| shelf.contains(k));
             self.cfg.save();
             self.mode = Mode::Panel;
             self.tab = Tab::Shelf;
@@ -7854,11 +7865,107 @@ fn battery_rgb(pct: u8, charging: bool) -> [u8; 3] {
     if charging { BATT_GREEN } else if pct <= 10 { BATT_RED } else { BATT_ORANGE }
 }
 
+/// Положить путь на полку первым: без дублей, не больше 30. Возвращает вытесненные пути.
+fn shelf_add(list: &mut Vec<String>, path: String) -> Vec<String> {
+    list.retain(|p| p != &path);
+    list.insert(0, path);
+    if list.len() > 30 { list.split_off(30) } else { Vec::new() }
+}
+
+/// QR-код текста; None, если не помещается.
+fn qr_encode(text: &str) -> Option<qrcode::QrCode> {
+    qrcode::QrCode::new(text.as_bytes()).ok()
+}
+
+/// Подпись вида содержимого кода.
+fn qr_kind(text: &str) -> &'static str {
+    if text.starts_with("http://") || text.starts_with("https://") {
+        "Ссылка"
+    } else if text.starts_with("WIFI:") {
+        "Wi‑Fi"
+    } else {
+        "Текст"
+    }
+}
+
+#[cfg(test)]
+mod fix_tests {
+    use super::*;
+    fn d(y: i32, m: u32, dd: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, dd).unwrap()
+    }
+
+    #[test]
+    fn shelf_add_moves_to_front_without_dupes() {
+        let mut l: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        let out = shelf_add(&mut l, "b".into());
+        assert_eq!(l, vec!["b", "a", "c"]);
+        assert!(out.is_empty());
+        shelf_add(&mut l, "z".into());
+        assert_eq!(l, vec!["z", "b", "a", "c"]);
+    }
+
+    #[test]
+    fn shelf_add_limits_to_30_and_returns_evicted() {
+        let mut l: Vec<String> = (0..30).map(|i| i.to_string()).collect();
+        let out = shelf_add(&mut l, "new".into());
+        assert_eq!(l.len(), 30);
+        assert_eq!(l[0], "new");
+        assert_eq!(out, vec!["29".to_string()]);
+        let out = shelf_add(&mut l, "5".into());
+        assert!(out.is_empty());
+        assert_eq!(l.len(), 30);
+        assert_eq!(l.iter().filter(|p| *p == "5").count(), 1);
+    }
+
+    #[test]
+    fn qr_long_cyrillic_errors_without_panic() {
+        let s: String = std::iter::repeat('я').take(3000).collect();
+        assert!(qr_encode(&s).is_none());
+    }
+
+    #[test]
+    fn qr_emoji_encodes() {
+        assert!(qr_encode("😀🎉🚀").is_some());
+    }
+
+    #[test]
+    fn qr_kind_requires_scheme() {
+        assert_eq!(qr_kind("https://a.ru"), "Ссылка");
+        assert_eq!(qr_kind("http://a.ru"), "Ссылка");
+        assert_eq!(qr_kind("httpfoo"), "Текст");
+        assert_eq!(qr_kind("WIFI:S:x;;"), "Wi‑Fi");
+    }
+
+    #[test]
+    fn parse_due_keeps_newlines() {
+        let (t, dt) = parse_due("купить\nхлеб до 5.12", d(2026, 11, 17));
+        assert_eq!(t, "купить\nхлеб");
+        assert_eq!(dt, Some(d(2026, 12, 5)));
+    }
+
+    #[test]
+    fn parse_due_emoji_tomorrow() {
+        assert_eq!(parse_due("😀 завтра", d(2026, 11, 17)), ("😀".to_string(), Some(d(2026, 11, 18))));
+    }
+
+    #[test]
+    fn parse_due_empty_and_bare() {
+        let t = d(2026, 11, 17);
+        assert_eq!(parse_due("", t).1, None);
+        assert_eq!(parse_due("   ", t).1, None);
+        assert_eq!(parse_due("до пятницы", t), ("до пятницы".to_string(), None));
+    }
+}
+
 /// Срок в конце текста дела: «сегодня», «завтра», «послезавтра», «до пятницы», «до 5.12».
 /// Возвращает текст без срока и дату; если срока нет — текст как есть.
 fn parse_due(text: &str, today: chrono::NaiveDate) -> (String, Option<chrono::NaiveDate>) {
     use chrono::Datelike;
     let plain = (text.trim().to_string(), None);
+    // слова с байтовыми позициями — хвост отрезаем по позиции, не трогая пробелы и переводы строк
+    let base = text.as_ptr() as usize;
+    let starts: Vec<usize> = text.split_whitespace().map(|w| w.as_ptr() as usize - base).collect();
     let words: Vec<&str> = text.split_whitespace().collect();
     let Some(last) = words.last() else { return plain };
     let low = last.to_lowercase();
@@ -7896,7 +8003,7 @@ fn parse_due(text: &str, today: chrono::NaiveDate) -> (String, Option<chrono::Na
     if keep == 0 {
         return plain;
     }
-    (words[..keep].join(" "), Some(date))
+    (text[..starts[keep]].trim().to_string(), Some(date))
 }
 
 /// Подпись срока и тревога: 0 — спокойно, 1 — сегодня, 2 — просрочено.
