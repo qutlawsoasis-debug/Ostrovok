@@ -6986,7 +6986,8 @@ impl App {
                 let items = self.notes.get(self.note_sel).map_or(0, |n| store::check_items(n).len());
                 340.0 + (items.min(5) as f32 * 34.0 + if items > 0 { 30.0 } else { 0.0 })
             }
-            Tab::Todo => 366.0,
+            // дела: страница растёт по числу дел (до шести видно без прокрутки)
+            Tab::Todo => 190.0 + self.cfg.todos.len().clamp(3, 6) as f32 * 44.0,
             Tab::System => if self.stats.battery.is_some() { 416.0 } else { 394.0 },
             Tab::Settings => 528.0,
         }
