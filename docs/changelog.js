@@ -342,28 +342,48 @@
   }
 
   // ── страница
-  function init() {
-    var $ = function (id) { return document.getElementById(id); };
+  // env — для тестов: document, location, history, fetch, storage, setTimeout, clearTimeout, clock.
+  function init(env) {
+    env = env || {};
+    var doc = env.document || document;
+    var loc = env.location || root.location;
+    var hist = env.history || root.history;
+    var later = env.setTimeout || setTimeout, cancel = env.clearTimeout || clearTimeout;
+    var $ = function (id) { return doc.getElementById(id); };
     var clock = $('clock');
-    if (clock) {
+    if (clock && env.clock !== false) {
       var tick = function () { clock.textContent = formatTime(new Date()); };
       tick(); setInterval(tick, 10000);
     }
     var input = $('q'), state = $('state');
     var view = { list: $('list'), count: $('count') };
-    var all = [], timer = 0;
+    var all = [], loaded = false, timer = 0;
     var storage = null;
-    try { storage = root.localStorage; } catch (e) { storage = null; }
+    if ('storage' in env) storage = env.storage;
+    else { try { storage = root.localStorage; } catch (e) { storage = null; } }
 
     var readHash = function () {
-      var m = /^#q=(.*)$/.exec(location.hash || '');
+      var m = /^#q=(.*)$/.exec(loc.hash || '');
       if (!m) return '';
       try { return decodeURIComponent(m[1]); } catch (e) { return ''; }
     };
     var writeHash = function (q) {
-      try { history.replaceState(null, '', q ? '#q=' + encodeURIComponent(q) : location.pathname + location.search); } catch (e) { /* без адреса */ }
+      try { hist.replaceState(null, '', q ? '#q=' + encodeURIComponent(q) : loc.pathname + loc.search); } catch (e) { /* без адреса */ }
     };
-    var apply = function () { render(view, all, input.value); writeHash(input.value.trim()); };
+    // Ссылка вида #v0.1.61: карточки появляются после загрузки, поэтому браузер сам не прокрутит.
+    var revealHash = function () {
+      var m = /^#([0-9A-Za-z._-]+)$/.exec(loc.hash || '');
+      if (!m) return;
+      var target = $(m[1]);
+      if (target && target.scrollIntoView) target.scrollIntoView();
+    };
+    // До загрузки списка (или если он не загрузился) поиск только запоминает запрос:
+    // иначе под «Загружаю…» или под ошибкой появилось бы «Пока нет ни одной версии».
+    var apply = function () {
+      cancel(timer);
+      if (loaded) render(view, all, input.value);
+      writeHash(input.value.trim());
+    };
     view.onReset = function () { input.value = ''; apply(); input.focus(); };
     var setState = function (node, text) {
       if (!node && !text) { state.hidden = true; state.textContent = ''; return; }
@@ -372,25 +392,32 @@
       if (node) state.append(node);
       if (text) state.append(el('p', '', text));
     };
+    var show = function (releases) {
+      all = prepare(releases);
+      loaded = true;
+      render(view, all, input.value);
+      revealHash();
+    };
 
     input.value = readHash();
-    input.addEventListener('input', function () { clearTimeout(timer); timer = setTimeout(apply, 150); });
+    input.addEventListener('input', function () { cancel(timer); timer = later(apply, 150); });
     input.addEventListener('keydown', function (e) {
-      if (e.key === 'Escape' && input.value) { e.preventDefault(); clearTimeout(timer); input.value = ''; apply(); }
+      if (e.key === 'Escape' && input.value) { e.preventDefault(); input.value = ''; apply(); }
     });
 
-    fetchAll(root.fetch.bind(root)).then(function (res) {
-      all = prepare(res.releases);
+    var fetchFn = env.fetch || root.fetch.bind(root);
+    // then(ok, fail): ошибка в отрисовке не должна выдаваться за «нет связи».
+    return fetchAll(fetchFn).then(function (res) {
+      // Неполный список кэш не затирает: в нём может быть больше версий.
       if (!res.partial) saveCache(storage, res.releases, Date.now());
       setState(res.partial ? errorNode(res.partial) : null);
-      render(view, all, input.value);
-    }).catch(function (err) {
+      show(res.releases);
+    }, function (err) {
       var info = err && err.kind ? err : classifyError(err);
       var cached = loadCache(storage);
       if (cached) {
-        all = prepare(cached.releases);
         setState(errorNode(info), cacheNote(cached.savedAt));
-        render(view, all, input.value);
+        show(cached.releases);
       } else setState(errorNode(info));
     });
   }
@@ -402,7 +429,8 @@
     groupByDay: groupByDay, parseInline: parseInline, parseBody: parseBody, safeHref: safeHref,
     classifyError: classifyError, fetchAll: fetchAll,
     saveCache: saveCache, loadCache: loadCache, cacheNote: cacheNote,
-    renderBody: renderBody, renderRelease: renderRelease, render: render, errorNode: errorNode
+    renderBody: renderBody, renderRelease: renderRelease, render: render, errorNode: errorNode,
+    init: init
   };
   if (typeof module === 'object' && module.exports) module.exports = api;
   else if (typeof document !== 'undefined') init();
