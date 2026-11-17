@@ -5777,7 +5777,40 @@ fn smart_hint(text: &str) -> Option<Hint> {
             }
         }
     }
+    if foreign_phrase(t) {
+        let url = format!("https://translate.google.com/?sl=auto&tl=ru&op=translate&text={}", weather::encode(t));
+        return Some(Hint { glyph: "\u{E774}", label: "Перевести".into(), color: [0x7F, 0xC8, 0xFF], act: HintAct::Open(url) });
+    }
     None
+}
+
+/// Фраза на иностранном языке, которую стоит предложить перевести: хотя бы два слова, почти все буквы
+/// латинские, кириллицы нет, и это не похоже на код или команду.
+fn foreign_phrase(t: &str) -> bool {
+    let words = t.split_whitespace().filter(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 2).count();
+    let letters = t.chars().filter(|c| c.is_alphabetic()).count();
+    let latin = t.chars().filter(|c| c.is_ascii_alphabetic() || ('\u{C0}'..='\u{24F}').contains(c)).count();
+    let cyr = t.chars().any(|c| ('\u{400}'..='\u{4FF}').contains(&c));
+    let code = t.chars().filter(|c| "{}[]<>=;$\\|`_".contains(*c)).count();
+    words >= 2 && letters >= 6 && !cyr && latin * 10 >= letters * 9 && code == 0 && letters * 2 >= t.chars().count()
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+    #[test]
+    fn translate_hint() {
+        assert!(foreign_phrase("Hello, how are you?"));
+        assert!(foreign_phrase("Où est la bibliothèque"));
+        assert!(!foreign_phrase("Привет, как дела"));
+        assert!(!foreign_phrase("hello"));
+        assert!(!foreign_phrase("let x = vec![1, 2];"));
+        assert!(!foreign_phrase("cargo build --release_mode"));
+        assert!(!foreign_phrase("12 34 56 ab"));
+        assert!(matches!(smart_hint("good morning everyone").map(|h| h.label), Some(l) if l == "Перевести"));
+        // ссылки и почта по-прежнему узнаются первыми
+        assert!(matches!(smart_hint("https://example.org").map(|h| h.label), Some(l) if l == "Открыть ссылку"));
+    }
 }
 
 /// Кольцо-шкала: тусклая дорожка и цветная дуга от верхней точки по часовой стрелке.
