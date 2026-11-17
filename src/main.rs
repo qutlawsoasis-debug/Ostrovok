@@ -5139,8 +5139,9 @@ impl App {
             self.clip_imgs.insert(0, it);
             return;
         }
+        let Some((tw, th_h)) = clip_thumb_size(w, h) else { return };
         let Some(full) = image::RgbaImage::from_raw(w as u32, h as u32, px.clone()) else { return };
-        let th = image::imageops::thumbnail(&full, (256 * w / w.max(h)).max(1) as u32, (256 * h / w.max(h)).max(1) as u32);
+        let th = image::imageops::thumbnail(&full, tw, th_h);
         let tex = ctx.load_texture(format!("clip{hash:x}"), egui::ColorImage::from_rgba_unmultiplied([th.width() as usize, th.height() as usize], th.as_raw()), egui::TextureOptions::LINEAR);
         self.clip_imgs.insert(0, ClipImg { w, h, px, hash, tex });
         self.clip_imgs.truncate(8);
@@ -9015,6 +9016,27 @@ impl ClipTx {
         (ClipTx::Translit, "Транслит", "Русские буквы латиницей: Щука → Shchuka"),
         (ClipTx::Layout, "Раскладка", "Набрано не в той раскладке: ghbdtn → привет"),
     ];
+}
+
+/// Размер миниатюры картинки из буфера (длинная сторона 256). Пустая картинка 0×N
+/// из чужой программы раньше роняла панель делением на ноль.
+fn clip_thumb_size(w: usize, h: usize) -> Option<(u32, u32)> {
+    if w == 0 || h == 0 || w > u32::MAX as usize || h > u32::MAX as usize {
+        return None;
+    }
+    let m = w.max(h) as u64;
+    Some(((256 * w as u64 / m).max(1) as u32, (256 * h as u64 / m).max(1) as u32))
+}
+
+#[cfg(test)]
+mod clip_thumb_tests {
+    #[test]
+    fn empty_image_does_not_panic() {
+        assert_eq!(super::clip_thumb_size(0, 0), None);
+        assert_eq!(super::clip_thumb_size(0, 10), None);
+        assert_eq!(super::clip_thumb_size(1000, 500), Some((256, 128)));
+        assert_eq!(super::clip_thumb_size(1, 100000), Some((1, 256)));
+    }
 }
 
 fn clip_transform(tx: ClipTx, text: &str) -> String {

@@ -154,11 +154,18 @@ pub fn dir() -> PathBuf {
 /// Если питание пропадёт посреди записи, останется прежний целый файл, а не обрезок.
 pub fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let tmp = path.with_extension("tmp");
+    // своё имя временного файла на каждую запись: два одновременных сохранения
+    // не должны писать в один и тот же .tmp и подменять файл обрезком
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}.{n}.tmp", std::process::id()));
     {
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?;
+        if let Err(e) = f.write_all(data).and_then(|_| f.sync_all()) {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
     }
     // антивирус или OneDrive могут на мгновение держать файл — пробуем несколько раз
     let mut last = Ok(());
@@ -235,6 +242,10 @@ mod tests {
         super::write_atomic(&path, b"first").unwrap();
         super::write_atomic(&path, "второй".as_bytes()).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "второй");
+        let hs: Vec<_> = (0..8).map(|i| { let p = path.clone(); std::thread::spawn(move || super::write_atomic(&p, format!("поток {i} ").repeat(5000).as_bytes()).unwrap()) }).collect();
+        hs.into_iter().for_each(|h| h.join().unwrap());
+        let got = std::fs::read_to_string(&path).unwrap();
+        assert!((0..8).any(|i| got == format!("поток {i} ").repeat(5000)), "файл склеен из разных записей");
         assert!(!path.with_extension("tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
