@@ -34,6 +34,21 @@ pub enum Cmd {
     Toggle,
     Next,
     Prev,
+    /// перемотать на позицию, секунды от начала
+    Seek(f64),
+}
+
+/// Куда перемотать по щелчку в точке x на полосе [left, left+width] трека длиной dur секунд.
+pub fn seek_secs(x: f32, left: f32, width: f32, dur: f64) -> Option<f64> {
+    if width <= 0.0 || !(dur > 0.0) {
+        return None;
+    }
+    Some(((x - left) / width).clamp(0.0, 1.0) as f64 * dur)
+}
+
+/// Секунды → единицы Windows Media (100 нс); отрицательное — в ноль.
+pub fn secs_to_ticks(secs: f64) -> i64 {
+    (secs.max(0.0) * 10_000_000.0).round() as i64
 }
 
 pub fn spawn() -> (Arc<Mutex<State>>, mpsc::Sender<Cmd>) {
@@ -61,6 +76,8 @@ pub fn spawn() -> (Arc<Mutex<State>>, mpsc::Sender<Cmd>) {
                     Cmd::Toggle => s.TryTogglePlayPauseAsync().and_then(|o| o.get()),
                     Cmd::Next => s.TrySkipNextAsync().and_then(|o| o.get()),
                     Cmd::Prev => s.TrySkipPreviousAsync().and_then(|o| o.get()),
+                    // плеер может не уметь перематывать — тогда Windows просто ответит отказом
+                    Cmd::Seek(secs) => s.TryChangePlaybackPositionAsync(secs_to_ticks(*secs)).and_then(|o| o.get()),
                 };
                 std::thread::sleep(Duration::from_millis(120));
             }
@@ -228,6 +245,27 @@ pub fn clean_artist(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seek_by_click() {
+        // полоса от x=100 шириной 200, трек 240 с
+        assert_eq!(seek_secs(100.0, 100.0, 200.0, 240.0), Some(0.0));
+        assert_eq!(seek_secs(200.0, 100.0, 200.0, 240.0), Some(120.0));
+        assert_eq!(seek_secs(300.0, 100.0, 200.0, 240.0), Some(240.0));
+        assert_eq!(seek_secs(50.0, 100.0, 200.0, 240.0), Some(0.0), "левее полосы — начало");
+        assert_eq!(seek_secs(999.0, 100.0, 200.0, 240.0), Some(240.0), "правее — конец");
+        assert_eq!(seek_secs(150.0, 100.0, 200.0, 0.0), None, "длительность неизвестна");
+        assert_eq!(seek_secs(150.0, 100.0, 0.0, 240.0), None);
+        assert_eq!(seek_secs(150.0, 100.0, 200.0, f64::NAN), None);
+    }
+
+    #[test]
+    fn ticks() {
+        assert_eq!(secs_to_ticks(1.5), 15_000_000);
+        assert_eq!(secs_to_ticks(0.0), 0);
+        assert_eq!(secs_to_ticks(-3.0), 0);
+    }
+
     #[test]
     fn titles() {
         assert_eq!(clean_title("(18)TikTok - Make Your Day"), "TikTok - Make Your Day");

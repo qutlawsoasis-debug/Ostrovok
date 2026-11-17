@@ -3728,12 +3728,42 @@ impl App {
         text.text(pos2(x, row.top() + 4.0), Align2::LEFT_TOP, &m.title, semi(18.0), FG);
         text.text(pos2(x, row.top() + 30.0), Align2::LEFT_TOP, &m.artist, FontId::proportional(13.5), DIM);
         // полоса прогресса со временем
-        let track = Rect::from_min_max(pos2(x, row.top() + 62.0), pos2(row.right(), row.top() + 67.0));
-        p.rect_filled(track, Rounding::same(2.5), rgba(255, 255, 255, 0x33));
+        // щелчок или перетаскивание по полосе перематывают трек
+        let bar = Rect::from_min_max(pos2(x, row.top() + 62.0), pos2(row.right(), row.top() + 67.0));
+        let seek = ui.interact(bar.expand2(vec2(6.0, 8.0)), ui.id().with("music-seek"), if m.dur > 0.0 { Sense::click_and_drag() } else { Sense::hover() });
+        let grab = ui.ctx().animate_bool_with_time(seek.id.with("hov"), m.dur > 0.0 && (seek.hovered() || seek.dragged()), 0.12);
+        let track = bar.expand2(vec2(0.0, 1.5 * grab));
+        p.rect_filled(track, Rounding::same(2.5 + 1.5 * grab), rgba(255, 255, 255, 0x33));
+        let mut at = at;
+        // при перетаскивании мышь может уйти с полосы — тогда берём её последнее положение
+        let busy = seek.dragged() || seek.drag_stopped() || seek.clicked();
+        let ptr = if busy { ui.ctx().pointer_latest_pos() } else { seek.hover_pos() };
+        if let Some(ptr) = ptr.filter(|_| m.dur > 0.0) {
+            let to = media::seek_secs(ptr.x, track.left(), track.width(), m.dur);
+            if let Some(to) = to {
+                // где окажемся — время над курсором
+                let tip = pos2(ptr.x.clamp(track.left() + 16.0, track.right() - 16.0), track.top() - 12.0);
+                let g = p.layout_no_wrap(clock(to), FontId::proportional(11.0), FG);
+                let r = Rect::from_center_size(tip, g.size() + vec2(10.0, 4.0));
+                p.rect_filled(r, Rounding::same(6.0), rgba(10, 10, 18, (210.0 * grab) as u8));
+                p.galley(r.min + vec2(5.0, 2.0), g, FG);
+                if seek.dragged() || seek.clicked() {
+                    at = to; // ползунок едет за мышью сразу
+                }
+                if seek.drag_stopped() || seek.clicked() {
+                    let _ = self.media_tx.send(media::Cmd::Seek(to));
+                    // не ждём опроса плеера: позиция обновляется сразу
+                    if let Some(info) = self.media.lock().unwrap().info.as_mut() {
+                        info.pos = to;
+                        info.at = Instant::now();
+                    }
+                }
+            }
+        }
         if m.dur > 0.0 {
             let done = Rect::from_min_max(track.min, pos2(track.left() + track.width() * (at / m.dur) as f32, track.bottom()));
-            p.rect_filled(done, Rounding::same(2.5), accent);
-            p.circle_filled(pos2(done.right(), track.center().y), 5.0, FG);
+            p.rect_filled(done, Rounding::same(2.5 + 1.5 * grab), accent);
+            p.circle_filled(pos2(done.right(), track.center().y), 5.0 + 2.0 * grab, FG);
             p.text(pos2(x, track.bottom() + 6.0), Align2::LEFT_TOP, clock(at), FontId::proportional(11.5), DIM);
             p.text(pos2(row.right(), track.bottom() + 6.0), Align2::RIGHT_TOP, clock(m.dur), FontId::proportional(11.5), DIM);
         }
