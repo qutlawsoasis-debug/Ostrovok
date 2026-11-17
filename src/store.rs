@@ -130,6 +130,13 @@ pub struct Reminder {
     pub text: String,
     /// время срабатывания, секунды с 1970 года
     pub at: i64,
+    /// повтор: 0 — нет, 1 — каждый день, 2 — по будням, 3 — каждую неделю
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub repeat: u8,
+}
+
+fn is_zero(v: &u8) -> bool {
+    *v == 0
 }
 
 pub fn dir() -> PathBuf {

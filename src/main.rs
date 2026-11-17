@@ -1008,6 +1008,8 @@ struct App {
     pick_at: Option<Instant>,
     remind_text: String,
     remind_time: String,
+    /// повтор для нового напоминания (см. repeat_name)
+    remind_repeat: u8,
     lyrics: Vec<(f64, String)>,
     lyrics_key: String,
     /// системное размытие фона включено (None — ещё не пробовали)
@@ -1294,6 +1296,7 @@ impl App {
             pick_at: None,
             remind_text: String::new(),
             remind_time: String::new(),
+            remind_repeat: 0,
             lyrics: Vec::new(),
             lyrics_key: String::new(),
             acrylic: None,
@@ -1383,7 +1386,7 @@ impl App {
         }
         // для снимков отсчёта в пилюле: OSTROVOK_SOON=7 — напоминание через 7 минут
         if let Some(m) = std::env::var("OSTROVOK_SOON").ok().and_then(|v| v.parse::<i64>().ok()).filter(|_| test_mode()) {
-            app.cfg.reminders.push(store::Reminder { text: "Позвонить".into(), at: chrono::Local::now().timestamp() + m * 60 - 5 });
+            app.cfg.reminders.push(store::Reminder { text: "Позвонить".into(), at: chrono::Local::now().timestamp() + m * 60 - 5, repeat: 0 });
         }
         // для снимков недели фокуса: OSTROVOK_FOCUS=30,55,0,80,25,110,50 — минуты за 7 дней, сегодня последним
         if let Some(list) = std::env::var("OSTROVOK_FOCUS").ok().filter(|_| test_mode()) {
@@ -1409,6 +1412,15 @@ impl App {
             for _ in 0..n {
                 app.push_inbox(live::Notice { app: "Telegram".into(), title: "Мирон".into(), body: "привет".into() }, [0x2A, 0xAB, 0xEE]);
             }
+        }
+        // для снимков повторяющихся напоминаний: OSTROVOK_REPEAT=1 — три повтора и одно разовое
+        if test_mode() && std::env::var_os("OSTROVOK_REPEAT").is_some() {
+            let now = chrono::Local::now().timestamp();
+            for (text, mins, repeat) in [("Сделать перерыв для глаз", 40, 1u8), ("Стендап команды", 300, 2), ("Резервная копия проекта", 1500, 3), ("Забрать посылку", 90, 0)] {
+                app.cfg.reminders.push(store::Reminder { text: text.into(), at: now + mins * 60, repeat });
+            }
+            app.cfg.reminders.sort_by_key(|r| r.at);
+            app.remind_repeat = 2;
         }
         // для снимков праздников в календаре: OSTROVOK_CALDAY=11-04 — открыть этот день (ближайший впереди)
         if let Some(v) = std::env::var("OSTROVOK_CALDAY").ok().filter(|_| test_mode()) {
@@ -1437,7 +1449,7 @@ impl App {
                 let m = mid.timestamp();
                 let soon = (now.timestamp() + 3600).min(m + 86_340);
                 for (text, at) in [("Зарядка", m + 8 * 3600), ("Созвон с командой", soon), ("Полить цветы", m + 21 * 3600 + 1800)] {
-                    app.cfg.reminders.push(store::Reminder { text: text.into(), at });
+                    app.cfg.reminders.push(store::Reminder { text: text.into(), at, repeat: 0 });
                 }
             }
         }
@@ -1535,7 +1547,7 @@ impl App {
                     // для снимков: несколько дел на ближайшие дни
                     let now = chrono::Local::now().timestamp();
                     for (days, hour, text) in [(0, 3, "Созвон с командой"), (0, 5, "Забрать посылку"), (2, 4, "Оплатить интернет"), (6, 2, "День рождения Миши")] {
-                        app.cfg.reminders.push(store::Reminder { text: text.into(), at: now + days * 86400 + hour * 3600 });
+                        app.cfg.reminders.push(store::Reminder { text: text.into(), at: now + days * 86400 + hour * 3600, repeat: 0 });
                     }
                     Tab::Calendar
                 }
@@ -1891,7 +1903,7 @@ impl App {
                 // .earliest(): в ночь перевода часов время 02:30 бывает дважды — берём первое
                 match chrono::Local.from_local_datetime(&at).earliest() {
                     Some(t) => {
-                        self.cfg.reminders.push(store::Reminder { text, at: t.timestamp() });
+                        self.cfg.reminders.push(store::Reminder { text, at: t.timestamp(), repeat: 0 });
                         self.cfg.reminders.sort_by_key(|r| r.at);
                         self.cfg.save();
                         self.notify(&format!("Напомню в {}", at.format("%H:%M")));
@@ -2213,7 +2225,19 @@ impl App {
         let stamp = chrono::Local::now().timestamp();
         if self.cfg.reminders.iter().any(|r| r.at <= stamp) {
             let due: Vec<String> = self.cfg.reminders.iter().filter(|r| r.at <= stamp).map(|r| r.text.clone()).collect();
+            // повторяющиеся переносим на следующий срок, разовые удаляем
+            let now_local = chrono::Local::now().naive_local();
+            for r in self.cfg.reminders.iter_mut().filter(|r| r.at <= stamp && r.repeat != 0) {
+                let next = chrono::DateTime::from_timestamp(r.at, 0)
+                    .and_then(|d| next_due(d.with_timezone(&chrono::Local).naive_local(), r.repeat, now_local))
+                    .and_then(|n| n.and_local_timezone(chrono::Local).earliest());
+                match next {
+                    Some(n) => r.at = n.timestamp(),
+                    None => r.repeat = 0,
+                }
+            }
             self.cfg.reminders.retain(|r| r.at > stamp);
+            self.cfg.reminders.sort_by_key(|r| r.at);
             self.cfg.save();
             sys::beep();
             self.show_toast("\u{E823}", [0xFF, 0x6B, 0x61], "Напоминание", &due.join("; "), 12, false);
@@ -2908,6 +2932,18 @@ impl App {
                     }
                 }
             }
+            // повтор: щелчок перебирает «без повтора → каждый день → по будням → каждую неделю»
+            let on = self.remind_repeat != 0;
+            let label = format!("\u{E8EE}  {}", repeat_name(self.remind_repeat));
+            let w = ui.painter().layout_no_wrap(label.clone(), FontId::proportional(12.0), FG).size().x + 20.0;
+            let (r, resp) = ui.allocate_exact_size(vec2(w, 26.0), Sense::click());
+            let resp = resp.on_hover_text("Повтор нового напоминания — щелчок меняет");
+            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
+            glass_chip(ui.painter(), r, 13.0, if on { 1.1 } else { 0.4 + 0.5 * hov });
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.0), if on { accent() } else { mix(DIM, FG, hov) });
+            if resp.clicked() {
+                self.remind_repeat = (self.remind_repeat + 1) % 4;
+            }
         });
         ui.add_space(2.0);
         ui.label(RichText::new("Можно и из поиска: «напомни 18:30 позвонить» или «напомни через 15 мин чай».").color(DIM).size(11.5));
@@ -2927,7 +2963,15 @@ impl App {
                     .unwrap_or_default();
                 let p = ui.painter().with_clip_rect(row);
                 p.text(pos2(row.left() + 14.0, row.center().y), Align2::LEFT_CENTER, when, semi(13.0), accent());
-                p.text(pos2(row.left() + 120.0, row.center().y), Align2::LEFT_CENTER, &r.text, FontId::proportional(13.5), FG);
+                let mut text_end = row.right() - 40.0;
+                if r.repeat != 0 {
+                    let g = p.layout_no_wrap(format!("\u{E8EE} {}", repeat_name(r.repeat)), FontId::proportional(11.5), accent());
+                    let at = pos2(text_end - g.size().x, row.center().y - g.size().y / 2.0);
+                    text_end = at.x - 10.0;
+                    p.galley(at, g, accent());
+                }
+                p.with_clip_rect(Rect::from_min_max(pos2(row.left() + 120.0, row.top()), pos2(text_end, row.bottom())))
+                    .text(pos2(row.left() + 120.0, row.center().y), Align2::LEFT_CENTER, &r.text, FontId::proportional(13.5), FG);
                 let x = Rect::from_center_size(pos2(row.right() - 20.0, row.center().y), vec2(26.0, 26.0));
                 let resp = ui.interact(x, ui.id().with(("del-reminder", i)), Sense::click());
                 ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(12.0), if resp.hovered() { FG } else { DIM });
@@ -2960,7 +3004,7 @@ impl App {
         };
         match at {
             Some(at) => {
-                self.cfg.reminders.push(store::Reminder { text, at });
+                self.cfg.reminders.push(store::Reminder { text, at, repeat: self.remind_repeat });
                 self.cfg.reminders.sort_by_key(|r| r.at);
                 self.cfg.save();
                 self.remind_text.clear();
@@ -5914,7 +5958,7 @@ impl App {
                 None => self.notify("Не понял время: напишите, например, 18:30"),
                 Some(at) if at <= Local::now().timestamp() => self.notify("Это время уже прошло"),
                 Some(at) => {
-                    self.cfg.reminders.push(store::Reminder { text, at });
+                    self.cfg.reminders.push(store::Reminder { text, at, repeat: 0 });
                     self.cfg.reminders.sort_by_key(|r| r.at);
                     self.cfg.save();
                     self.cal_text.clear();
@@ -7556,6 +7600,67 @@ fn ru_holiday(month: u32, day: u32) -> Option<&'static str> {
     })
 }
 
+/// Повтор напоминания: 0 — нет, 1 — каждый день, 2 — по будням, 3 — каждую неделю.
+fn repeat_name(repeat: u8) -> &'static str {
+    match repeat {
+        1 => "каждый день",
+        2 => "по будням",
+        3 => "каждую неделю",
+        _ => "без повтора",
+    }
+}
+
+/// Следующий срок повторяющегося напоминания — первый позже `now`, по местному времени.
+fn next_due(at: chrono::NaiveDateTime, repeat: u8, now: chrono::NaiveDateTime) -> Option<chrono::NaiveDateTime> {
+    use chrono::Datelike;
+    let step = match repeat {
+        1 | 2 => chrono::Duration::days(1),
+        3 => chrono::Duration::days(7),
+        _ => return None,
+    };
+    let mut next = at;
+    // ограничение на всякий случай: больше чем за десять лет не проматываем
+    for _ in 0..4000 {
+        next += step;
+        if repeat == 2 && next.weekday().num_days_from_monday() >= 5 {
+            continue;
+        }
+        if next > now {
+            return Some(next);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod repeat_tests {
+    use super::*;
+    fn t(y: i32, m: u32, d: u32, h: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, 0, 0).unwrap()
+    }
+    #[test]
+    fn next_terms() {
+        // 20 ноября 2026 — пятница
+        assert_eq!(next_due(t(2026, 11, 20, 9), 0, t(2026, 11, 20, 9)), None);
+        assert_eq!(next_due(t(2026, 11, 20, 9), 1, t(2026, 11, 20, 9)), Some(t(2026, 11, 21, 9)));
+        assert_eq!(next_due(t(2026, 11, 20, 9), 2, t(2026, 11, 20, 9)), Some(t(2026, 11, 23, 9)));
+        assert_eq!(next_due(t(2026, 11, 20, 9), 3, t(2026, 11, 20, 9)), Some(t(2026, 11, 27, 9)));
+        // конец месяца и года
+        assert_eq!(next_due(t(2026, 1, 31, 8), 1, t(2026, 1, 31, 8)), Some(t(2026, 2, 1, 8)));
+        assert_eq!(next_due(t(2026, 12, 28, 8), 3, t(2026, 12, 28, 8)), Some(t(2027, 1, 4, 8)));
+        // будни: суббота сама по себе переходит на понедельник
+        assert_eq!(next_due(t(2026, 11, 21, 9), 2, t(2026, 11, 21, 9)), Some(t(2026, 11, 23, 9)));
+    }
+    #[test]
+    fn skips_missed() {
+        // компьютер был выключен три дня — следующий срок первый после «сейчас»
+        assert_eq!(next_due(t(2026, 11, 10, 9), 1, t(2026, 11, 13, 12)), Some(t(2026, 11, 14, 9)));
+        assert_eq!(next_due(t(2026, 11, 2, 9), 3, t(2026, 11, 20, 10)), Some(t(2026, 11, 23, 9)));
+        assert_eq!(repeat_name(2), "по будням");
+        assert_eq!(repeat_name(9), "без повтора");
+    }
+}
+
 #[cfg(test)]
 mod holiday_tests {
     use super::*;
@@ -7700,7 +7805,7 @@ mod quiet_tests {
 mod day_strip_tests {
     use super::*;
     fn r(text: &str, at: i64) -> store::Reminder {
-        store::Reminder { text: text.into(), at }
+        store::Reminder { text: text.into(), at, repeat: 0 }
     }
     #[test]
     fn marks_only_today_sorted() {
