@@ -946,15 +946,64 @@ pub fn top_memory(n: usize) -> Vec<(String, u64)> {
         }
         let _ = CloseHandle(snap);
     }
-    let mut list: Vec<(String, u64)> = sum
-        .into_iter()
-        .map(|(name, bytes)| {
-            let stem = name.strip_suffix(".exe").or_else(|| name.strip_suffix(".EXE")).unwrap_or(&name);
-            let mut c = stem.chars();
-            (c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default(), bytes)
+    let mut list: Vec<(String, u64)> = sum.into_iter().map(|(name, bytes)| (pretty_name(&name), bytes)).collect();
+    list.sort_by(|a, b| b.1.cmp(&a.1));
+    list.truncate(n);
+    list
+}
+
+/// «chrome.exe» → «Chrome»: так программа называется в списках монитора.
+pub fn pretty_name(file: &str) -> String {
+    let stem = file.strip_suffix(".exe").or_else(|| file.strip_suffix(".EXE")).unwrap_or(file);
+    let mut c = stem.chars();
+    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+}
+
+/// Суммарное процессорное время (ядро + пользователь, в 100 нс) каждой программы, сложенное по имени.
+pub fn proc_times() -> std::collections::HashMap<String, u64> {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    use windows::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    let ft = |f: FILETIME| (f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64;
+    let mut sum = std::collections::HashMap::new();
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return sum };
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                let len = e.szExeFile.iter().position(|c| *c == 0).unwrap_or(e.szExeFile.len());
+                if let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, e.th32ProcessID) {
+                    let (mut a, mut b, mut k, mut u) = Default::default();
+                    if GetProcessTimes(h, &mut a, &mut b, &mut k, &mut u).is_ok() {
+                        *sum.entry(pretty_name(&String::from_utf16_lossy(&e.szExeFile[..len]))).or_default() += ft(k) + ft(u);
+                    }
+                    let _ = CloseHandle(h);
+                }
+                if Process32NextW(snap, &mut e).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    sum
+}
+
+/// Кто больше всех грузил процессор между двумя снимками proc_times: доля всей машины (0..1), по убыванию.
+/// Программы, появившиеся только во втором снимке или с уменьшившимся временем (перезапуск), пропускаются.
+pub fn cpu_top(prev: &std::collections::HashMap<String, u64>, cur: &std::collections::HashMap<String, u64>, elapsed_100ns: u64, cores: usize, n: usize) -> Vec<(String, f32)> {
+    if elapsed_100ns == 0 {
+        return Vec::new();
+    }
+    let whole = elapsed_100ns as f64 * cores.max(1) as f64;
+    let mut list: Vec<(String, f32)> = cur
+        .iter()
+        .filter_map(|(name, t)| {
+            let d = t.checked_sub(*prev.get(name)?)?;
+            (d > 0).then(|| (name.clone(), (d as f64 / whole).min(1.0) as f32))
         })
         .collect();
-    list.sort_by(|a, b| b.1.cmp(&a.1));
+    list.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     list.truncate(n);
     list
 }
@@ -1096,5 +1145,46 @@ pub fn drag_file(path: &str) -> bool {
         let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(path), None) else { return false };
         let Ok(data) = item.BindToHandler::<_, IDataObject>(None, &BHID_DataObject) else { return false };
         SHDoDragDrop(None, &data, None, DROPEFFECT_COPY | DROPEFFECT_LINK).is_ok()
+    }
+}
+
+#[cfg(test)]
+mod cpu_top_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn m(v: &[(&str, u64)]) -> HashMap<String, u64> {
+        v.iter().map(|(k, t)| (k.to_string(), *t)).collect()
+    }
+
+    #[test]
+    fn shares_of_whole_machine_sorted() {
+        // 1 с = 10_000_000 по 100 нс, 4 ядра → вся машина = 40_000_000
+        let prev = m(&[("Chrome", 1_000), ("Game", 0), ("Idle", 5)]);
+        let cur = m(&[("Chrome", 10_001_000), ("Game", 20_000_000), ("Idle", 5), ("New", 4_000_000)]);
+        let top = cpu_top(&prev, &cur, 10_000_000, 4, 2);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].0, "Game");
+        assert!((top[0].1 - 0.5).abs() < 1e-4);
+        assert_eq!(top[1].0, "Chrome");
+        assert!((top[1].1 - 0.25).abs() < 1e-4);
+    }
+
+    #[test]
+    fn skips_new_shrunk_idle_and_bad_input() {
+        let prev = m(&[("A", 500), ("B", 100)]);
+        let cur = m(&[("A", 100), ("B", 100), ("C", 9_999)]);
+        assert!(cpu_top(&prev, &cur, 10_000_000, 4, 5).is_empty());
+        assert!(cpu_top(&prev, &prev, 0, 4, 5).is_empty());
+        let top = cpu_top(&m(&[("X", 0)]), &m(&[("X", 99_000_000)]), 10_000_000, 0, 5);
+        assert_eq!(top[0].1, 1.0, "ноль ядер считаем одним, доля не больше 1");
+    }
+
+    #[test]
+    fn pretty_names() {
+        assert_eq!(pretty_name("chrome.exe"), "Chrome");
+        assert_eq!(pretty_name("GAME.EXE"), "GAME");
+        assert_eq!(pretty_name("ёлка.exe"), "Ёлка");
+        assert_eq!(pretty_name(""), "");
     }
 }
