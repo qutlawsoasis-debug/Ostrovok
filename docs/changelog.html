@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Что нового — Островок</title>
+<meta name="description" content="Все версии Островка — живой панели для Windows: что изменилось в каждой, с поиском и по дням.">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="icon.png">
+<style>
+:root{
+  --bg:#08080f; --ink:#f4f4f8; --dim:#a7aac0; --mute:#6f7290;
+  --acc:#b9a4ff; --acc2:#7fc8ff; --glass:rgba(255,255,255,.055); --line:rgba(255,255,255,.09);
+  --r:22px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  background:var(--bg); color:var(--ink); overflow-x:hidden;
+  font:16px/1.6 "Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,"Inter",sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+a{color:inherit}
+.sky{position:fixed;inset:0;z-index:-1;pointer-events:none;
+  background:
+   radial-gradient(900px 520px at 15% -10%, rgba(140,110,255,.22), transparent 60%),
+   radial-gradient(800px 600px at 95% 10%, rgba(80,170,255,.16), transparent 60%),
+   radial-gradient(700px 500px at 50% 110%, rgba(190,120,255,.10), transparent 60%);}
+.sky::after{content:"";position:absolute;inset:0;opacity:.06;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence baseFrequency='.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");}
+
+/* ── живая пилюля наверху */
+.island{position:fixed;top:10px;left:50%;transform:translateX(-50%);z-index:20;
+  height:40px;min-width:210px;padding:0 16px 0 10px;border-radius:999px;
+  background:linear-gradient(180deg,#17172a,#0c0c16);
+  box-shadow:0 0 0 1px rgba(255,255,255,.08) inset,0 10px 30px rgba(0,0,0,.55),0 0 40px rgba(185,164,255,.12);
+  display:flex;align-items:center;gap:12px;overflow:hidden;cursor:default;
+  transition:height .5s cubic-bezier(.2,.9,.25,1.15),min-width .5s cubic-bezier(.2,.9,.25,1.15),border-radius .5s,padding .5s;}
+.island .face{width:26px;height:20px;position:relative;flex:none}
+.island .face i{position:absolute;top:5px;width:7px;height:9px;border-radius:50%;background:#fff;animation:blink 5s infinite}
+.island .face i:first-child{left:3px}.island .face i:last-child{right:3px}
+@keyframes blink{0%,94%,100%{transform:scaleY(1)}96%{transform:scaleY(.1)}}
+.island .clock{font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:.3px}
+.island .eq{display:flex;gap:3px;align-items:flex-end;height:16px;margin-left:auto}
+.island .eq b{width:3px;border-radius:2px;background:var(--acc);animation:eq 1s ease-in-out infinite}
+.island .eq b:nth-child(2){animation-delay:-.3s;background:#a9b6ff}
+.island .eq b:nth-child(3){animation-delay:-.6s;background:var(--acc2)}
+.island .eq b:nth-child(4){animation-delay:-.15s}
+@keyframes eq{0%,100%{height:4px}50%{height:16px}}
+
+/* ── общее */
+.wrap{max-width:1120px;margin:0 auto;padding:0 24px}
+h1,h2,h3,h4{font-family:"Segoe UI Variable Display","Segoe UI",system-ui,sans-serif;letter-spacing:-.02em}
+.kicker{font-size:13px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--acc)}
+.lead{color:var(--dim);font-size:18px;max-width:640px}
+.glass{background:var(--glass);border:1px solid var(--line);border-radius:var(--r);
+  backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
+.note{font-size:13px;color:var(--mute)}
+.btn{display:inline-flex;align-items:center;gap:10px;padding:12px 20px;border-radius:16px;font:inherit;
+  font-weight:600;text-decoration:none;color:inherit;cursor:pointer;transition:transform .2s,background .2s}
+.btn:hover{transform:translateY(-2px)}
+.btn.ghost{background:var(--glass);border:1px solid var(--line)}
+.btn.ghost:hover{background:rgba(255,255,255,.09)}
+
+/* ── шапка */
+.top{padding:90px 24px 26px}
+.back{display:inline-block;margin-bottom:26px;color:var(--dim);text-decoration:none;font-size:14px}
+.back:hover{color:var(--ink)}
+.top h1{font-size:clamp(36px,6vw,56px);line-height:1.05;font-weight:700;margin:10px 0 14px;
+  background:linear-gradient(180deg,#fff 30%,#c9bdff);-webkit-background-clip:text;background-clip:text;color:transparent}
+.search{display:flex;align-items:center;gap:10px;max-width:520px;margin-top:28px;padding:0 16px;border-radius:16px}
+.search svg{width:18px;height:18px;flex:none;stroke:var(--mute);fill:none;stroke-width:2.2;stroke-linecap:round}
+.search input{flex:1;min-width:0;height:48px;background:none;border:0;outline:0;color:var(--ink);font:inherit;font-size:16px}
+.search input::placeholder{color:var(--mute)}
+.search:focus-within{border-color:rgba(185,164,255,.45)}
+.top .count{margin-top:12px;min-height:1.6em;font-size:14px;color:var(--mute);font-variant-numeric:tabular-nums}
+
+/* ── состояние загрузки и ошибки */
+.state{margin:10px 0 24px}
+.state p + p{margin-top:6px}
+.err a{display:inline-block;margin-top:6px;color:var(--acc2)}
+
+/* ── дни и версии */
+main{padding-bottom:80px}
+.day{margin-top:34px}
+.dayh{position:sticky;top:60px;z-index:5;padding:8px 0;background:var(--bg);font-size:20px}
+.dayh .count{color:var(--mute);font-weight:400;font-size:15px}
+.news{display:grid;gap:14px;margin-top:10px}
+.rel{display:grid;grid-template-columns:120px 1fr;gap:22px;padding:22px 26px}
+.rel .v{font-weight:700;font-size:20px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.rel .d{color:var(--mute);font-size:13px;margin-top:2px;font-variant-numeric:tabular-nums}
+.rel .new{display:inline-block;margin-top:8px;font-size:11px;font-weight:700;letter-spacing:.08em;padding:3px 8px;border-radius:999px;background:var(--acc);color:#15122a}
+.rel.first{border-color:rgba(185,164,255,.35);background:linear-gradient(135deg,rgba(185,164,255,.10),rgba(255,255,255,.04))}
+.body{min-width:0;overflow-wrap:anywhere}
+.body > p:first-child{color:var(--ink);font-weight:600;font-size:16.5px;line-height:1.4}
+.body p{color:var(--dim);font-size:14.5px;white-space:pre-line}
+.body p + *,.body ul + *{margin-top:8px}
+.body h4{font-size:15px;margin-top:14px;color:var(--ink)}
+.body h4:first-child{margin-top:0}
+.body ul{list-style:none;display:grid;gap:5px;margin-top:6px}
+.body li{color:var(--dim);font-size:14.5px;padding-left:18px;position:relative}
+.body li::before{content:"";position:absolute;left:3px;top:.65em;width:6px;height:6px;border-radius:50%;background:var(--acc)}
+.body strong{color:var(--ink);font-weight:600}
+.body code{font:13px/1.4 Consolas,"Cascadia Mono",monospace;padding:1px 6px;border-radius:6px;background:rgba(255,255,255,.08);color:var(--ink)}
+.body .open{display:inline-block;margin-top:12px;font-size:13px;color:var(--acc2);text-decoration:none}
+.body .open:hover{text-decoration:underline}
+.empty{padding:26px;margin-top:34px;color:var(--dim)}
+.empty .btn{margin-top:14px}
+
+/* появление карточек: новые сразу видимы, анимация при поиске не повторяется */
+.rise{opacity:0;transform:translateY(26px);transition:opacity .8s ease,transform .8s cubic-bezier(.2,.8,.2,1)}
+.rise.in{opacity:1;transform:none}
+
+footer{border-top:1px solid var(--line);padding:30px 0 50px;color:var(--mute);font-size:14px}
+footer .wrap{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}
+footer a{color:var(--dim);text-decoration:none}footer a:hover{color:var(--ink)}
+
+@media (max-width:820px){
+  .wrap{padding:0 16px}
+  .top{padding:80px 16px 20px}
+  .search{max-width:none;width:100%}
+  .rel{grid-template-columns:1fr;gap:10px;padding:18px}
+  .rel .side{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+  .rel .new{margin-top:0}
+  .body code{white-space:normal}
+}
+@media (prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+  html{scroll-behavior:auto}
+  .rise{opacity:1;transform:none}
+}
+</style>
+</head>
+<body>
+<div class="sky"></div>
+
+<div class="island" aria-hidden="true">
+  <div class="face"><i></i><i></i></div>
+  <span class="clock" id="clock">12:00</span>
+  <span class="eq"><b></b><b></b><b></b><b></b></span>
+</div>
+
+<header class="top wrap">
+  <a class="back" href="./">← Островок</a>
+  <div class="kicker">Что нового</div>
+  <h1>Все изменения</h1>
+  <p class="lead">Каждая версия Островка — из релизов на GitHub. У вас они появляются сами.</p>
+  <label class="search glass">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+    <input id="q" type="search" placeholder="Поиск по изменениям" autocomplete="off" aria-label="Поиск по изменениям">
+  </label>
+  <p class="count" id="count" aria-live="polite"></p>
+</header>
+
+<main class="wrap">
+  <div id="state" class="state note" role="status">Загружаю список версий…</div>
+  <div id="list"></div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Островок · лицензия MIT</span>
+    <span><a href="./">На главную</a> · <a href="https://github.com/qutlawsoasis-debug/Ostrovok">GitHub</a> · <a href="https://github.com/qutlawsoasis-debug/Ostrovok/releases">Все версии</a> · <a href="https://github.com/qutlawsoasis-debug/Ostrovok/issues">Сообщить об ошибке</a></span>
+  </div>
+</footer>
+
+<script src="changelog.js" defer></script>
+</body>
+</html>
