@@ -1,6 +1,6 @@
 //! Обёртки над Windows: курсор, горячая клавиша, буфер, снимок экрана, распознавание текста, запуск программ.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use windows::core::{w, HSTRING, PCWSTR};
@@ -210,15 +210,35 @@ pub fn ocr(w: usize, h: usize, rgba: &[u8]) -> Result<String, String> {
     Ok(lines.join("\r\n").trim().to_string())
 }
 
-/// Ярлыки из меню «Пуск» и с рабочего стола для поиска.
-pub fn index_apps() -> Vec<(String, String)> {
-    fn walk(dir: &Path, depth: u8, out: &mut Vec<(String, String, String)>) {
+/// Быстрый проход: только имена и пути .lnk, цели ярлыков не читаем.
+pub fn scan_lnks() -> Vec<(String, String)> {
+    let mut roots = Vec::new();
+    if let Ok(a) = std::env::var("APPDATA") {
+        roots.push(PathBuf::from(format!(r"{a}\Microsoft\Windows\Start Menu")));
+    }
+    if let Ok(p) = std::env::var("PROGRAMDATA") {
+        roots.push(PathBuf::from(format!(r"{p}\Microsoft\Windows\Start Menu")));
+    }
+    if let Ok(u) = std::env::var("USERPROFILE") {
+        roots.push(PathBuf::from(format!(r"{u}\Desktop")));
+    }
+    scan_lnks_in(&roots)
+}
+
+/// Ярлыки .lnk в папках (до 5 уровней), без деинсталляторов и повторов одного пути.
+pub fn scan_lnks_in(roots: &[PathBuf]) -> Vec<(String, String)> {
+    fn walk(dir: &Path, depth: u8, out: &mut Vec<(String, String)>, seen: &mut std::collections::HashSet<String>) {
         let Ok(rd) = std::fs::read_dir(dir) else { return };
         for entry in rd.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() || ft.is_symlink() {
+                // ссылки и точки повторной обработки (junction) не обходим — защита от петель
+                if ft.is_symlink() || is_reparse(&entry) {
+                    continue;
+                }
                 if depth < 5 {
-                    walk(&path, depth + 1, out);
+                    walk(&path, depth + 1, out, seen);
                 }
             } else if path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
                 let Some(name) = path.file_stem().and_then(|s| s.to_str()) else { continue };
@@ -226,26 +246,34 @@ pub fn index_apps() -> Vec<(String, String)> {
                     continue;
                 }
                 let lnk = path.display().to_string();
-                let target = lnk_target(&lnk).filter(|t| !t.is_empty()).unwrap_or_else(|| lnk.clone());
-                out.push((name.to_string(), lnk, target));
+                if seen.insert(lnk.to_lowercase()) {
+                    out.push((name.to_string(), lnk));
+                }
             }
         }
     }
-    let mut out = Vec::new();
-    let mut roots = Vec::new();
-    if let Ok(a) = std::env::var("APPDATA") {
-        roots.push(format!(r"{a}\Microsoft\Windows\Start Menu"));
+    fn is_reparse(entry: &std::fs::DirEntry) -> bool {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        entry.metadata().map_or(true, |m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
     }
-    if let Ok(p) = std::env::var("PROGRAMDATA") {
-        roots.push(format!(r"{p}\Microsoft\Windows\Start Menu"));
-    }
-    if let Ok(u) = std::env::var("USERPROFILE") {
-        roots.push(format!(r"{u}\Desktop"));
-    }
+    let (mut out, mut seen) = (Vec::new(), std::collections::HashSet::new());
     for r in roots {
-        walk(Path::new(&r), 0, &mut out);
+        walk(r, 0, &mut out, &mut seen);
     }
-    dedup_apps(out)
+    out
+}
+
+/// Медленный проход: читает цели ярлыков и убирает повторы (имя, цель).
+pub fn resolve_apps(raw: Vec<(String, String)>) -> Vec<(String, String)> {
+    let full = raw
+        .into_iter()
+        .map(|(n, lnk)| {
+            let target = lnk_target(&lnk).filter(|t| !t.is_empty()).unwrap_or_else(|| lnk.clone());
+            (n, lnk, target)
+        })
+        .collect();
+    dedup_apps(full)
 }
 
 /// Ярлык деинсталлятора — в поиск не берём.
@@ -1243,5 +1271,54 @@ mod apps_index_tests {
         let v = vec![s("Foo", "a.lnk", "C:\\X.exe"), s("foo", "b.lnk", "c:\\x.exe"), s("Foo", "c.lnk", "C:\\Y.exe"), s("Bar", "d.lnk", "C:\\X.exe")];
         let p = |a: &str, b: &str| (a.to_string(), b.to_string());
         assert_eq!(dedup_apps(v), vec![p("Foo", "a.lnk"), p("Foo", "c.lnk"), p("Bar", "d.lnk")]);
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    #[test]
+    fn scan_and_resolve_lnks() {
+        let root = std::env::temp_dir().join(format!("ostrovok-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        for f in ["Foo.lnk", "Uninstall Foo.lnk", "sub/Bar.LNK", "readme.txt"] {
+            std::fs::write(root.join(f), b"").unwrap();
+        }
+        let roots = vec![root.clone(), root.clone()];
+        let mut raw = scan_lnks_in(&roots);
+        raw.sort();
+        let names: Vec<&str> = raw.iter().map(|a| a.0.as_str()).collect();
+        assert_eq!(names, ["Bar", "Foo"]);
+        let res = resolve_apps(raw.clone());
+        assert_eq!(res, raw);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_lnks_skips_junction_loop() {
+        let root = std::env::temp_dir().join(format!("ostrovok-junc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("real").join("a.lnk"), b"x").unwrap();
+        let loop_dir = root.join("real").join("loop");
+        let ok = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&loop_dir)
+            .arg(&root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok || !loop_dir.exists() {
+            eprintln!("junction не создан, тест пропущен");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let found = scan_lnks_in(&[root.clone()]);
+        let _ = std::fs::remove_dir(&loop_dir);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, "a");
     }
 }
