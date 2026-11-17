@@ -419,7 +419,7 @@ enum Quick {
 fn parse_quick(q: &str, now: chrono::NaiveDateTime) -> Option<Quick> {
     let q = q.trim();
     let low = q.to_lowercase();
-    let after = |prefixes: &[&str]| prefixes.iter().find_map(|p| low.strip_prefix(p).map(|_| q[p.len()..].trim().to_string()));
+    let after = |prefixes: &[&str]| prefixes.iter().find_map(|p| low.strip_prefix(p).and_then(|_| q.get(p.len()..)).map(|r| r.trim().to_string()));
     if let Some(t) = after(&["дело ", "todo "]).filter(|t| !t.is_empty()) {
         return Some(Quick::Todo(t));
     }
@@ -460,8 +460,13 @@ fn parse_quick(q: &str, now: chrono::NaiveDateTime) -> Option<Quick> {
             };
             if let Some(mul) = words.get(unit_at).and_then(|u| unit(u)) {
                 let text = text_of(i..unit_at + 1);
-                let mins = (n * mul as f64).round() as i64;
-                return (!text.is_empty() && mins > 0).then(|| Quick::Remind(text, now + chrono::Duration::minutes(mins)));
+                // nan/inf/огромные числа: не дальше года, иначе Duration и сложение дат падают
+                let mins = n * mul as f64;
+                if !mins.is_finite() || mins.round() < 1.0 || mins > 366.0 * 24.0 * 60.0 {
+                    return None;
+                }
+                let at = now.checked_add_signed(chrono::Duration::minutes(mins.round() as i64))?;
+                return (!text.is_empty()).then(|| Quick::Remind(text, at));
             }
         }
     }
@@ -640,6 +645,31 @@ mod date_tests {
         assert_eq!(date_query("до 8 марта 2027", today).unwrap().0, d(2027, 3, 8));
         assert!(date_query("через 400000000 лет", today).is_none());
         assert!(date_query("до 1 января", d(2026, 12, 4)).unwrap().1.contains("(4 нед.)"));
+    }
+
+    #[test]
+    fn strange_input_does_not_panic() {
+        let now = d(2026, 11, 17).and_hms_opt(12, 0, 0).unwrap();
+        for q in ["", " ", "напомни ", "напомни через", "напомни через nan мин чай", "напомни через inf ч чай", "напомни через -5 мин чай",
+            "напомни через 1e300 ч чай", "напомни через 99999999999999999999 мин чай", "дело 🙂", "İnote x", "заметка", "напомни в 25:99 чай"] {
+            let _ = parse_quick(q, now);
+        }
+        assert!(parse_quick("напомни через nan мин чай", now).is_none());
+        assert!(parse_quick("напомни через 1e300 ч чай", now).is_none());
+        assert!(parse_quick("напомни через 15 мин чай", now).is_some());
+        for q in ["", "до ", "через", "до 99999999.12", "до 0.0", "до 31 февраля 2028", "до 29 февраля 2100", "через 4294967295 недель", "🙂.🙂", "до 8 марта 99999999999"] {
+            let _ = date_query(q, d(2026, 11, 17));
+        }
+        assert_eq!(parse_due("Поздравить до 29.02", d(2026, 11, 17)).1, Some(d(2028, 2, 29)));
+        assert_eq!(parse_due("Сдать до 31.01", d(2026, 1, 31)).1, Some(d(2026, 1, 31)));
+    }
+
+    #[test]
+    fn dst_night_times_resolve() {
+        // в Германии 29.03.2026 02:30 нет, 25.10.2026 02:30 есть дважды — оба должны давать метку
+        assert!(local_ts(d(2026, 3, 29).and_hms_opt(2, 30, 0).unwrap()).is_some());
+        let a = local_ts(d(2026, 10, 25).and_hms_opt(2, 30, 0).unwrap()).unwrap();
+        assert!(a < local_ts(d(2026, 10, 25).and_hms_opt(3, 30, 0).unwrap()).unwrap());
     }
 }
 
@@ -1839,7 +1869,7 @@ impl App {
 
         for prefix in ["таймер ", "timer "] {
             if let Some(rest) = low.strip_prefix(prefix) {
-                if let Ok(m) = rest.trim().replace(',', ".").parse::<f64>() {
+                if let Some(m) = rest.trim().replace(',', ".").parse::<f64>().ok().filter(|m| timer_minutes_ok(*m)) {
                     self.results.push(Item {
                         title: format!("Таймер на {} мин", fmt_num(m)),
                         sub: "запустить".into(),
@@ -7841,7 +7871,8 @@ fn parse_due(text: &str, today: chrono::NaiveDate) -> (String, Option<chrono::Na
                 Some(today + chrono::Duration::days(if ahead == 0 { 7 } else { ahead }))
             } else if let Some((dd, mm)) = low.split_once('.') {
                 match (dd.parse::<u32>(), mm.parse::<u32>()) {
-                    (Ok(dd), Ok(mm)) => chrono::NaiveDate::from_ymd_opt(today.year(), mm, dd).map(|d| if d < today { chrono::NaiveDate::from_ymd_opt(today.year() + 1, mm, dd).unwrap_or(d) } else { d }),
+                    // ближайшая такая дата не раньше сегодня; 29.02 — до следующего високосного года
+                    (Ok(dd), Ok(mm)) => (today.year()..=today.year() + 8).filter_map(|y| chrono::NaiveDate::from_ymd_opt(y, mm, dd)).find(|d| *d >= today),
                     _ => None,
                 }
             } else {
@@ -8015,6 +8046,15 @@ fn wifi_payload(ssid: &str, pass: &str, secure: bool) -> String {
 }
 
 /// Допустимое время таймера: больше нуля и не больше суток (NaN — нет: «nan» парсится как число).
+/// Местное время → метка. В ночь перевода часов 02:30 бывает дважды (берём первое)
+/// или не бывает вовсе (весной в Германии 02:00→03:00 — сдвигаем на час вперёд).
+#[cfg(test)]
+fn local_ts(t: chrono::NaiveDateTime) -> Option<i64> {
+    use chrono::TimeZone;
+    let tz = chrono::Local;
+    tz.from_local_datetime(&t).earliest().or_else(|| tz.from_local_datetime(&(t + chrono::Duration::hours(1))).earliest()).map(|d| d.timestamp())
+}
+
 fn timer_minutes_ok(m: f64) -> bool {
     m.is_finite() && m > 0.0 && m <= 24.0 * 60.0
 }
