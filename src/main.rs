@@ -202,6 +202,23 @@ struct InboxItem {
     at: chrono::DateTime<chrono::Local>,
 }
 
+/// Мессенджеры во входящих: имя, сколько сообщений, цвет — в порядке первого (самого свежего) сообщения.
+fn inbox_apps(list: &[InboxItem]) -> Vec<(String, usize, [u8; 3])> {
+    let mut by_app: Vec<(String, usize, [u8; 3])> = Vec::new();
+    for it in list {
+        match by_app.iter_mut().find(|a| a.0 == it.app) {
+            Some(a) => a.1 += 1,
+            None => by_app.push((it.app.clone(), 1, it.color)),
+        }
+    }
+    by_app
+}
+
+/// Номера сообщений, которые видны при фильтре по мессенджеру (None — все).
+fn inbox_visible(list: &[InboxItem], app: Option<&str>) -> Vec<usize> {
+    (0..list.len()).filter(|&i| app.is_none_or(|a| list[i].app == a)).collect()
+}
+
 fn badge_text(n: usize) -> String {
     if n > 99 { "99+".into() } else { n.to_string() }
 }
@@ -941,6 +958,8 @@ struct App {
     live: live::Live,
     /// последние уведомления мессенджеров, новые сверху; живут только в памяти
     inbox: Vec<InboxItem>,
+    /// фильтр входящих по мессенджеру (None — все)
+    inbox_filter: Option<String>,
     /// сколько пришло с тех пор, как открывали страницу «Уведомления»
     inbox_unread: usize,
     /// последние картинки из буфера обмена (только в памяти)
@@ -1236,6 +1255,7 @@ impl App {
             album: None,
             live,
             inbox: Vec::new(),
+            inbox_filter: None,
             inbox_unread: 0,
             clip_imgs: Vec::new(),
             world_edit: None,
@@ -1486,6 +1506,8 @@ impl App {
                         app.push_inbox(live::Notice { app: app_name.into(), title: title.into(), body: body.into() }, color);
                         app.inbox[0].at = chrono::Local::now() - chrono::Duration::minutes(mins);
                     }
+                    // для снимка с включённым фильтром: OSTROVOK_INBOX_FILTER=Discord
+                    app.inbox_filter = std::env::var("OSTROVOK_INBOX_FILTER").ok().filter(|f| !f.is_empty());
                     Tab::Inbox
                 }
                 "music" => Tab::Music,
@@ -4856,37 +4878,54 @@ impl App {
             empty_state(ui, "\u{EA8F}", "Новых сообщений нет", hint);
             return;
         }
-        // сводка: сколько и откуда
-        let mut by_app: Vec<(String, usize, [u8; 3])> = Vec::new();
-        for it in &self.inbox {
-            match by_app.iter_mut().find(|a| a.0 == it.app) {
-                Some(a) => a.1 += 1,
-                None => by_app.push((it.app.clone(), 1, it.color)),
-            }
+        // сводка: сколько и откуда; фишки мессенджеров — фильтр
+        let by_app = inbox_apps(&self.inbox);
+        if self.inbox_filter.as_ref().is_some_and(|f| !by_app.iter().any(|a| &a.0 == f)) {
+            self.inbox_filter = None; // сообщений этого мессенджера не осталось
         }
-        let mut clear = false;
+        let visible = inbox_visible(&self.inbox, self.inbox_filter.as_deref());
+        let (mut clear, mut toggle) = (false, None);
         ui.horizontal(|ui| {
             ui.add_space(4.0);
-            ui.label(RichText::new(count_ru(self.inbox.len(), ["сообщение", "сообщения", "сообщений"])).font(semi(14.0)));
-            for (app, n, c) in by_app.iter().take(4) {
-                ui.add_space(6.0);
-                let (r, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                ui.painter().circle_filled(r.center(), 3.5, Color32::from_rgb(c[0], c[1], c[2]));
-                ui.label(RichText::new(format!("{app} {n}")).color(DIM).size(12.5));
+            ui.label(RichText::new(count_ru(visible.len(), ["сообщение", "сообщения", "сообщений"])).font(semi(14.0)));
+            ui.add_space(4.0);
+            for (k, (app, n, c)) in by_app.iter().take(4).enumerate() {
+                let color = Color32::from_rgb(c[0], c[1], c[2]);
+                let on = self.inbox_filter.as_deref() == Some(app.as_str());
+                let label = format!("{app} {n}");
+                let tw = ui.painter().layout_no_wrap(label.clone(), FontId::proportional(12.0), FG).size().x;
+                let (r, resp) = ui.allocate_exact_size(vec2(tw + 28.0, 24.0), Sense::click());
+                let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
+                let t = ui.ctx().animate_bool_with_time(ui.id().with(("inbox-chip", k, app.as_str())), on, 0.15);
+                let p = ui.painter();
+                // активная фишка заливается цветом мессенджера
+                p.rect_filled(r, Rounding::same(12.0), mix(rgba(255, 255, 255, (10.0 + 14.0 * hov) as u8), color.gamma_multiply(0.35), t));
+                p.rect_stroke(r, Rounding::same(12.0), Stroke::new(1.0_f32, mix(rgba(255, 255, 255, 22), color, t)));
+                p.circle_filled(pos2(r.left() + 12.0, r.center().y), 3.5, color);
+                p.text(pos2(r.left() + 20.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(12.0), mix(DIM, FG, t.max(hov)));
+                let tip = if on { "Показать все сообщения".to_string() } else { format!("Только {app}") };
+                if resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    toggle = Some(if on { None } else { Some(app.clone()) });
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if jelly(ui, "Очистить").on_hover_text("Убрать все сообщения из списка").clicked() {
+                let tip = if self.inbox_filter.is_some() { "Убрать показанные сообщения этого мессенджера" } else { "Убрать все сообщения из списка" };
+                if jelly(ui, "Очистить").on_hover_text(tip).clicked() {
                     clear = true;
                 }
             });
         });
+        if let Some(f) = toggle {
+            self.inbox_filter = f;
+        }
         ui.add_space(4.0);
         let now = chrono::Local::now();
         let mut pick: Option<usize> = None;
         let mut drop: Option<usize> = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
-            for (i, it) in self.inbox.iter().enumerate() {
+            for &i in &visible {
+                let it = &self.inbox[i];
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 6.0, 50.0), Sense::click());
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
                 let p = ui.painter();
@@ -4926,7 +4965,11 @@ impl App {
             }
         });
         if clear {
-            self.inbox.clear();
+            // при фильтре убираем только показанные; фильтр сам сбросится в следующем кадре
+            match self.inbox_filter.take() {
+                Some(f) => self.inbox.retain(|it| it.app != f),
+                None => self.inbox.clear(),
+            }
         } else if let Some(i) = drop {
             self.inbox.remove(i);
         } else if let Some(i) = pick {
@@ -8381,6 +8424,31 @@ fn load_thumb(path: &str) -> Option<(usize, usize, Vec<u8>)> {
     reader.limits(limits);
     let img = reader.decode().ok()?.thumbnail(176, 176).into_rgba8();
     Some((img.width() as usize, img.height() as usize, img.into_raw()))
+}
+
+#[cfg(test)]
+mod inbox_filter_tests {
+    use super::*;
+
+    fn it(app: &str, c: u8) -> InboxItem {
+        InboxItem { app: app.into(), title: "t".into(), body: String::new(), color: [c, 0, 0], at: chrono::Local::now() }
+    }
+
+    #[test]
+    fn apps_counted_in_order_of_first_message() {
+        let list = [it("Telegram", 1), it("Discord", 2), it("Telegram", 1), it("WhatsApp", 3)];
+        assert_eq!(inbox_apps(&list), vec![("Telegram".to_string(), 2, [1, 0, 0]), ("Discord".to_string(), 1, [2, 0, 0]), ("WhatsApp".to_string(), 1, [3, 0, 0])]);
+        assert!(inbox_apps(&[]).is_empty());
+    }
+
+    #[test]
+    fn visible_by_filter() {
+        let list = [it("Telegram", 1), it("Discord", 2), it("Telegram", 1)];
+        assert_eq!(inbox_visible(&list, None), vec![0, 1, 2]);
+        assert_eq!(inbox_visible(&list, Some("Telegram")), vec![0, 2]);
+        assert_eq!(inbox_visible(&list, Some("Discord")), vec![1]);
+        assert!(inbox_visible(&list, Some("Slack")).is_empty());
+    }
 }
 
 #[cfg(test)]
