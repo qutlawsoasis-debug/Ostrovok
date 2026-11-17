@@ -2551,6 +2551,7 @@ impl App {
 
     /// Персонаж в пилюле. Прорисовка глаз и персонажей перенесена из Atoll (Views/CharacterView.cs, MIT).
     fn draw_face(&self, p: &egui::Painter, o: Pos2, look: Vec2, now: Instant) {
+        // все множители t в sin/cos должны быть кратны 0.1: фаза оборачивается по RIPPLE_PERIOD = 150π
         let t = self.ripple_phase / 7.5;
         let playing = self.media_now.as_ref().is_some_and(|m| m.playing);
         let emo = self.emotion;
@@ -9760,7 +9761,7 @@ mod frame_tests {
             let after = wrap_phase(before + 0.02, p);
             assert!(after < 0.02 && after >= 0.0);
             for k in m {
-                assert!(((before + 0.02) * k).sin() - (after * k).sin() < 1e-3);
+                assert!((((before + 0.02) * k).sin() - (after * k).sin()).abs() < 2e-3, "рывок при множителе {k}");
             }
         }
         assert_eq!(wrap_phase(1.0, DRIP_PERIOD), 1.0);
