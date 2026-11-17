@@ -934,6 +934,8 @@ struct App {
     last_cx: f32,
     pill_rect: Rect,
     timer_total: f32,
+    /// таймер на паузе: сколько оставалось (timer_end при этом пуст)
+    timer_paused: Option<Duration>,
     // удобства Windows
     ctl_at: Instant,
     vol: Option<(f32, bool)>,
@@ -1238,6 +1240,7 @@ impl App {
             last_cx: 0.0,
             pill_rect: Rect::NOTHING,
             timer_total: 60.0,
+            timer_paused: None,
             ctl_at: now,
             mixer: Vec::new(),
             sound: sound::Sound::spawn(),
@@ -1412,6 +1415,12 @@ impl App {
             for _ in 0..n {
                 app.push_inbox(live::Notice { app: "Telegram".into(), title: "Мирон".into(), body: "привет".into() }, [0x2A, 0xAB, 0xEE]);
             }
+        }
+        // для снимков таймера на паузе: OSTROVOK_TIMERPAUSE=25 — таймер на 25 минут, на паузе на трети пути
+        if let Some(m) = std::env::var("OSTROVOK_TIMERPAUSE").ok().and_then(|v| v.parse::<f64>().ok()).filter(|m| test_mode() && *m > 0.0 && *m <= 1440.0) {
+            app.timer_total = (m * 60.0) as f32;
+            app.timer_end = None;
+            app.timer_paused = Some(Duration::from_secs_f64(m * 60.0 * 0.62));
         }
         // для снимков повторяющихся напоминаний: OSTROVOK_REPEAT=1 — три повтора и одно разовое
         if test_mode() && std::env::var_os("OSTROVOK_REPEAT").is_some() {
@@ -1623,6 +1632,7 @@ impl App {
         }
         self.timer_end = Some(Instant::now() + Duration::from_secs_f64(minutes * 60.0));
         self.timer_total = (minutes * 60.0) as f32;
+        self.timer_paused = None;
         self.notify(&format!("Таймер на {} мин", fmt_num(minutes)));
     }
 
@@ -4532,15 +4542,15 @@ impl App {
         let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 156.0), Sense::hover());
         let p = ui.painter().clone();
         let c = pos2(area.left() + 80.0, area.center().y);
-        let (text, frac) = match self.timer_end {
-            Some(end) => (fmt_left(end), end.saturating_duration_since(Instant::now()).as_secs_f32() / self.timer_total.max(1.0)),
-            None => ("00:00".to_string(), 0.0),
-        };
-        let live = self.timer_end.is_some();
+        let (secs, frac, running, paused) = timer_view(self.timer_end, self.timer_paused, self.timer_total, Instant::now());
+        let text = fmt_secs(secs);
+        // на паузе циферблат застывает, но не гаснет: кольцо и деления — приглушённым цветом
+        let live = running || paused;
         let tone = match self.focus {
             Some((true, _)) => Color32::from_rgb(0x7B, 0xE0, 0x9A), // перерыв — зелёный
             _ => Color32::from_rgb(0xFF, 0xB3, 0x40),
         };
+        let tone = if paused { mix(tone, Color32::from_rgb(120, 120, 134), 0.55) } else { tone };
         // циферблат: 60 делений, каждое пятое длиннее; в работе оставшаяся часть подсвечена
         for i in 0..60 {
             let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * i as f32 / 60.0;
@@ -4561,6 +4571,7 @@ impl App {
         }
         p.text(c - vec2(0.0, 5.0), Align2::CENTER_CENTER, text, light(30.0), if live { FG } else { DIM });
         let sub = match (live, self.focus) {
+            _ if paused => "\u{E769} пауза".to_string(),
             (true, Some((true, _))) => "перерыв".to_string(),
             (true, Some((false, _))) => "фокус".to_string(),
             (true, None) => {
@@ -4592,15 +4603,25 @@ impl App {
             }
             if live && jelly(ui, "Стоп").clicked() {
                 // остановили посреди рабочего круга — прошедшее время засчитываем, если набралось от 5 минут
-                if let (Some((false, _)), Some(end)) = (self.focus, self.timer_end) {
-                    let left = end.saturating_duration_since(Instant::now()).as_secs_f32();
+                if let Some((false, _)) = self.focus {
+                    // остаток берём и у идущего таймера, и у стоящего на паузе
+                    let left = timer_view(self.timer_end, self.timer_paused, self.timer_total, Instant::now()).0 as f32;
                     let done = ((self.timer_total - left) / 60.0).floor() as u32;
                     if done >= 5 {
                         self.log_focus(done);
                     }
                 }
                 self.timer_end = None;
+                self.timer_paused = None;
                 self.focus = None;
+            }
+            // пауза: остаток запоминаем, таймер останавливаем — пилюля и капля перестают тикать
+            if live && jelly(ui, if paused { "\u{E768}" } else { "\u{E769}" }).on_hover_text(if paused { "Продолжить" } else { "Пауза" }).clicked() {
+                if let Some(left) = self.timer_paused.take() {
+                    self.timer_end = Some(Instant::now() + left);
+                } else if let Some(end) = self.timer_end.take() {
+                    self.timer_paused = Some(end.saturating_duration_since(Instant::now()));
+                }
             }
             let label = match self.focus {
                 Some((_, rounds)) => format!("Фокус: круг {}", rounds + 1),
@@ -4609,6 +4630,7 @@ impl App {
             if jelly(ui, label).on_hover_text("25 минут работы, 5 минут перерыва — по кругу, пока не остановите").clicked() {
                 if self.focus.take().is_some() {
                     self.timer_end = None;
+                    self.timer_paused = None;
                 } else {
                     self.focus = Some((false, 0));
                     self.start_timer(25.0);
@@ -7670,6 +7692,44 @@ fn next_due(at: chrono::NaiveDateTime, repeat: u8, now: chrono::NaiveDateTime) -
     None
 }
 
+/// Что показывать на циферблате: (секунд осталось, доля, идёт ли, на паузе ли).
+fn timer_view(end: Option<Instant>, paused: Option<Duration>, total: f32, now: Instant) -> (u64, f32, bool, bool) {
+    let total = total.max(1.0);
+    match (end, paused) {
+        (Some(e), _) => {
+            let left = e.saturating_duration_since(now).as_secs_f32();
+            (left.ceil() as u64, left / total, true, false)
+        }
+        (None, Some(left)) => (left.as_secs_f32().ceil() as u64, left.as_secs_f32() / total, false, true),
+        _ => (0, 0.0, false, false),
+    }
+}
+
+#[cfg(test)]
+mod timer_pause_tests {
+    use super::*;
+    #[test]
+    fn view_running_paused_idle() {
+        let now = Instant::now();
+        // идёт: осталось 30 из 60 секунд
+        let (s, f, live, paused) = timer_view(Some(now + Duration::from_secs(30)), None, 60.0, now);
+        assert_eq!((s, live, paused), (30, true, false));
+        assert!((f - 0.5).abs() < 0.01);
+        // пауза: остаток 15 из 60
+        let (s, f, live, paused) = timer_view(None, Some(Duration::from_secs(15)), 60.0, now);
+        assert_eq!((s, live, paused), (15, false, true));
+        assert!((f - 0.25).abs() < 0.01);
+        // ничего
+        assert_eq!(timer_view(None, None, 60.0, now), (0, 0.0, false, false));
+    }
+    #[test]
+    fn formats() {
+        assert_eq!(fmt_secs(0), "00:00");
+        assert_eq!(fmt_secs(125), "02:05");
+        assert_eq!(fmt_secs(3725), "1:02:05");
+    }
+}
+
 #[cfg(test)]
 mod repeat_tests {
     use super::*;
@@ -8404,7 +8464,11 @@ fn rounded_image(p: &egui::Painter, tex: &egui::TextureHandle, rect: Rect, radiu
 }
 
 fn fmt_left(end: Instant) -> String {
-    let s = end.saturating_duration_since(Instant::now()).as_secs_f64().ceil() as u64;
+    fmt_secs(end.saturating_duration_since(Instant::now()).as_secs_f64().ceil() as u64)
+}
+
+/// «02:05» или «1:02:05».
+fn fmt_secs(s: u64) -> String {
     if s >= 3600 {
         format!("{}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
     } else {
