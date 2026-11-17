@@ -930,6 +930,10 @@ impl App {
             app.timer_end = Some(Instant::now() + Duration::from_secs_f64(m * 60.0 * 0.62));
             app.note = None;
         }
+        // для снимков отсчёта в пилюле: OSTROVOK_SOON=7 — напоминание через 7 минут
+        if let Some(m) = std::env::var("OSTROVOK_SOON").ok().and_then(|v| v.parse::<i64>().ok()).filter(|_| test_mode()) {
+            app.cfg.reminders.push(store::Reminder { text: "Позвонить".into(), at: chrono::Local::now().timestamp() + m * 60 - 5 });
+        }
         // для снимков пилюли со значком непрочитанных: OSTROVOK_UNREAD=3
         if let Some(n) = std::env::var("OSTROVOK_UNREAD").ok().and_then(|v| v.parse::<usize>().ok()).filter(|_| test_mode()) {
             for _ in 0..n {
@@ -1703,6 +1707,12 @@ impl App {
             v.push(Seg::Track(if m.artist.trim().is_empty() { m.title.clone() } else { format!("{} — {}", m.title, m.artist) }));
         }
         v.push(Seg::Text(chrono::Local::now().format("%H:%M").to_string(), FG));
+        // напоминание скоро — обратный отсчёт с колокольчиком
+        let stamp = chrono::Local::now().timestamp();
+        if let Some(r) = self.cfg.reminders.iter().filter(|r| r.at > stamp && r.at - stamp <= 600).min_by_key(|r| r.at) {
+            let mins = ((r.at - stamp) as f64 / 60.0).ceil() as i64;
+            v.push(Seg::Text(format!("\u{E823} {mins} мин"), Color32::from_rgb(0xFF, 0x8A, 0x7A)));
+        }
         if self.inbox_unread > 0 {
             let c = self.inbox.first().map_or([0x3A, 0x9B, 0xFF], |i| i.color);
             v.push(Seg::Badge(self.inbox_unread, Color32::from_rgb(c[0], c[1], c[2])));
