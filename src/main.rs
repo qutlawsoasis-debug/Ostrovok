@@ -2308,13 +2308,15 @@ impl App {
         if self.cfg.reminders.iter().any(|r| r.at <= stamp) {
             let due: Vec<String> = self.cfg.reminders.iter().filter(|r| r.at <= stamp).map(|r| r.text.clone()).collect();
             // повторяющиеся переносим на следующий срок, разовые удаляем
-            let now_local = chrono::Local::now().naive_local();
+            let now_local = chrono::DateTime::from_timestamp(stamp, 0).map_or_else(|| chrono::Local::now().naive_local(), |d| d.with_timezone(&chrono::Local).naive_local());
             for r in self.cfg.reminders.iter_mut().filter(|r| r.at <= stamp && r.repeat != 0) {
                 let next = chrono::DateTime::from_timestamp(r.at, 0)
-                    .and_then(|d| next_due(d.with_timezone(&chrono::Local).naive_local(), r.repeat, now_local))
-                    .and_then(resolve_here);
+                    .and_then(|d| reschedule(d.with_timezone(&chrono::Local).naive_local(), r.repeat, now_local, stamp, |x| {
+                        use chrono::TimeZone;
+                        chrono::Local.from_local_datetime(&x)
+                    }));
                 match next {
-                    Some(n) => r.at = n.timestamp(),
+                    Some(n) => r.at = n,
                     None => r.repeat = 0,
                 }
             }
@@ -3115,8 +3117,10 @@ impl App {
             }
         });
         if let Some(i) = remove {
-            self.cfg.reminders.remove(i);
-            self.cfg.save();
+            if i < self.cfg.reminders.len() {
+                self.cfg.reminders.remove(i);
+                self.cfg.save();
+            }
         }
     }
 
@@ -7998,6 +8002,21 @@ fn next_due(at: chrono::NaiveDateTime, repeat: u8, now: chrono::NaiveDateTime) -
     None
 }
 
+/// Новый срок сработавшего повторяющегося напоминания — строго позже `stamp`.
+/// В двусмысленный осенний час «первый из двух» мог дать момент раньше текущего,
+/// и напоминание удалялось навсегда; теперь проматываем дальше.
+fn reschedule<T: chrono::TimeZone>(at: chrono::NaiveDateTime, repeat: u8, now: chrono::NaiveDateTime, stamp: i64, lookup: impl Fn(chrono::NaiveDateTime) -> chrono::LocalResult<chrono::DateTime<T>>) -> Option<i64> {
+    let mut next = next_due(at, repeat, now)?;
+    for _ in 0..8 {
+        let ts = resolve_local(next, &lookup)?.timestamp();
+        if ts > stamp {
+            return Some(ts);
+        }
+        next = next_due(next, repeat, next)?;
+    }
+    None
+}
+
 /// Что показывать на циферблате: (секунд осталось, доля, идёт ли, на паузе ли).
 fn timer_view(end: Option<Instant>, paused: Option<Duration>, total: f32, now: Instant) -> (u64, f32, bool, bool) {
     let total = total.max(1.0);
@@ -8116,6 +8135,21 @@ mod dst_tests {
         let d = resolve_local(t(2026, 10, 25, 2, 30), berlin).unwrap();
         assert_eq!(d.offset().local_minus_utc(), 7200);
         assert_eq!(resolve_local(t(2026, 11, 1, 9, 0), berlin).unwrap().naive_local(), t(2026, 11, 1, 9, 0));
+    }
+    #[test]
+    fn repeat_fired_in_ambiguous_hour_is_not_lost() {
+        // ежедневное 02:45, ПК спал; проснулся 25.10 в 02:40 по зимнему (второй проход часа)
+        let stamp = cet_ts(t(2026, 10, 25, 2, 40));
+        let at = t(2026, 10, 24, 2, 45);
+        let next = reschedule(at, 1, t(2026, 10, 25, 2, 40), stamp, berlin).unwrap();
+        assert!(next > stamp, "новый срок должен быть в будущем, иначе напоминание удалится");
+        assert_eq!(next, cet_ts(t(2026, 10, 26, 2, 45)));
+        // обычный случай: следующий день, без лишних шагов
+        assert_eq!(reschedule(t(2026, 11, 2, 9, 0), 1, t(2026, 11, 2, 9, 1), cet_ts(t(2026, 11, 2, 9, 1)), berlin), Some(cet_ts(t(2026, 11, 3, 9, 0))));
+        assert_eq!(reschedule(t(2026, 11, 2, 9, 0), 0, t(2026, 11, 2, 9, 1), 0, berlin), None);
+    }
+    fn cet_ts(n: NaiveDateTime) -> i64 {
+        FixedOffset::east_opt(3600).unwrap().from_local_datetime(&n).unwrap().timestamp()
     }
     #[test]
     fn daily_repeat_through_dst_days_survives() {
