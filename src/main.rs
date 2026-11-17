@@ -7394,7 +7394,6 @@ fn parse_due(text: &str, today: chrono::NaiveDate) -> (String, Option<chrono::Na
 
 /// Подпись срока и тревога: 0 — спокойно, 1 — сегодня, 2 — просрочено.
 fn due_label(due: chrono::NaiveDate, today: chrono::NaiveDate) -> (String, u8) {
-    use chrono::Datelike;
     let days = (due - today).num_days();
     match days {
         0 => ("сегодня".into(), 1),
