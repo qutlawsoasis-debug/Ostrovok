@@ -377,7 +377,7 @@ enum Msg {
     Notice(live::Notice),
     Lyrics(String, Vec<(f64, String)>),
     /// значок программы для строки поиска, загруженный в фоне: путь и точки
-    Icon(String, Option<(usize, usize, Vec<u8>)>),
+    Icon(u64, String, Option<(usize, usize, Vec<u8>)>),
     /// картинка из буфера обмена, прочитанная в фоне
     ClipImg(usize, usize, Vec<u8>),
 }
@@ -1066,6 +1066,11 @@ struct App {
     icon_tx: Option<mpsc::Sender<String>>,
     icon_pending: std::collections::HashSet<String>,
     icon_failed: std::collections::HashMap<String, Instant>,
+    icon_gen: u64,
+    icon_busy_since: Option<Instant>,
+    /// пути, на которых завис поток значков, — больше не запрашиваем; и сколько потоков брошено
+    icon_stuck: std::collections::HashSet<String>,
+    icon_abandoned: usize,
     // «жидкая» физика
     jelly: Spr,
     reach: Spr,
@@ -1377,6 +1382,10 @@ impl App {
             icon_tx: None,
             icon_pending: Default::default(),
             icon_failed: Default::default(),
+            icon_gen: 0,
+            icon_busy_since: None,
+            icon_stuck: Default::default(),
+            icon_abandoned: 0,
             jelly: Spr::new(1.0, 420.0, 12.0, 0.0015),
             reach: Spr::new(0.0, 210.0, 17.0, 0.004),
             lean_s: Spr::new(0.0, 190.0, 16.0, 0.03),
@@ -2097,20 +2106,20 @@ impl App {
             return Some(t.clone());
         }
         let now = Instant::now();
-        if !should_request(path, false, self.icon_pending.contains(path), self.icon_failed.get(path).copied(), now) {
+        if !worker_allowed(self.icon_abandoned, self.icon_stuck.contains(path)) || !should_request(path, false, self.icon_pending.contains(path), self.icon_failed.get(path).copied(), now) {
             return None;
         }
         // один фоновый поток грузит значки по очереди: оболочка Windows не любит параллельных запросов
         let worker = self.icon_tx.get_or_insert_with(|| {
             let (req_tx, req_rx) = mpsc::channel::<String>();
-            let (tx, ctx) = (self.tx.clone(), ctx.clone());
+            let (tx, ctx, generation) = (self.tx.clone(), ctx.clone(), self.icon_gen);
             std::thread::spawn(move || {
                 unsafe {
                     let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
                 }
                 for path in req_rx {
                     let icon = sys::icon_rgba(&path);
-                    let _ = tx.send(Msg::Icon(path, icon));
+                    let _ = tx.send(Msg::Icon(generation, path, icon));
                     ctx.request_repaint();
                 }
             });
@@ -2119,11 +2128,28 @@ impl App {
         if worker.send(path.to_string()).is_ok() {
             self.icon_failed.remove(path);
             self.icon_pending.insert(path.to_string());
+            if self.icon_busy_since.is_none() {
+                self.icon_busy_since = Some(now);
+            }
         } else {
             // поток значков упал — пересоздадим при следующем запросе
-            self.icon_tx = None;
+            self.reset_icon_worker();
         }
         None
+    }
+
+    /// Бросает зависший/упавший поток значков: его ответы станут чужим поколением, ожидающие — в отложенные.
+    fn reset_icon_worker(&mut self) {
+        let now = Instant::now();
+        self.icon_tx = None;
+        self.icon_gen += 1;
+        // поток бросаем: пути, на которых он завис, больше не запрашиваем, иначе зависшие потоки копятся
+        self.icon_abandoned += 1;
+        for p in self.icon_pending.drain() {
+            self.icon_failed.insert(p.clone(), now);
+            self.icon_stuck.insert(p);
+        }
+        self.icon_busy_since = None;
     }
 
     fn run(&mut self, action: Action) {
@@ -2251,8 +2277,10 @@ impl App {
                 }
                 Msg::Download(name) => self.show_toast("\u{E896}", [0x3A, 0x9B, 0xFF], "Загрузка завершена", &name, 6, false),
                 Msg::ClipImg(w, h, px) => self.push_clip_img(ctx, w, h, px),
-                Msg::Icon(path, icon) => {
+                Msg::Icon(generation, _, _) if generation != self.icon_gen => {}
+                Msg::Icon(_, path, icon) => {
                     self.icon_pending.remove(&path);
+                    self.icon_busy_since = if self.icon_pending.is_empty() { None } else { Some(Instant::now()) };
                     match icon {
                         Some((w, h, px)) => {
                             let tex = ctx.load_texture(icon_tex_name(&path), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR);
@@ -2315,6 +2343,12 @@ impl App {
                     self.refresh_weather(ctx);
                 }
             }
+        }
+        if icon_worker_stalled(self.icon_pending.len(), self.icon_busy_since, Instant::now(), ICON_STALL) {
+            self.reset_icon_worker();
+        }
+        if !self.icon_pending.is_empty() {
+            ctx.request_repaint_after(ICON_STALL);
         }
         if self.hotkey.swap(false, Ordering::Relaxed) {
             self.toggle_palette(ctx);
@@ -8128,6 +8162,13 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 const ICON_LIMIT: usize = 512;
 /// через сколько повторить загрузку значка, который не удалось получить
 const ICON_RETRY: Duration = Duration::from_secs(60);
+/// сколько ждать ответа воркера значков, прежде чем счесть его зависшим
+const ICON_STALL: Duration = Duration::from_secs(5);
+
+/// Завис ли воркер значков: есть ожидающие, а ответа нет дольше limit.
+fn icon_worker_stalled(pending: usize, busy_since: Option<Instant>, now: Instant, limit: Duration) -> bool {
+    pending > 0 && busy_since.is_some_and(|t| now.saturating_duration_since(t) >= limit)
+}
 /// как часто перечитывать список программ
 const REINDEX_EVERY: Duration = Duration::from_secs(600);
 
@@ -8147,6 +8188,13 @@ fn icon_tex_name(path: &str) -> String {
 }
 
 /// Нужно ли отправить значок в фоновую загрузку.
+/// Брошенных зависших потоков значков не больше этого — дальше значки не грузим до перезапуска.
+const ICON_MAX_ABANDONED: usize = 3;
+
+fn worker_allowed(abandoned: usize, stuck: bool) -> bool {
+    !stuck && abandoned < ICON_MAX_ABANDONED
+}
+
 fn should_request(path: &str, cached: bool, pending: bool, failed_at: Option<Instant>, now: Instant) -> bool {
     !path.is_empty() && !cached && !pending && failed_at.map_or(true, |t| now.saturating_duration_since(t) >= ICON_RETRY)
 }
@@ -9999,6 +10047,9 @@ mod bg_tests {
     #[test]
     fn should_request_rules() {
         let now = Instant::now();
+        assert!(worker_allowed(0, false));
+        assert!(!worker_allowed(0, true));
+        assert!(!worker_allowed(ICON_MAX_ABANDONED, false));
         assert!(should_request("a", false, false, None, now));
         assert!(!should_request("", false, false, None, now));
         assert!(!should_request("a", true, false, None, now));
@@ -10006,6 +10057,17 @@ mod bg_tests {
         assert!(!should_request("a", false, false, Some(now), now));
         assert!(!should_request("a", false, false, Some(now), now + ICON_RETRY - Duration::from_secs(1)));
         assert!(should_request("a", false, false, Some(now), now + ICON_RETRY));
+    }
+
+    #[test]
+    fn icon_worker_stalled_rules() {
+        let t = Instant::now();
+        let lim = ICON_STALL;
+        assert!(!icon_worker_stalled(0, Some(t), t + Duration::from_secs(60), lim));
+        assert!(!icon_worker_stalled(3, None, t + Duration::from_secs(60), lim));
+        assert!(!icon_worker_stalled(1, Some(t), t + Duration::from_millis(4900), lim));
+        assert!(icon_worker_stalled(1, Some(t), t + Duration::from_secs(5), lim));
+        assert!(!icon_worker_stalled(1, Some(t + Duration::from_secs(1)), t, lim));
     }
 
     #[test]

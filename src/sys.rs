@@ -210,12 +210,6 @@ pub fn ocr(w: usize, h: usize, rgba: &[u8]) -> Result<String, String> {
     Ok(lines.join("\r\n").trim().to_string())
 }
 
-/// Ярлыки из меню «Пуск» и с рабочего стола для поиска.
-#[allow(dead_code)]
-pub fn index_apps() -> Vec<(String, String)> {
-    resolve_apps(scan_lnks())
-}
-
 /// Быстрый проход: только имена и пути .lnk, цели ярлыков не читаем.
 pub fn scan_lnks() -> Vec<(String, String)> {
     let mut roots = Vec::new();
@@ -237,7 +231,12 @@ pub fn scan_lnks_in(roots: &[PathBuf]) -> Vec<(String, String)> {
         let Ok(rd) = std::fs::read_dir(dir) else { return };
         for entry in rd.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() || ft.is_symlink() {
+                // ссылки и точки повторной обработки (junction) не обходим — защита от петель
+                if ft.is_symlink() || is_reparse(&entry) {
+                    continue;
+                }
                 if depth < 5 {
                     walk(&path, depth + 1, out, seen);
                 }
@@ -252,6 +251,11 @@ pub fn scan_lnks_in(roots: &[PathBuf]) -> Vec<(String, String)> {
                 }
             }
         }
+    }
+    fn is_reparse(entry: &std::fs::DirEntry) -> bool {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        entry.metadata().map_or(true, |m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
     }
     let (mut out, mut seen) = (Vec::new(), std::collections::HashSet::new());
     for r in roots {
@@ -1290,5 +1294,31 @@ mod scan_tests {
         let res = resolve_apps(raw.clone());
         assert_eq!(res, raw);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_lnks_skips_junction_loop() {
+        let root = std::env::temp_dir().join(format!("ostrovok-junc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("real").join("a.lnk"), b"x").unwrap();
+        let loop_dir = root.join("real").join("loop");
+        let ok = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&loop_dir)
+            .arg(&root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok || !loop_dir.exists() {
+            eprintln!("junction не создан, тест пропущен");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let found = scan_lnks_in(&[root.clone()]);
+        let _ = std::fs::remove_dir(&loop_dir);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, "a");
     }
 }
