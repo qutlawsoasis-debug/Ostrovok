@@ -7948,7 +7948,6 @@ fn moon_disc(p: &egui::Painter, c: Pos2, r: f32, illum: f32, waxing: bool) {
     p.add(egui::Shape::mesh(mesh));
 }
 
-/// Лента дня: сегодняшние напоминания как доля суток (0..1) и текст, по порядку.
 /// Принять найденный геокодером город: название, координаты, отметка проверки.
 fn apply_city(cfg: &mut store::Settings, query: &str, lat: f64, lon: f64, name: &str) {
     cfg.city = query.to_string();
@@ -7958,6 +7957,7 @@ fn apply_city(cfg: &mut store::Settings, query: &str, lat: f64, lon: f64, name: 
     cfg.city_checked = true;
 }
 
+/// Лента дня: сегодняшние напоминания как доля суток (0..1) и текст, по порядку.
 fn day_marks(list: &[store::Reminder], day_start: i64, day_len: i64) -> Vec<(f32, String)> {
     let mut v: Vec<&store::Reminder> = list.iter().filter(|r| r.at >= day_start && r.at < day_start + day_len).collect();
     v.sort_by_key(|r| r.at);
