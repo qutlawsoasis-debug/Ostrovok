@@ -1171,6 +1171,10 @@ struct App {
     sw_start: Option<Instant>,
     sw_acc: Duration,
     cal_shift: i32,
+    /// кэш календаря: ключ и (номер напоминания, срок) в окне месяца
+    cal_occ: Option<(u64, Vec<(usize, i64)>)>,
+    /// кэш ленты дня: ключ и отметки (доля суток, текст)
+    marks_occ: Option<(u64, Vec<(f32, String)>)>,
     /// выбранный в календаре день (None — сегодня) и поля нового дела на него
     cal_sel: Option<chrono::NaiveDate>,
     cal_text: String,
@@ -1458,6 +1462,8 @@ impl App {
             sw_start: None,
             sw_acc: Duration::ZERO,
             cal_shift: 0,
+            cal_occ: None,
+            marks_occ: None,
             cal_sel: None,
             cal_text: String::new(),
             cal_time: String::new(),
@@ -2024,9 +2030,9 @@ impl App {
         // ответ про дату не прячет «Спросить ИИ» (быстрые команды и конвертер — прячут)
         let converted = self.results.len() > date_items;
 
-        let is_expr = q.chars().all(|c| c.is_ascii_digit() || " +-*/().,".contains(c))
+        let is_expr = q.chars().all(|c| c.is_ascii_digit() || " +-*/^().,".contains(c))
             && q.chars().any(|c| c.is_ascii_digit())
-            && q.chars().any(|c| "+-*/".contains(c));
+            && q.chars().any(|c| "+-*/^".contains(c));
         if is_expr {
             if let Some(v) = sys::eval(&q) {
                 let s = fmt_num(v);
@@ -4151,7 +4157,11 @@ impl App {
         let midnight = now.date_naive().and_hms_opt(0, 0, 0).and_then(|m| m.and_local_timezone(chrono::Local).earliest()).map_or(now.timestamp() - 43_200, |m| m.timestamp());
         // в день перевода часов сутки длятся 23 или 25 часов
         let day_len = now.date_naive().succ_opt().and_then(|d| d.and_hms_opt(0, 0, 0)).and_then(resolve_here).map(|m| m.timestamp() - midnight).filter(|l| *l > 0).unwrap_or(86_400);
-        let marks = day_marks(&self.cfg.reminders, midnight, day_len);
+        let mkey = reminders_key(&self.cfg.reminders, midnight, midnight + day_len);
+        if self.marks_occ.as_ref().map(|c| c.0) != Some(mkey) {
+            self.marks_occ = Some((mkey, day_marks(&self.cfg.reminders, midnight, day_len)));
+        }
+        let marks = self.marks_occ.as_ref().map(|c| c.1.clone()).unwrap_or_default();
         let frac_now = ((now.timestamp() - midnight) as f32 / day_len as f32).clamp(0.0, 1.0);
         let left_n = marks.iter().filter(|m| m.0 > frac_now).count();
         let shov = ui.ctx().animate_bool_with_time(sresp.id.with("hov"), sresp.hovered(), 0.12);
@@ -6384,16 +6394,28 @@ impl App {
         let midnight = |d: NaiveDate| resolve_here(d.and_time(NaiveTime::MIN)).map_or(0, |x| x.timestamp());
         let win_from = midnight(first.min(sel));
         let win_to = midnight(next.unwrap_or(first + chrono::Duration::days(31)).max(sel + chrono::Duration::days(1)));
+        let ckey = reminders_key(&self.cfg.reminders, win_from, win_to);
+        if self.cal_occ.as_ref().map(|c| c.0) != Some(ckey) {
+            let occ: Vec<(usize, i64)> = self
+                .cfg
+                .reminders
+                .iter()
+                .enumerate()
+                .flat_map(|(i, r)| occurrences(r, win_from, win_to).into_iter().map(move |ts| (i, ts)))
+                .collect();
+            self.cal_occ = Some((ckey, occ));
+        }
+        let reminders = &self.cfg.reminders;
         let dated: Vec<(usize, NaiveDate, String, String, i64, bool)> = self
-            .cfg
-            .reminders
+            .cal_occ
+            .as_ref()
+            .map(|c| c.1.as_slice())
+            .unwrap_or_default()
             .iter()
-            .enumerate()
-            .flat_map(|(i, r)| {
-                occurrences(r, win_from, win_to).into_iter().filter_map(move |ts| {
-                    let d = chrono::DateTime::from_timestamp(ts, 0)?.with_timezone(&Local);
-                    Some((i, d.date_naive(), d.format("%H:%M").to_string(), r.text.clone(), ts, ts == r.at))
-                })
+            .filter_map(|&(i, ts)| {
+                let r = reminders.get(i)?;
+                let d = chrono::DateTime::from_timestamp(ts, 0)?.with_timezone(&Local);
+                Some((i, d.date_naive(), d.format("%H:%M").to_string(), r.text.clone(), ts, ts == r.at))
             })
             .collect();
 
@@ -8104,6 +8126,17 @@ fn apply_city(cfg: &mut store::Settings, query: &str, lat: f64, lon: f64, name: 
 }
 
 /// Лента дня: сегодняшние напоминания как доля суток (0..1) и текст, по порядку.
+/// Ключ кэша развёрнутых повторов: окно и (срок, повтор, текст) каждого напоминания.
+fn reminders_key(list: &[store::Reminder], from: i64, to: i64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (from, to, list.len()).hash(&mut h);
+    for r in list {
+        (r.at, r.repeat, &r.text).hash(&mut h);
+    }
+    h.finish()
+}
+
 fn day_marks(list: &[store::Reminder], day_start: i64, day_len: i64) -> Vec<(f32, String)> {
     let mut v: Vec<(i64, &store::Reminder)> = list.iter().flat_map(|r| occurrences(r, day_start, day_start + day_len).into_iter().map(move |ts| (ts, r))).collect();
     v.sort_by_key(|(ts, _)| *ts);
@@ -9594,12 +9627,20 @@ fn fmt_secs(s: u64) -> String {
 }
 
 fn fmt_num(v: f64) -> String {
-    if (v - v.round()).abs() < 1e-9 && v.abs() < 1e15 {
+    if v == 0.0 {
+        return "0".into(); // и -0.0
+    }
+    if v.abs() >= 1e15 {
+        return format!("{v:e}");
+    }
+    let s = if (v - v.round()).abs() < 1e-9 {
         format!("{}", v.round() as i64)
     } else {
         let s = format!("{v:.6}");
         s.trim_end_matches('0').trim_end_matches('.').to_string()
-    }
+    };
+    // крошечное ненулевое число не должно превращаться в «0»
+    if s == "0" || s == "-0" { format!("{v:e}") } else { s }
 }
 
 /// Полужирный Segoe UI — заголовки, вкладки, кнопки, часы.
@@ -10300,5 +10341,45 @@ mod frame_tests {
         }
         assert_eq!(wrap_phase(1.0, DRIP_PERIOD), 1.0);
         assert!(wrap_phase(f32::NAN, DRIP_PERIOD) == 0.0);
+    }
+}
+
+#[cfg(test)]
+mod brigade_a_tests {
+    use super::*;
+    fn r(text: &str, at: i64, repeat: u8) -> store::Reminder {
+        store::Reminder { text: text.into(), at, repeat }
+    }
+    #[test]
+    fn reminders_key_changes() {
+        let a = vec![r("купить", 100, 0), r("позвонить", 200, 1)];
+        let k = reminders_key(&a, 0, 1000);
+        assert_eq!(k, reminders_key(&a.clone(), 0, 1000));
+        assert_ne!(k, reminders_key(&a, 0, 1001));
+        assert_ne!(k, reminders_key(&a, 1, 1000));
+        assert_ne!(k, reminders_key(&a[..1], 0, 1000));
+        // текст той же длины, но другой — ключ обязан смениться
+        let mut c = a.clone();
+        c[0].text = "абвгде".into();
+        let mut d = a.clone();
+        d[0].text = "ежзийк".into();
+        assert_ne!(reminders_key(&c, 0, 1000), reminders_key(&d, 0, 1000));
+        let mut e = a.clone();
+        e[1].repeat = 2;
+        assert_ne!(k, reminders_key(&e, 0, 1000));
+        let mut f = a.clone();
+        f[1].at = 201;
+        assert_ne!(k, reminders_key(&f, 0, 1000));
+    }
+    #[test]
+    fn fmt_num_edges() {
+        assert_eq!(fmt_num(2.5), "2.5");
+        assert_eq!(fmt_num(1000000.0), "1000000");
+        assert_eq!(fmt_num(-0.0), "0");
+        assert_eq!(fmt_num(0.0), "0");
+        for v in [1e-7, -1e-7, 1e20, -3e18] {
+            let s = fmt_num(v);
+            assert!(s.contains('e') && s.parse::<f64>().unwrap() == v, "{v} → {s}");
+        }
     }
 }
