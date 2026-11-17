@@ -827,6 +827,8 @@ enum Seg {
     Text(String, Color32),
     /// непрочитанные сообщения: число на цветной капсуле мессенджера
     Badge(usize, Color32),
+    /// заряд кончается: процент и идёт ли зарядка
+    Battery(u8, bool),
 }
 
 struct App {
@@ -2182,6 +2184,13 @@ impl App {
         if now.duration_since(self.stats_at) >= Duration::from_millis(1500) {
             self.stats_at = now;
             self.stats = self.meter.sample();
+            // для снимков батарейки в пилюле: OSTROVOK_BATTERY=8 (разряжается) или 15c (заряжается)
+            if let Some(v) = std::env::var("OSTROVOK_BATTERY").ok().filter(|_| test_mode()) {
+                let charging = v.ends_with('c');
+                if let Ok(pct) = v.trim_end_matches('c').parse::<u8>() {
+                    self.stats.battery = Some((pct.min(100), charging));
+                }
+            }
             if let Some((rx, tx)) = sys::net_bytes() {
                 if let Some((prx, ptx, at)) = self.net_prev {
                     let dt = now.duration_since(at).as_secs_f32().max(0.2);
@@ -2235,6 +2244,9 @@ impl App {
             let secs = since.elapsed().as_secs();
             v.push(Seg::Text(format!("\u{E720} {:02}:{:02}", secs / 60, secs % 60), Color32::from_rgb(0x8E, 0x98, 0xFF)));
         }
+        if let Some((pct, charging)) = battery_seg(self.stats.battery) {
+            v.push(Seg::Battery(pct, charging));
+        }
         if playing || self.sound.active() {
             v.push(Seg::Eq);
         } else if let Some(w) = &self.weather {
@@ -2253,6 +2265,7 @@ impl App {
                 Seg::Track(t) => ctx.fonts(|f| f.layout_no_wrap(t.clone(), semi(13.0), FG).size().x).clamp(96.0, 170.0),
                 Seg::Text(t, _) => ctx.fonts(|f| f.layout_no_wrap(t.clone(), semi(13.5), FG).size().x),
                 Seg::Badge(n, _) => badge_w(ctx, *n),
+                Seg::Battery(pct, _) => 25.0 + ctx.fonts(|f| f.layout_no_wrap(format!("{pct}%"), semi(12.5), FG).size().x),
             } + 10.0;
         }
         (w + 6.0).clamp(120.0, 520.0)
@@ -2539,6 +2552,22 @@ impl App {
                     p.rect_filled(Rect::from_min_max(r.min + vec2(4.0, 1.5), pos2(r.right() - 4.0, r.top() + 6.5)), Rounding::same(4.0), rgba(255, 255, 255, 34));
                     p.text(r.center() + vec2(0.0, 0.5), Align2::CENTER_CENTER, badge_text(*n), semi(11.5), Color32::WHITE);
                     x += w + 10.0;
+                }
+                Seg::Battery(pct, charging) => {
+                    // корпус, носик и заливка по заряду; при зарядке — молния поверх. Всё неподвижно
+                    let [r0, g0, b0] = battery_rgb(*pct, *charging);
+                    let col = Color32::from_rgb(r0, g0, b0);
+                    let body = Rect::from_min_size(pos2(x, cy - 5.5), vec2(19.0, 11.0));
+                    p.rect_stroke(body, Rounding::same(3.0), Stroke::new(1.3_f32, mix(col, Color32::WHITE, 0.35)));
+                    p.rect_filled(Rect::from_min_size(pos2(body.right() + 1.0, cy - 2.0), vec2(2.0, 4.0)), Rounding::same(1.0), mix(col, Color32::WHITE, 0.35));
+                    let inner = body.shrink(2.2);
+                    let fill = (inner.width() * (*pct as f32 / 100.0)).max(2.0);
+                    p.rect_filled(Rect::from_min_size(inner.min, vec2(fill, inner.height())), Rounding::same(1.5), col);
+                    if *charging {
+                        p.text(body.center(), Align2::CENTER_CENTER, "\u{E945}", FontId::proportional(10.0), Color32::WHITE);
+                    }
+                    let r = p.text(pos2(x + 25.0, cy), Align2::LEFT_CENTER, format!("{pct}%"), semi(12.5), col);
+                    x += 25.0 + r.width() + 10.0;
                 }
             }
         }
@@ -7067,6 +7096,40 @@ fn quiet_toggle(level: f32, saved: Option<f32>) -> (f32, Option<f32>) {
 /// Какой из пресетов громкости сейчас стоит (с допуском в 1%).
 fn preset_index(level: f32) -> Option<usize> {
     VOL_PRESETS.iter().position(|p| (p - level).abs() < 0.01)
+}
+
+const BATT_GREEN: [u8; 3] = [0x5E, 0xE0, 0x8A];
+const BATT_ORANGE: [u8; 3] = [0xFF, 0xB3, 0x40];
+const BATT_RED: [u8; 3] = [0xFF, 0x5C, 0x5C];
+
+/// Батарейка в пилюле: только когда заряда осталось 20% и меньше.
+fn battery_seg(b: Option<(u8, bool)>) -> Option<(u8, bool)> {
+    b.filter(|(pct, _)| *pct <= 20)
+}
+
+fn battery_rgb(pct: u8, charging: bool) -> [u8; 3] {
+    if charging { BATT_GREEN } else if pct <= 10 { BATT_RED } else { BATT_ORANGE }
+}
+
+#[cfg(test)]
+mod battery_tests {
+    use super::*;
+    #[test]
+    fn shows_only_when_low() {
+        assert_eq!(battery_seg(None), None);
+        assert_eq!(battery_seg(Some((80, false))), None);
+        assert_eq!(battery_seg(Some((21, false))), None);
+        assert_eq!(battery_seg(Some((20, false))), Some((20, false)));
+        assert_eq!(battery_seg(Some((5, true))), Some((5, true)));
+        assert_eq!(battery_seg(Some((60, true))), None);
+    }
+    #[test]
+    fn colors() {
+        assert_eq!(battery_rgb(15, true), BATT_GREEN);
+        assert_eq!(battery_rgb(15, false), BATT_ORANGE);
+        assert_eq!(battery_rgb(10, false), BATT_RED);
+        assert_eq!(battery_rgb(0, false), BATT_RED);
+    }
 }
 
 #[cfg(test)]
