@@ -1714,3 +1714,31 @@ mod clip_private_tests {
         assert!(!clip_is_private(false, Some(7), Some(u32::MAX)));
     }
 }
+
+/// Отметка двух часов: `tick_ms` идёт и во сне, `unbiased_100ns` во сне стоит.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SleepClock {
+    pub tick_ms: u64,
+    pub unbiased_100ns: u64,
+}
+
+/// Сколько компьютер проспал между отметками: прирост «идущих во сне» часов минус прирост «стоящих».
+pub fn slept_between(a: SleepClock, b: SleepClock) -> std::time::Duration {
+    let wall = std::time::Duration::from_millis(b.tick_ms.saturating_sub(a.tick_ms));
+    let awake = std::time::Duration::from_nanos(b.unbiased_100ns.saturating_sub(a.unbiased_100ns).saturating_mul(100));
+    wall.saturating_sub(awake)
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn QueryUnbiasedInterruptTime(time: *mut u64) -> i32;
+}
+
+/// Текущая отметка часов сна (None, если система не ответила).
+pub fn sleep_clock() -> Option<SleepClock> {
+    let mut unbiased = 0u64;
+    // SAFETY: передаём указатель на свою переменную, функция только пишет в неё.
+    let ok = unsafe { QueryUnbiasedInterruptTime(&mut unbiased) } != 0;
+    let tick_ms = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+    ok.then_some(SleepClock { tick_ms, unbiased_100ns: unbiased })
+}

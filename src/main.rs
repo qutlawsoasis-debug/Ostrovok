@@ -1089,6 +1089,8 @@ struct App {
     timer_total: f32,
     /// таймер на паузе: сколько оставалось (timer_end при этом пуст)
     timer_paused: Option<Duration>,
+    /// отметка часов сна при старте/продолжении таймера
+    timer_clock: Option<sys::SleepClock>,
     // удобства Windows
     ctl_at: Instant,
     vol: Option<(f32, bool)>,
@@ -1428,6 +1430,7 @@ impl App {
             pill_rect: Rect::NOTHING,
             timer_total: 60.0,
             timer_paused: None,
+            timer_clock: None,
             ctl_at: now,
             mixer: Vec::new(),
             mix_push: (None, None),
@@ -1913,6 +1916,7 @@ impl App {
         self.timer_end = Some(Instant::now() + Duration::from_secs_f64(minutes * 60.0));
         self.timer_total = (minutes * 60.0) as f32;
         self.timer_paused = None;
+        self.timer_clock = sys::sleep_clock();
         self.notify(&format!("Таймер на {} мин", fmt_num(minutes)));
     }
 
@@ -2671,23 +2675,29 @@ impl App {
             }
         }
 
-        if self.timer_end.is_some_and(|end| now >= end) {
+        if let Some(end) = self.timer_end.filter(|&end| now >= end) {
             self.timer_end = None;
             sys::beep();
-            match self.focus {
-                // работа кончилась — перерыв; перерыв кончился — снова работа
-                Some((false, rounds)) => {
+            // работа кончилась — перерыв; перерыв кончился — снова работа; проспали срок — стоп без зачёта
+            let slept = self.timer_clock.zip(sys::sleep_clock()).map(|(a, b)| sys::slept_between(a, b));
+            match timer_finish(self.focus, now.saturating_duration_since(end), slept) {
+                TimerFinish::Break(round) => {
                     self.log_focus(25);
-                    self.focus = Some((true, rounds + 1));
+                    self.focus = Some((true, round));
                     self.start_timer(5.0);
-                    self.show_toast("\u{E916}", [0x30, 0xD1, 0x58], "Перерыв 5 минут", &format!("круг {} пройден — отдохните", rounds + 1), 6, false);
+                    self.show_toast("\u{E916}", [0x30, 0xD1, 0x58], "Перерыв 5 минут", &format!("круг {round} пройден — отдохните"), 6, false);
                 }
-                Some((true, rounds)) => {
+                TimerFinish::Work(rounds) => {
                     self.focus = Some((false, rounds));
                     self.start_timer(25.0);
                     self.show_toast("\u{E916}", [0xFF, 0xB3, 0x40], "Фокус 25 минут", "перерыв окончен — за работу", 6, false);
                 }
-                None => self.show_toast("\u{E916}", [0x30, 0xD1, 0x58], "Таймер завершён", "Время вышло", 8, false),
+                TimerFinish::Slept => {
+                    self.focus = None;
+                    self.timer_paused = None;
+                    self.show_toast("\u{E916}", [0xFF, 0xB3, 0x40], "Таймер закончился, пока компьютер спал", "круг не засчитан", 8, false);
+                }
+                TimerFinish::Done => self.show_toast("\u{E916}", [0x30, 0xD1, 0x58], "Таймер завершён", "Время вышло", 8, false),
             }
             self.emotion = Emotion::Surprised;
             self.emotion_until = now + Duration::from_secs(4);
@@ -5213,32 +5223,26 @@ impl App {
             }
             if live && jelly(ui, "Стоп").clicked() {
                 // остановили посреди рабочего круга — прошедшее время засчитываем, если набралось от 5 минут
-                if let Some((false, _)) = self.focus {
-                    // остаток берём и у идущего таймера, и у стоящего на паузе
-                    let left = timer_view(self.timer_end, self.timer_paused, self.timer_total, Instant::now()).0 as f32;
-                    let done = ((self.timer_total - left) / 60.0).floor() as u32;
-                    if done >= 5 {
-                        self.log_focus(done);
-                    }
-                }
+                self.credit_focus();
                 self.timer_end = None;
                 self.timer_paused = None;
                 self.focus = None;
             }
             // пауза: остаток запоминаем, таймер останавливаем — пилюля и капля перестают тикать
             if live && jelly(ui, if paused { "\u{E768}" } else { "\u{E769}" }).on_hover_text(if paused { "Продолжить" } else { "Пауза" }).clicked() {
-                if let Some(left) = self.timer_paused.take() {
-                    self.timer_end = Some(Instant::now() + left);
-                } else if let Some(end) = self.timer_end.take() {
-                    self.timer_paused = Some(end.saturating_duration_since(Instant::now()));
-                }
+                (self.timer_end, self.timer_paused) = pause_toggle(self.timer_end, self.timer_paused, Instant::now());
+                // сон на паузе не в счёт: отметку ставим заново
+                self.timer_clock = sys::sleep_clock();
             }
             let label = match self.focus {
                 Some((_, rounds)) => format!("Фокус: круг {}", rounds + 1),
                 None => "Фокус 25/5".to_string(),
             };
             if jelly(ui, label).on_hover_text("25 минут работы, 5 минут перерыва — по кругу, пока не остановите").clicked() {
-                if self.focus.take().is_some() {
+                if self.focus.is_some() {
+                    // выключатель засчитывает так же, как «Стоп»
+                    self.credit_focus();
+                    self.focus = None;
                     self.timer_end = None;
                     self.timer_paused = None;
                 } else {
@@ -5589,6 +5593,15 @@ impl App {
         } else if let Some(text) = pick {
             self.set_clipboard(&text);
             self.notify("Скопировано в буфер");
+        }
+    }
+
+    /// Досрочная остановка фокуса: прошедшую работу засчитываем, если набралось от 5 минут.
+    /// Остаток берём и у идущего таймера, и у стоящего на паузе.
+    fn credit_focus(&mut self) {
+        let left = timer_view(self.timer_end, self.timer_paused, self.timer_total, Instant::now()).0 as f32;
+        if let Some(done) = focus_credit(self.timer_total, left, matches!(self.focus, Some((false, _)))) {
+            self.log_focus(done);
         }
     }
 
@@ -7869,6 +7882,10 @@ impl eframe::App for App {
         } else {
             ctx.request_repaint_after(Duration::from_millis(90));
         }
+        // срок таймера не проспим, даже если кадры редкие
+        if let Some(end) = self.timer_end {
+            ctx.request_repaint_after(end.saturating_duration_since(now));
+        }
     }
 }
 
@@ -8829,6 +8846,160 @@ fn timer_minutes_ok(m: f64) -> bool {
     m.is_finite() && m > 0.0 && m <= 24.0 * 60.0
 }
 
+/// Сон короче этого не считаем сном, и опоздание меньше этого — срок наступил уже после пробуждения.
+const TIMER_SLEPT: Duration = Duration::from_secs(60);
+/// Если часов сна нет — считаем, что спали, только при таком большом опоздании (редкие кадры скрытого острова).
+const TIMER_SLEPT_FALLBACK: Duration = Duration::from_secs(10 * 60);
+
+/// Что делать, когда срок таймера прошёл.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerFinish {
+    /// простой таймер вовремя
+    Done,
+    /// рабочий круг пройден: засчитать 25 минут и уйти на перерыв (номер пройденного круга)
+    Break(u32),
+    /// перерыв кончился — снова работа
+    Work(u32),
+    /// срок прошёл, пока компьютер спал: ничего не засчитываем, цикл останавливаем
+    Slept,
+}
+
+/// `overshoot` — насколько позже срока мы это заметили; `slept` — сколько компьютер реально спал
+/// с начала (продолжения) таймера, None — часов сна нет.
+fn timer_finish(focus: Option<(bool, u32)>, overshoot: Duration, slept: Option<Duration>) -> TimerFinish {
+    let asleep = match slept {
+        Some(s) => s > TIMER_SLEPT && overshoot > TIMER_SLEPT,
+        None => overshoot > TIMER_SLEPT_FALLBACK,
+    };
+    if asleep {
+        return TimerFinish::Slept;
+    }
+    match focus {
+        Some((false, rounds)) => TimerFinish::Break(rounds + 1),
+        Some((true, rounds)) => TimerFinish::Work(rounds),
+        None => TimerFinish::Done,
+    }
+}
+
+/// Сколько минут рабочего круга засчитать при досрочной остановке: только работу и только от 5 минут.
+fn focus_credit(total: f32, left: f32, working: bool) -> Option<u32> {
+    if !working {
+        return None;
+    }
+    let done = ((total - left).max(0.0) / 60.0).floor() as u32;
+    (done >= 5).then_some(done)
+}
+
+/// Пауза туда-обратно: возвращает новые (срок, остаток на паузе).
+fn pause_toggle(end: Option<Instant>, paused: Option<Duration>, now: Instant) -> (Option<Instant>, Option<Duration>) {
+    match (end, paused) {
+        (_, Some(left)) => (Some(now + left), None),
+        (Some(e), None) => (None, Some(e.saturating_duration_since(now))),
+        (None, None) => (None, None),
+    }
+}
+
+#[cfg(test)]
+mod timer_tests {
+    use super::*;
+
+    #[test]
+    fn finish_on_time_and_after_sleep() {
+        let s = Duration::from_secs;
+        let z = Some(Duration::ZERO);
+        let sleep = Some(s(2 * 3600));
+        // без сна опоздание само по себе ничего не значит
+        assert_eq!(timer_finish(None, s(0), z), TimerFinish::Done);
+        assert_eq!(timer_finish(None, s(59), z), TimerFinish::Done);
+        assert_eq!(timer_finish(None, s(61), z), TimerFinish::Done);
+        assert_eq!(timer_finish(Some((false, 2)), s(61), z), TimerFinish::Break(3));
+        assert_eq!(timer_finish(Some((true, 3)), s(61), z), TimerFinish::Work(3));
+        // спали и срок прошёл во сне
+        assert_eq!(timer_finish(None, s(61), sleep), TimerFinish::Slept);
+        assert_eq!(timer_finish(Some((false, 2)), s(61), sleep), TimerFinish::Slept);
+        assert_eq!(timer_finish(Some((true, 3)), s(61), sleep), TimerFinish::Slept);
+        // спали, но срок наступил уже после пробуждения
+        assert_eq!(timer_finish(Some((false, 2)), s(59), sleep), TimerFinish::Break(3));
+        assert_eq!(timer_finish(Some((true, 3)), s(59), sleep), TimerFinish::Work(3));
+        // короткий «сон» до минуты не считается
+        assert_eq!(timer_finish(None, s(3600), Some(s(60))), TimerFinish::Done);
+    }
+
+    #[test]
+    fn rare_frames_are_not_sleep() {
+        // остров скрыт, кадры редкие: заметили срок через 5 минут, но компьютер не спал
+        let late = Duration::from_secs(5 * 60);
+        assert_eq!(timer_finish(Some((false, 0)), late, Some(Duration::ZERO)), TimerFinish::Break(1));
+    }
+
+    #[test]
+    fn fallback_without_clock() {
+        let m = |x: u64| Duration::from_secs(x * 60);
+        assert_eq!(timer_finish(Some((false, 0)), m(9), None), TimerFinish::Break(1));
+        assert_eq!(timer_finish(Some((false, 0)), m(11), None), TimerFinish::Slept);
+        assert_eq!(timer_finish(None, m(9), None), TimerFinish::Done);
+    }
+
+    #[test]
+    fn slept_between_clocks() {
+        use sys::{slept_between, SleepClock};
+        let a = SleepClock { tick_ms: 1_000, unbiased_100ns: 50_000_000 };
+        // обычный ход: оба часа прошли 10 минут
+        let b = SleepClock { tick_ms: 1_000 + 600_000, unbiased_100ns: 50_000_000 + 600 * 10_000_000 };
+        assert_eq!(slept_between(a, b), Duration::ZERO);
+        // сон 2 часа: tick прошёл 2 ч 10 мин, unbiased — 10 мин
+        let b = SleepClock { tick_ms: 1_000 + 600_000 + 7_200_000, unbiased_100ns: 50_000_000 + 600 * 10_000_000 };
+        assert_eq!(slept_between(a, b), Duration::from_secs(7200));
+        // часы «назад» — ноль, без паники
+        let b = SleepClock { tick_ms: 0, unbiased_100ns: 0 };
+        assert_eq!(slept_between(a, b), Duration::ZERO);
+        let b = SleepClock { tick_ms: 2_000, unbiased_100ns: 0 };
+        assert_eq!(slept_between(a, b), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn credit_boundaries() {
+        let t = 25.0 * 60.0;
+        assert_eq!(focus_credit(t, t - 299.0, true), None); // 4:59
+        assert_eq!(focus_credit(t, t - 300.0, true), Some(5)); // 5:00
+        assert_eq!(focus_credit(t, 0.0, true), Some(25));
+        assert_eq!(focus_credit(5.0 * 60.0, 0.0, false), None); // перерыв не засчитывается
+        assert_eq!(focus_credit(t, t + 10.0, true), None);
+    }
+
+    #[test]
+    fn pause_round_trip() {
+        let now = Instant::now();
+        let end = now + Duration::from_secs(90);
+        let (e, p) = pause_toggle(Some(end), None, now);
+        assert_eq!((e, p), (None, Some(Duration::from_secs(90))));
+        let later = now + Duration::from_secs(1000);
+        let (e, p) = pause_toggle(e, p, later);
+        assert_eq!((e, p), (Some(later + Duration::from_secs(90)), None));
+        assert_eq!(pause_toggle(Some(now), None, later), (None, Some(Duration::ZERO)));
+        assert_eq!(pause_toggle(None, None, now), (None, None));
+    }
+
+    #[test]
+    fn minutes_ok() {
+        assert!(!timer_minutes_ok(0.0));
+        assert!(!timer_minutes_ok(-1.0));
+        assert!(!timer_minutes_ok(f64::NAN));
+        assert!(!timer_minutes_ok(f64::INFINITY));
+        assert!(timer_minutes_ok(1440.0));
+        assert!(!timer_minutes_ok(1440.01));
+        assert!(timer_minutes_ok(0.5));
+    }
+
+    #[test]
+    fn secs_format() {
+        assert_eq!(fmt_secs(0), "00:00");
+        assert_eq!(fmt_secs(59), "00:59");
+        assert_eq!(fmt_secs(3600), "1:00:00");
+        assert_eq!(fmt_secs(86400), "24:00:00");
+    }
+}
+
 /// Демо отложенного сна: секунд до срока, без ухода в минус при 0 минут.
 fn power_demo_secs(m: u64) -> u64 {
     m.saturating_mul(60).saturating_sub(19)
@@ -9640,24 +9811,22 @@ fn is_ru_letter(c: char) -> bool {
 
 /// Переводит текст, набранный не в той раскладке: ЙЦУКЕН ↔ QWERTY по положению клавиш.
 /// Направление — по большинству букв (поровну — по первой букве).
-/// Буквы выдаются строчными: поиск сравнивает без учёта регистра, а строчные не путают «Ntktuhfv» с «NТЕЛЕ…».
+/// Первая буква сохраняет регистр исходника («Ntktuhfv» → «Телеграм»), остальные строчные:
+/// поиск сравнивает без учёта регистра, а Caps Lock не даёт «ТЕЛЕГРАМ». Shift-знаки («<» → «б») тоже переводятся.
 fn swap_layout(s: &str) -> String {
     let latin = s.chars().filter(|c| c.is_ascii_alphabetic()).count();
     let cyr = s.chars().filter(|&c| is_ru_letter(c)).count();
     let to_en = if latin != cyr { cyr > latin } else { s.chars().find(|c| c.is_alphabetic()).is_some_and(is_ru_letter) };
-    // Shift-знаки («<» → «б») тоже переводим
-    // первая буква сохраняет регистр исходника («Ntktuhfv» → «Телеграм»), остальные строчные
     let mut first = true;
     s.chars()
         .map(|c| {
             let t = map_key(c, !to_en).unwrap_or(c);
-            let low = t.to_lowercase().next().unwrap_or(t);
             if !t.is_alphabetic() {
                 return t;
             }
             let keep = first && (c.is_uppercase() || (!c.is_alphabetic() && t.is_uppercase()));
             first = false;
-            if keep { t.to_uppercase().next().unwrap_or(t) } else { low }
+            if keep { t.to_uppercase().next().unwrap_or(t) } else { t.to_lowercase().next().unwrap_or(t) }
         })
         .collect()
 }
