@@ -1089,6 +1089,8 @@ struct App {
     timer_total: f32,
     /// таймер на паузе: сколько оставалось (timer_end при этом пуст)
     timer_paused: Option<Duration>,
+    /// отметка часов сна при старте/продолжении таймера
+    timer_clock: Option<sys::SleepClock>,
     // удобства Windows
     ctl_at: Instant,
     vol: Option<(f32, bool)>,
@@ -1428,6 +1430,7 @@ impl App {
             pill_rect: Rect::NOTHING,
             timer_total: 60.0,
             timer_paused: None,
+            timer_clock: None,
             ctl_at: now,
             mixer: Vec::new(),
             mix_push: (None, None),
@@ -1913,6 +1916,7 @@ impl App {
         self.timer_end = Some(Instant::now() + Duration::from_secs_f64(minutes * 60.0));
         self.timer_total = (minutes * 60.0) as f32;
         self.timer_paused = None;
+        self.timer_clock = sys::sleep_clock();
         self.notify(&format!("Таймер на {} мин", fmt_num(minutes)));
     }
 
@@ -2675,7 +2679,8 @@ impl App {
             self.timer_end = None;
             sys::beep();
             // работа кончилась — перерыв; перерыв кончился — снова работа; проспали срок — стоп без зачёта
-            match timer_finish(self.focus, now.saturating_duration_since(end)) {
+            let slept = self.timer_clock.zip(sys::sleep_clock()).map(|(a, b)| sys::slept_between(a, b));
+            match timer_finish(self.focus, now.saturating_duration_since(end), slept) {
                 TimerFinish::Break(round) => {
                     self.log_focus(25);
                     self.focus = Some((true, round));
@@ -5226,6 +5231,8 @@ impl App {
             // пауза: остаток запоминаем, таймер останавливаем — пилюля и капля перестают тикать
             if live && jelly(ui, if paused { "\u{E768}" } else { "\u{E769}" }).on_hover_text(if paused { "Продолжить" } else { "Пауза" }).clicked() {
                 (self.timer_end, self.timer_paused) = pause_toggle(self.timer_end, self.timer_paused, Instant::now());
+                // сон на паузе не в счёт: отметку ставим заново
+                self.timer_clock = sys::sleep_clock();
             }
             let label = match self.focus {
                 Some((_, rounds)) => format!("Фокус: круг {}", rounds + 1),
@@ -8833,8 +8840,10 @@ fn timer_minutes_ok(m: f64) -> bool {
     m.is_finite() && m > 0.0 && m <= 24.0 * 60.0
 }
 
-/// Насколько таймер может опоздать, прежде чем считаем, что компьютер спал.
+/// Сон короче этого не считаем сном, и опоздание меньше этого — срок наступил уже после пробуждения.
 const TIMER_SLEPT: Duration = Duration::from_secs(60);
+/// Если часов сна нет — считаем, что спали, только при таком большом опоздании (редкие кадры скрытого острова).
+const TIMER_SLEPT_FALLBACK: Duration = Duration::from_secs(10 * 60);
 
 /// Что делать, когда срок таймера прошёл.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8849,9 +8858,14 @@ enum TimerFinish {
     Slept,
 }
 
-/// `overshoot` — насколько позже срока мы это заметили.
-fn timer_finish(focus: Option<(bool, u32)>, overshoot: Duration) -> TimerFinish {
-    if overshoot > TIMER_SLEPT {
+/// `overshoot` — насколько позже срока мы это заметили; `slept` — сколько компьютер реально спал
+/// с начала (продолжения) таймера, None — часов сна нет.
+fn timer_finish(focus: Option<(bool, u32)>, overshoot: Duration, slept: Option<Duration>) -> TimerFinish {
+    let asleep = match slept {
+        Some(s) => s > TIMER_SLEPT && overshoot > TIMER_SLEPT,
+        None => overshoot > TIMER_SLEPT_FALLBACK,
+    };
+    if asleep {
         return TimerFinish::Slept;
     }
     match focus {
@@ -8886,14 +8900,55 @@ mod timer_tests {
     #[test]
     fn finish_on_time_and_after_sleep() {
         let s = Duration::from_secs;
-        assert_eq!(timer_finish(None, s(0)), TimerFinish::Done);
-        assert_eq!(timer_finish(None, s(59)), TimerFinish::Done);
-        assert_eq!(timer_finish(None, s(60)), TimerFinish::Done);
-        assert_eq!(timer_finish(None, s(61)), TimerFinish::Slept);
-        assert_eq!(timer_finish(Some((false, 2)), s(59)), TimerFinish::Break(3));
-        assert_eq!(timer_finish(Some((false, 2)), s(61)), TimerFinish::Slept);
-        assert_eq!(timer_finish(Some((true, 3)), s(59)), TimerFinish::Work(3));
-        assert_eq!(timer_finish(Some((true, 3)), s(61)), TimerFinish::Slept);
+        let z = Some(Duration::ZERO);
+        let sleep = Some(s(2 * 3600));
+        // без сна опоздание само по себе ничего не значит
+        assert_eq!(timer_finish(None, s(0), z), TimerFinish::Done);
+        assert_eq!(timer_finish(None, s(59), z), TimerFinish::Done);
+        assert_eq!(timer_finish(None, s(61), z), TimerFinish::Done);
+        assert_eq!(timer_finish(Some((false, 2)), s(61), z), TimerFinish::Break(3));
+        assert_eq!(timer_finish(Some((true, 3)), s(61), z), TimerFinish::Work(3));
+        // спали и срок прошёл во сне
+        assert_eq!(timer_finish(None, s(61), sleep), TimerFinish::Slept);
+        assert_eq!(timer_finish(Some((false, 2)), s(61), sleep), TimerFinish::Slept);
+        assert_eq!(timer_finish(Some((true, 3)), s(61), sleep), TimerFinish::Slept);
+        // спали, но срок наступил уже после пробуждения
+        assert_eq!(timer_finish(Some((false, 2)), s(59), sleep), TimerFinish::Break(3));
+        assert_eq!(timer_finish(Some((true, 3)), s(59), sleep), TimerFinish::Work(3));
+        // короткий «сон» до минуты не считается
+        assert_eq!(timer_finish(None, s(3600), Some(s(60))), TimerFinish::Done);
+    }
+
+    #[test]
+    fn rare_frames_are_not_sleep() {
+        // остров скрыт, кадры редкие: заметили срок через 5 минут, но компьютер не спал
+        let late = Duration::from_secs(5 * 60);
+        assert_eq!(timer_finish(Some((false, 0)), late, Some(Duration::ZERO)), TimerFinish::Break(1));
+    }
+
+    #[test]
+    fn fallback_without_clock() {
+        let m = |x: u64| Duration::from_secs(x * 60);
+        assert_eq!(timer_finish(Some((false, 0)), m(9), None), TimerFinish::Break(1));
+        assert_eq!(timer_finish(Some((false, 0)), m(11), None), TimerFinish::Slept);
+        assert_eq!(timer_finish(None, m(9), None), TimerFinish::Done);
+    }
+
+    #[test]
+    fn slept_between_clocks() {
+        use sys::{slept_between, SleepClock};
+        let a = SleepClock { tick_ms: 1_000, unbiased_100ns: 50_000_000 };
+        // обычный ход: оба часа прошли 10 минут
+        let b = SleepClock { tick_ms: 1_000 + 600_000, unbiased_100ns: 50_000_000 + 600 * 10_000_000 };
+        assert_eq!(slept_between(a, b), Duration::ZERO);
+        // сон 2 часа: tick прошёл 2 ч 10 мин, unbiased — 10 мин
+        let b = SleepClock { tick_ms: 1_000 + 600_000 + 7_200_000, unbiased_100ns: 50_000_000 + 600 * 10_000_000 };
+        assert_eq!(slept_between(a, b), Duration::from_secs(7200));
+        // часы «назад» — ноль, без паники
+        let b = SleepClock { tick_ms: 0, unbiased_100ns: 0 };
+        assert_eq!(slept_between(a, b), Duration::ZERO);
+        let b = SleepClock { tick_ms: 2_000, unbiased_100ns: 0 };
+        assert_eq!(slept_between(a, b), Duration::from_secs(1));
     }
 
     #[test]
