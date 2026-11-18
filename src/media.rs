@@ -61,9 +61,10 @@ fn mgr_backoff(prev: u32) -> u32 {
 
 /// Позиция для показа: сразу после смены трека Windows ещё отдаёт позицию прошлого
 /// (та же длительность, далеко от начала) — тогда показываем начало.
-pub fn sane_timeline(stale_dur: Option<f64>, pos: f64, dur: f64) -> f64 {
+/// Не дольше 4 с после смены: иначе трек той же длины, начатый с середины, навсегда показывал бы 0.
+pub fn sane_timeline(stale_dur: Option<f64>, pos: f64, dur: f64, since_switch: f64) -> f64 {
     match stale_dur {
-        Some(d) if (d - dur).abs() < 0.5 && pos > 5.0 => 0.0,
+        Some(d) if since_switch < 4.0 && (d - dur).abs() < 0.5 && pos > 5.0 => 0.0,
         _ => pos,
     }
 }
@@ -97,6 +98,7 @@ pub fn spawn() -> (Arc<Mutex<State>>, mpsc::Sender<Cmd>) {
         // длительность прошлого трека: пока Windows отдаёт его позицию для нового — показываем 0
         let mut stale_dur: Option<f64> = None;
         let mut last_dur = 0.0f64;
+        let mut switched_at = Instant::now();
         loop {
             let cmd = match rx.recv_timeout(Duration::from_millis(1000)) {
                 Ok(c) => Some(c),
@@ -143,6 +145,7 @@ pub fn spawn() -> (Arc<Mutex<State>>, mpsc::Sender<Cmd>) {
                     let new_key = format!("{}|{}", info.title, info.artist);
                     if new_key != key {
                         stale_dur = (!key.is_empty()).then_some(last_dur);
+                        switched_at = Instant::now();
                         key = new_key;
                         have_thumb = false;
                         thumb_tries = 0;
@@ -152,7 +155,7 @@ pub fn spawn() -> (Arc<Mutex<State>>, mpsc::Sender<Cmd>) {
                         st.thumb_gen += 1;
                     }
                     last_dur = info.dur;
-                    let pos = sane_timeline(stale_dur, info.pos, info.dur);
+                    let pos = sane_timeline(stale_dur, info.pos, info.dur, switched_at.elapsed().as_secs_f64());
                     if pos == info.pos {
                         stale_dur = None;
                     }
@@ -391,10 +394,10 @@ mod tests {
 
     #[test]
     fn timeline_after_switch() {
-        assert_eq!(sane_timeline(Some(200.0), 120.0, 200.0), 0.0, "старая позиция при той же длительности");
-        assert_eq!(sane_timeline(Some(200.0), 3.0, 200.0), 3.0, "уже с начала");
-        assert_eq!(sane_timeline(Some(200.0), 120.0, 180.0), 120.0, "длительность сменилась — позиция свежая");
-        assert_eq!(sane_timeline(None, 120.0, 200.0), 120.0);
+        assert_eq!(sane_timeline(Some(200.0), 120.0, 200.0, 1.0), 0.0, "старая позиция при той же длительности");
+        assert_eq!(sane_timeline(Some(200.0), 3.0, 200.0, 1.0), 3.0, "уже с начала");
+        assert_eq!(sane_timeline(Some(200.0), 120.0, 180.0, 1.0), 120.0, "длительность сменилась — позиция свежая");
+        assert_eq!(sane_timeline(None, 120.0, 200.0, 1.0), 120.0);
     }
 
     #[test]
