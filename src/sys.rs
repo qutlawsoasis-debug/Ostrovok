@@ -289,12 +289,37 @@ pub fn dedup_apps(list: Vec<(String, String, String)>) -> Vec<(String, String)> 
     list.into_iter().filter(|(n, _, t)| seen.insert((n.to_lowercase(), t.to_lowercase()))).map(|(n, l, _)| (n, l)).collect()
 }
 
-/// «50% от 300» → «50%*300»: одно вхождение « от » (без учёта регистра), только если слева стоит '%'.
+/// Таб и неразрывные пробелы (U+00A0, U+202F) — обычный пробел.
+fn spaces(s: &str) -> String {
+    s.chars().map(|c| if matches!(c, '\t' | '\u{A0}' | '\u{202F}') { ' ' } else { c }).collect()
+}
+
+/// «сколько процентов A от B» / «A от B в процентах» → (A, B) как строки.
+fn pct_question(s: &str) -> Option<(String, String)> {
+    let lc = spaces(s).to_lowercase();
+    let lc = lc.trim().trim_end_matches('?').trim_end();
+    let body = lc.strip_prefix("сколько процентов ").or_else(|| lc.strip_suffix(" в процентах"))?;
+    let (a, b) = body.split_once(" от ")?;
+    let (a, b) = (a.trim(), b.trim());
+    (!a.is_empty() && !b.is_empty()).then(|| (a.to_string(), b.to_string()))
+}
+
+/// Вопрос «сколько процентов A от B» — ответ показывать со знаком «%».
+pub fn asks_percent(s: &str) -> bool {
+    pct_question(s).is_some()
+}
+
+/// Приводит запрос к виду калькулятора: «50% от 300» → «50%*300», «15 процентов от 200» → «15%*200»,
+/// «сколько процентов 30 от 200» → «(30)/(200)*100». Таб и неразрывные пробелы — пробел.
 pub fn pct_of(s: &str) -> String {
-    let lc = s.to_lowercase();
-    match lc.find(" от ") {
-        Some(pos) if lc[..pos].trim_end().ends_with('%') => format!("{}*{}", &lc[..pos], &lc[pos + " от ".len()..]),
-        _ => s.to_string(),
+    if let Some((a, b)) = pct_question(s) {
+        return format!("({a})/({b})*100");
+    }
+    let lc = spaces(s).to_lowercase().replace(" процентов", "%").replace(" процента", "%").replace("%от", "% от");
+    match lc.find(" от") {
+        Some(pos) if lc[..pos].trim_end().ends_with('%') => format!("{}*{}", &lc[..pos], &lc[pos + " от".len()..]),
+        _ if lc.contains('%') => lc,
+        _ => spaces(s),
     }
 }
 
@@ -427,7 +452,18 @@ mod pct_tests {
         ok("200+-10%", 180.0);
         ok("200+10%*2", 200.2);
         ok("100+(10%)", 100.1);
-        for bad in ["от 300", "50 от", "10%%", "%5", "%", "5%("] {
+        ok("сколько процентов 30 от 200", 15.0);
+        ok("30 от 200 в процентах", 15.0);
+        ok("Сколько процентов 30 от 200?", 15.0);
+        assert_eq!(eval("сколько процентов 30 от 0"), None);
+        assert!(super::asks_percent("30 от 200 в процентах"));
+        assert!(!super::asks_percent("15% от 200"));
+        ok("15%от200", 30.0);
+        ok("15% от200", 30.0);
+        ok("15 процентов от 200", 30.0);
+        ok("15\t+\u{A0}5\u{202F}*2", 25.0);
+        ok("50%\u{A0}от\u{202F}300", 150.0);
+        for bad in ["от 300", "50 от", "10%%", "%5", "%", "5%(", "сколько процентов 30", "сколько процентов от 200"] {
             assert_eq!(eval(bad), None, "{bad}");
         }
     }
