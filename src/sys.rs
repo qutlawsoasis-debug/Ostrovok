@@ -1853,3 +1853,41 @@ unsafe extern "system" fn end_session_proc(
     }
     DefSubclassProc(hwnd, msg, wparam, lparam)
 }
+
+// ---------------------------------------------------------------- место окна острова
+
+/// Монитор, на котором точка (пиксели экрана): [лево, верх, право, низ].
+pub fn monitor_at(x: i32, y: i32) -> [i32; 4] {
+    unsafe {
+        let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            let r = mi.rcMonitor;
+            [r.left, r.top, r.right, r.bottom]
+        } else {
+            [0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)]
+        }
+    }
+}
+
+/// Позиция и размер окна одним вызовом (пиксели экрана), без смены порядка окон и фокуса.
+pub fn place_window(hwnd: isize, r: [i32; 4]) {
+    unsafe {
+        let _ = SetWindowPos(
+            HWND(hwnd as *mut core::ffi::c_void),
+            HWND::default(),
+            r[0],
+            r[1],
+            r[2],
+            r[3],
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        );
+    }
+}
+
+/// Зажата ли левая кнопка мыши (с учётом перестановки кнопок).
+pub fn left_button_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
+    let vk = if unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0 { VK_RBUTTON } else { VK_LBUTTON };
+    unsafe { GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000 != 0 }
+}
