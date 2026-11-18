@@ -365,9 +365,15 @@ impl Settings {
         }
         match serde_json::to_string_pretty(self) {
             Ok(s) => {
-                if let Err(e) = write_atomic(&path, s.as_bytes()) {
-                    log_err(&format!("не удалось записать settings.json: {e}"));
-                }
+                // снимок для записи при завершении сеанса Windows держим, только пока на диск не легло
+                let snap = match write_atomic(&path, s.as_bytes()) {
+                    Ok(()) => None,
+                    Err(e) => {
+                        log_err(&format!("не удалось записать settings.json: {e}"));
+                        Some(s.into_bytes())
+                    }
+                };
+                *SNAP_SETTINGS.lock().unwrap_or_else(|e| e.into_inner()) = snap;
             }
             Err(e) => log_err(&format!("не удалось собрать settings.json: {e}")),
         }
@@ -380,6 +386,43 @@ fn test_free() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::{due_flush, Flush, FLUSH_AFTER};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn due_flush_thresholds() {
+        let t0 = Instant::now();
+        assert_eq!(due_flush(None, t0), Flush::Idle);
+        assert_eq!(due_flush(Some(t0), t0), Flush::WaitFor(FLUSH_AFTER));
+        assert_eq!(due_flush(Some(t0), t0 + Duration::from_millis(1490)), Flush::WaitFor(Duration::from_millis(10)));
+        assert_eq!(due_flush(Some(t0), t0 + Duration::from_millis(1500)), Flush::Save);
+        assert_eq!(due_flush(Some(t0), t0 + Duration::from_secs(10)), Flush::Save);
+    }
+
+    #[test]
+    fn continuous_typing_saves_regularly() {
+        // правка каждые 100 мс в течение 5 с; флаг ставится только если пуст
+        let t0 = Instant::now();
+        let mut dirty: Option<Instant> = None;
+        let mut saves = vec![];
+        for i in 0..=50u64 {
+            let now = t0 + Duration::from_millis(i * 100);
+            dirty.get_or_insert(now);
+            if due_flush(dirty, now) == Flush::Save {
+                assert!(now.duration_since(dirty.unwrap()) <= FLUSH_AFTER, "правка ждала дольше 1.5 с");
+                saves.push(now);
+                dirty = None;
+            }
+        }
+        assert!(saves.len() >= 3, "сохранений: {}", saves.len());
+        let mut prev = t0;
+        for s in &saves {
+            // между сохранениями — 1.5 с плюс не более одного шага набора
+            assert!(s.duration_since(prev) <= FLUSH_AFTER + Duration::from_millis(100), "интервал слишком велик");
+            prev = *s;
+        }
+    }
+
     #[test]
     fn atomic_write_replaces_file() {
         let dir = std::env::temp_dir().join(format!("ostrovok-test-{}", std::process::id()));
@@ -425,6 +468,35 @@ mod data_tests {
         *LOAD_WARN.lock().unwrap_or_else(|e| e.into_inner()) = None;
         Tmp(d, g)
     }
+    #[test]
+    fn snapshot_written_and_loads_back() {
+        let t = tmp("snap");
+        clear_snapshot();
+        assert_eq!(write_snapshot(), 0, "пустой снимок ничего не пишет");
+        assert!(std::fs::read_dir(&t.0).unwrap().next().is_none());
+        let mut s = Settings::default();
+        s.city = "Снимокград".into();
+        s.save();
+        // успешно записанные настройки снимок не держит — при выходе из Windows их не переписываем
+        set_snapshot_notes(&["первая".to_string(), "вторая".to_string()]);
+        assert_eq!(write_snapshot(), 1);
+        assert_eq!(load_notes(), vec!["первая".to_string(), "вторая".to_string()]);
+        assert_eq!(Settings::load().city, "Снимокград");
+        no_tmp(&t.0);
+        clear_snapshot();
+    }
+
+    #[test]
+    fn snapshot_respects_notes_no_save() {
+        let t = tmp("snap-nosave");
+        clear_snapshot();
+        set_snapshot_notes(&["x".to_string()]);
+        NOTES_NO_SAVE.store(true, Ordering::Relaxed);
+        assert_eq!(write_snapshot(), 0);
+        assert!(!t.0.join("notes.txt").exists());
+        clear_snapshot();
+    }
+
     fn baks(d: &std::path::Path) -> Vec<PathBuf> {
         std::fs::read_dir(d).unwrap().flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("settings.json.bak-")).collect()
     }
@@ -629,16 +701,94 @@ pub fn load_notes() -> Vec<String> {
     if list.is_empty() { vec![String::new()] } else { list }
 }
 
-pub fn save_notes(notes: &[String]) {
-    // проверочный запуск не должен менять настоящие заметки
+fn notes_text(notes: &[String]) -> String {
+    let kept: Vec<&str> = notes.iter().map(String::as_str).filter(|n| !n.trim().is_empty()).collect();
+    kept.join(NOTE_SEP)
+}
+
+fn write_notes_text(text: &str) -> bool {
+    // проверочный запуск не должен менять настоящие заметки; запрет — тоже «успех», чтобы не крутиться
     if !test_free() || NOTES_NO_SAVE.load(std::sync::atomic::Ordering::Relaxed) {
-        return;
+        return true;
     }
     let _ = std::fs::create_dir_all(dir());
-    let kept: Vec<&str> = notes.iter().map(String::as_str).filter(|n| !n.trim().is_empty()).collect();
-    if let Err(e) = write_atomic(&dir().join("notes.txt"), kept.join(NOTE_SEP).as_bytes()) {
-        log_err(&format!("не удалось записать notes.txt: {e}"));
+    match write_atomic(&dir().join("notes.txt"), text.as_bytes()) {
+        Ok(()) => true,
+        Err(e) => {
+            log_err(&format!("не удалось записать notes.txt: {e}"));
+            false
+        }
     }
+}
+
+/// Сохраняет заметки. false — запись не удалась (стоит повторить позже).
+pub fn save_notes(notes: &[String]) -> bool {
+    let text = notes_text(notes);
+    let ok = write_notes_text(&text);
+    if ok {
+        *SNAP_NOTES.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    ok
+}
+
+/// Через сколько после первой несохранённой правки заметки пишутся на диск.
+pub const FLUSH_AFTER: std::time::Duration = std::time::Duration::from_millis(1500);
+
+#[derive(Debug, PartialEq)]
+pub enum Flush {
+    Save,
+    WaitFor(std::time::Duration),
+    Idle,
+}
+
+/// Пора ли сохранять заметки: `since` — момент первой несохранённой правки.
+pub fn due_flush(since: Option<std::time::Instant>, now: std::time::Instant) -> Flush {
+    match since {
+        None => Flush::Idle,
+        Some(t) => {
+            let el = now.saturating_duration_since(t);
+            if el >= FLUSH_AFTER { Flush::Save } else { Flush::WaitFor(FLUSH_AFTER - el) }
+        }
+    }
+}
+
+/// Снимок для записи при завершении сеанса Windows (без участия UI).
+static SNAP_NOTES: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static SNAP_SETTINGS: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+/// Запомнить текущий текст несохранённых заметок.
+pub fn set_snapshot_notes(notes: &[String]) {
+    *SNAP_NOTES.lock().unwrap_or_else(|e| e.into_inner()) = Some(notes_text(notes));
+}
+
+#[cfg(test)]
+fn clear_snapshot() {
+    *SNAP_NOTES.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *SNAP_SETTINGS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Пишет снимок на диск (вызывается из WM_ENDSESSION). Возвращает число записанных файлов.
+pub fn write_snapshot() -> usize {
+    let mut n = 0;
+    if !test_free() {
+        return 0;
+    }
+    let notes = SNAP_NOTES.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(text) = notes {
+        if !NOTES_NO_SAVE.load(std::sync::atomic::Ordering::Relaxed) && write_notes_text(&text) {
+            n += 1;
+        }
+    }
+    let settings = SNAP_SETTINGS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(bytes) = settings {
+        if !NO_SAVE.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = std::fs::create_dir_all(dir());
+            if write_atomic(&dir().join("settings.json"), &bytes).is_ok() {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// Пункт чек-листа в заметке: номер строки, отмечен ли, текст после «[ ]».
