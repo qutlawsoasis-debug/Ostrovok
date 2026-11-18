@@ -145,7 +145,27 @@ fn is_zero(v: &u8) -> bool {
     *v == 0
 }
 
+/// Подмена каталога данных (для тестов).
+#[cfg(test)]
+pub static OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Предупреждение о загрузке настроек — показывается один раз при старте.
+pub static LOAD_WARN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Добавляет предупреждение к уже накопленным, не затирая их.
+fn add_warn(msg: &str) {
+    let mut w = LOAD_WARN.lock().unwrap_or_else(|e| e.into_inner());
+    *w = Some(match w.take() {
+        Some(old) if !old.is_empty() => format!("{old}\n{msg}"),
+        _ => msg.to_string(),
+    });
+}
+
 pub fn dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return p;
+    }
     let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
     PathBuf::from(base).join("Ostrovok")
 }
@@ -183,15 +203,111 @@ pub fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
 /// Настройки не прочитались по непонятной причине — в этом запуске их не перезаписываем,
 /// чтобы не затереть настоящие пустыми.
 static NO_SAVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Заметки не прочитались — в этом запуске их не перезаписываем.
+static NOTES_NO_SAVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// settings.json.bak в этом запуске уже обновлялся (или решено не обновлять).
+static BAK_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// errors.log больше этого — уходит в errors.log.old
+const LOG_MAX: u64 = 1024 * 1024;
+/// сколько копий испорченного файла хранить
+const KEEP_COPIES: usize = 5;
+
+/// Запись в errors.log, чтобы сбои записи не терялись молча.
+pub fn log_err(text: &str) {
+    use std::io::Write;
+    if !test_free() {
+        return;
+    }
+    let d = dir();
+    let _ = std::fs::create_dir_all(&d);
+    let log = d.join("errors.log");
+    if std::fs::metadata(&log).map(|m| m.len() > LOG_MAX).unwrap_or(false) {
+        let _ = std::fs::rename(&log, d.join("errors.log.old"));
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+        let _ = writeln!(f, "[{}] данные: {text}", unix_now());
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Копия испорченных байт файла `name` рядом (`name.bak-<время>`), без перезаписи прежних копий.
+/// Хранятся последние KEEP_COPIES копий.
+fn keep_corrupt_copy(name: &str, bytes: &[u8]) -> bool {
+    use std::io::Write;
+    if !test_free() {
+        return false;
+    }
+    let d = dir();
+    let _ = std::fs::create_dir_all(&d);
+    let t = unix_now();
+    // номер после уже занятых в эту секунду, чтобы новая копия всегда была «новее» оставшихся
+    let first = std::fs::read_dir(&d)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| copy_index(&e.file_name().to_string_lossy(), name))
+                .filter(|k| k.0 == t)
+                .map(|k| k.1 + 1)
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    for i in first..first + 100 {
+        let file = if i == 0 { format!("{name}.bak-{t}") } else { format!("{name}.bak-{t}-{i}") };
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(d.join(file)) {
+            Ok(mut f) => {
+                let ok = f.write_all(bytes).and_then(|_| f.sync_all()).is_ok();
+                drop(f);
+                prune_copies(&d, name);
+                return ok;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// Удаляет старые копии `name.bak-*`, оставляя KEEP_COPIES самых новых.
+fn prune_copies(d: &std::path::Path, name: &str) {
+    let Ok(rd) = std::fs::read_dir(d) else { return };
+    let mut list: Vec<((u64, u64), PathBuf)> = rd
+        .flatten()
+        .filter_map(|e| Some((copy_index(&e.file_name().to_string_lossy(), name)?, e.path())))
+        .collect();
+    if list.len() <= KEEP_COPIES {
+        return;
+    }
+    list.sort_by_key(|x| x.0);
+    let extra = list.len() - KEEP_COPIES;
+    for (_, p) in list.into_iter().take(extra) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// (время, номер) из имени копии «<name>.bak-<время>[-<номер>]».
+fn copy_index(file: &str, name: &str) -> Option<(u64, u64)> {
+    let tail = file.strip_prefix(name)?.strip_prefix(".bak-")?;
+    let mut it = tail.splitn(2, '-');
+    let t = it.next()?.parse::<u64>().ok()?;
+    let i = match it.next() {
+        Some(x) => x.parse::<u64>().ok()?,
+        None => 0,
+    };
+    Some((t, i))
+}
 
 impl Settings {
     pub fn load() -> Self {
         let path = dir().join("settings.json");
-        let mut text = None;
+        let mut bytes = None;
         for _ in 0..5 {
             match std::fs::read(&path) {
-                Ok(bytes) => {
-                    text = Some(String::from_utf8_lossy(&bytes).into_owned());
+                Ok(b) => {
+                    bytes = Some(b);
                     break;
                 }
                 // файла нет — первый запуск, это нормально
@@ -200,30 +316,60 @@ impl Settings {
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(150)),
             }
         }
-        let Some(text) = text else {
+        let Some(bytes) = bytes else {
             NO_SAVE.store(true, std::sync::atomic::Ordering::Relaxed);
+            log_err("settings.json не читается — сохранение в этом запуске отключено");
+            add_warn("Настройки не удалось прочитать — изменения в этом запуске не запишутся");
             return Self::default();
         };
-        match serde_json::from_str(&text) {
-            Ok(s) => s,
-            Err(_) => {
-                // файл испорчен — откладываем его в сторону, а не затираем при первом сохранении
-                if test_free() {
-                    let _ = std::fs::copy(&path, dir().join("settings.bad.json"));
-                }
-                Self::default()
-            }
+        if let Ok(s) = serde_json::from_slice(&bytes) {
+            return s;
         }
+        // файл испорчен — копию исходных байт откладываем в сторону, а не затираем
+        let kept = keep_corrupt_copy("settings.json", &bytes);
+        if kept {
+            log_err("settings.json испорчен — копия сохранена в settings.json.bak-*");
+        } else {
+            NO_SAVE.store(true, std::sync::atomic::Ordering::Relaxed);
+            log_err("settings.json испорчен, копию сделать не удалось — сохранение отключено");
+        }
+        let restored = std::fs::read(dir().join("settings.json.bak"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Settings>(&b).ok());
+        let msg = match (&restored, kept) {
+            (Some(_), true) => "Настройки были повреждены — копия сохранена, восстановлены из резервной",
+            (None, true) => "Настройки были повреждены — копия сохранена, заданы заново",
+            (_, false) => "Настройки были повреждены — копию сохранить не удалось, изменения не запишутся",
+        };
+        add_warn(msg);
+        restored.unwrap_or_default()
     }
 
     pub fn save(&self) {
+        use std::sync::atomic::Ordering;
         // проверочный запуск не должен менять настоящие настройки
-        if !test_free() || NO_SAVE.load(std::sync::atomic::Ordering::Relaxed) {
+        if !test_free() || NO_SAVE.load(Ordering::Relaxed) {
             return;
         }
         let _ = std::fs::create_dir_all(dir());
-        if let Ok(s) = serde_json::to_string_pretty(self) {
-            let _ = write_atomic(&dir().join("settings.json"), s.as_bytes());
+        let path = dir().join("settings.json");
+        // резервная копия — один раз за запуск, при первом сохранении, только если нынешний файл исправен
+        if !BAK_DONE.swap(true, Ordering::Relaxed) {
+            if let Ok(cur) = std::fs::read(&path) {
+                if serde_json::from_slice::<Settings>(&cur).is_ok() {
+                    if let Err(e) = write_atomic(&dir().join("settings.json.bak"), &cur) {
+                        log_err(&format!("не удалось обновить settings.json.bak: {e}"));
+                    }
+                }
+            }
+        }
+        match serde_json::to_string_pretty(self) {
+            Ok(s) => {
+                if let Err(e) = write_atomic(&path, s.as_bytes()) {
+                    log_err(&format!("не удалось записать settings.json: {e}"));
+                }
+            }
+            Err(e) => log_err(&format!("не удалось собрать settings.json: {e}")),
         }
     }
 }
@@ -246,8 +392,192 @@ mod tests {
         hs.into_iter().for_each(|h| h.join().unwrap());
         let got = std::fs::read_to_string(&path).unwrap();
         assert!((0..8).any(|i| got == format!("поток {i} ").repeat(5000)), "файл склеен из разных записей");
-        assert!(!path.with_extension("tmp").exists());
+        let tmp = std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).count();
+        assert_eq!(tmp, 0, "остались временные файлы");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod data_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// общий замок: каталог данных и флаги — глобальные
+    pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct Tmp(PathBuf, #[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            *OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn tmp(name: &str) -> Tmp {
+        let g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = std::env::temp_dir().join(format!("ostrovok-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        *OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = Some(d.clone());
+        NO_SAVE.store(false, Ordering::Relaxed);
+        NOTES_NO_SAVE.store(false, Ordering::Relaxed);
+        BAK_DONE.store(false, Ordering::Relaxed);
+        *LOAD_WARN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        Tmp(d, g)
+    }
+    fn baks(d: &std::path::Path) -> Vec<PathBuf> {
+        std::fs::read_dir(d).unwrap().flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("settings.json.bak-")).collect()
+    }
+    fn no_tmp(d: &std::path::Path) {
+        assert!(!std::fs::read_dir(d).unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with(".tmp")));
+    }
+
+    #[test]
+    fn settings_roundtrip() {
+        let t = tmp("rt");
+        let mut s = Settings::default();
+        s.todos.push(Todo { text: "дело".into(), done: true, due: Some("2026-11-18".into()) });
+        s.shelf.push(r"C:\файл.txt".into());
+        s.reminders.push(Reminder { text: "звонок".into(), at: 42, repeat: 1 });
+        s.save();
+        BAK_DONE.store(false, Ordering::Relaxed); // «следующий запуск»
+        s.save();
+        let l = Settings::load();
+        assert_eq!(l.todos[0].text, "дело");
+        assert!(l.todos[0].done);
+        assert_eq!(l.todos[0].due.as_deref(), Some("2026-11-18"));
+        assert_eq!(l.shelf, s.shelf);
+        assert_eq!((l.reminders[0].at, l.reminders[0].repeat), (42, 1));
+        assert!(t.0.join("settings.json.bak").exists());
+        no_tmp(&t.0);
+    }
+
+    #[test]
+    fn corrupt_settings_keeps_backup() {
+        let t = tmp("bad");
+        let junk: &[u8] = b"{ \"city\": \xff\xfe broken";
+        std::fs::write(t.0.join("settings.json"), junk).unwrap();
+        let s = Settings::load();
+        let b = baks(&t.0);
+        assert_eq!(b.len(), 1);
+        assert_eq!(std::fs::read(&b[0]).unwrap(), junk);
+        let w = LOAD_WARN.lock().unwrap().clone().unwrap();
+        assert!(w.starts_with("Настройки были повреждены — копия сохранена"), "{w}");
+        s.save();
+        s.save();
+        assert_eq!(std::fs::read(&b[0]).unwrap(), junk);
+        assert_eq!(baks(&t.0).len(), 1);
+        // испорченный файл не попал в .bak
+        assert!(!t.0.join("settings.json.bak").exists());
+        no_tmp(&t.0);
+    }
+
+    #[test]
+    fn corrupt_restores_from_bak() {
+        let t = tmp("restore");
+        let mut s = Settings::default();
+        s.todos.push(Todo { text: "важное".into(), done: false, due: None });
+        s.save();
+        BAK_DONE.store(false, Ordering::Relaxed); // «следующий запуск»
+        s.save(); // теперь .bak содержит дела
+        std::fs::write(t.0.join("settings.json"), b"\0\0\0").unwrap();
+        let l = Settings::load();
+        assert_eq!(l.todos[0].text, "важное");
+        assert_eq!(baks(&t.0).len(), 1);
+        assert!(LOAD_WARN.lock().unwrap().as_deref().unwrap().contains("восстановлены"));
+    }
+
+    #[test]
+    fn notes_roundtrip() {
+        let t = tmp("notes");
+        save_notes(&["первая".into(), "  ".into(), "вторая\nстрока".into()]);
+        assert_eq!(load_notes(), vec!["первая".to_string(), "вторая\nстрока".to_string()]);
+        no_tmp(&t.0);
+    }
+
+    #[test]
+    fn notes_bad_utf8_not_erased() {
+        let t = tmp("notes8");
+        std::fs::write(t.0.join("notes.txt"), b"hello \xff world").unwrap();
+        let n = load_notes();
+        assert_eq!(n.len(), 1);
+        assert!(n[0].starts_with("hello") && n[0].ends_with("world"));
+    }
+
+    #[test]
+    fn notes_bad_utf8_copy_survives_save() {
+        let t = tmp("notes8c");
+        let raw: &[u8] = b"hello \xff world";
+        std::fs::write(t.0.join("notes.txt"), raw).unwrap();
+        let n = load_notes();
+        save_notes(&n);
+        let copies: Vec<_> = std::fs::read_dir(&t.0).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("notes.txt.bak-")).collect();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(std::fs::read(copies[0].path()).unwrap(), raw);
+        assert!(std::fs::read(t.0.join("notes.txt")).unwrap() != raw);
+    }
+
+    #[test]
+    fn corrupt_copies_limited_to_five() {
+        let t = tmp("prune");
+        for i in 0..8u8 {
+            assert!(keep_corrupt_copy("settings.json", &[i]));
+        }
+        let b = baks(&t.0);
+        assert_eq!(b.len(), 5);
+        let mut got: Vec<u8> = b.iter().map(|p| std::fs::read(p).unwrap()[0]).collect();
+        got.sort();
+        assert_eq!(got, vec![3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn big_log_rotated() {
+        let t = tmp("log");
+        std::fs::write(t.0.join("errors.log"), vec![b'x'; (LOG_MAX + 1) as usize]).unwrap();
+        log_err("новое");
+        assert_eq!(std::fs::metadata(t.0.join("errors.log.old")).unwrap().len(), LOG_MAX + 1);
+        let l = std::fs::read_to_string(t.0.join("errors.log")).unwrap();
+        assert!(l.contains("новое") && l.len() < 200);
+    }
+
+    #[test]
+    fn bak_updated_once_per_run() {
+        let t = tmp("once");
+        let mut s = Settings::default();
+        s.city = "a".into();
+        s.save(); // файла не было — .bak нет
+        assert!(!t.0.join("settings.json.bak").exists());
+        s.city = "b".into();
+        s.save(); // флаг уже взведён — .bak не появляется
+        assert!(!t.0.join("settings.json.bak").exists());
+        BAK_DONE.store(false, Ordering::Relaxed);
+        s.city = "c".into();
+        s.save();
+        s.city = "d".into();
+        s.save();
+        let bak: Settings = serde_json::from_slice(&std::fs::read(t.0.join("settings.json.bak")).unwrap()).unwrap();
+        assert_eq!(bak.city, "b");
+    }
+
+    #[test]
+    fn warnings_accumulate() {
+        let t = tmp("warn");
+        add_warn("первое");
+        std::fs::create_dir_all(t.0.join("notes.txt")).unwrap();
+        let _ = load_notes();
+        let w = LOAD_WARN.lock().unwrap().clone().unwrap();
+        assert!(w.starts_with("первое\n") && w.contains("Заметки"), "{w}");
+    }
+
+    #[test]
+    fn unreadable_notes_block_save() {
+        let t = tmp("notesdir");
+        // каталог вместо файла — чтение падает не с NotFound
+        std::fs::create_dir_all(t.0.join("notes.txt")).unwrap();
+        let _ = load_notes();
+        save_notes(&["x".into()]);
+        assert!(t.0.join("notes.txt").is_dir());
+        assert!(std::fs::read_to_string(t.0.join("errors.log")).unwrap().contains("notes.txt"));
     }
 }
 
@@ -256,19 +586,59 @@ mod tests {
 const NOTE_SEP: &str = "\n\u{1E}\n";
 
 pub fn load_notes() -> Vec<String> {
-    let text = std::fs::read_to_string(dir().join("notes.txt")).unwrap_or_default();
+    let path = dir().join("notes.txt");
+    let mut text = String::new();
+    let mut failed = None;
+    for _ in 0..5 {
+        match std::fs::read(&path) {
+            Ok(b) => {
+                text = match String::from_utf8(b) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        // байты не UTF-8 — исходник откладываем, чтобы сохранение не стёрло его
+                        let b = e.into_bytes();
+                        if keep_corrupt_copy("notes.txt", &b) {
+                            log_err("notes.txt не в UTF-8 — копия сохранена в notes.txt.bak-*");
+                        } else {
+                            NOTES_NO_SAVE.store(true, std::sync::atomic::Ordering::Relaxed);
+                            log_err("notes.txt не в UTF-8, копию сделать не удалось — сохранение заметок отключено");
+                            add_warn("Заметки повреждены — копию сохранить не удалось, изменения не запишутся");
+                        }
+                        String::from_utf8_lossy(&b).into_owned()
+                    }
+                };
+                failed = None;
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                failed = None;
+                break;
+            }
+            Err(e) => {
+                failed = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+        }
+    }
+    if let Some(e) = failed {
+        NOTES_NO_SAVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        log_err(&format!("notes.txt не читается ({e}) — сохранение заметок отключено"));
+        add_warn("Заметки не удалось прочитать — изменения в этом запуске не запишутся");
+    }
     let list: Vec<String> = text.split(NOTE_SEP).map(str::to_string).filter(|n| !n.trim().is_empty()).collect();
     if list.is_empty() { vec![String::new()] } else { list }
 }
 
 pub fn save_notes(notes: &[String]) {
     // проверочный запуск не должен менять настоящие заметки
-    if std::env::var_os("OSTROVOK_TEST").is_some() {
+    if !test_free() || NOTES_NO_SAVE.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let _ = std::fs::create_dir_all(dir());
     let kept: Vec<&str> = notes.iter().map(String::as_str).filter(|n| !n.trim().is_empty()).collect();
-    let _ = write_atomic(&dir().join("notes.txt"), kept.join(NOTE_SEP).as_bytes());
+    if let Err(e) = write_atomic(&dir().join("notes.txt"), kept.join(NOTE_SEP).as_bytes()) {
+        log_err(&format!("не удалось записать notes.txt: {e}"));
+    }
 }
 
 /// Пункт чек-листа в заметке: номер строки, отмечен ли, текст после «[ ]».

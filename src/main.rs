@@ -7156,6 +7156,7 @@ impl eframe::App for App {
             update::trial_passed();
         }
         store::save_notes(&self.notes);
+        self.cfg.save();
         self.jarvis.stop();
         self.ears.stop_server();
     }
@@ -7164,6 +7165,11 @@ impl eframe::App for App {
         let now = Instant::now();
         let dt = frame_dt(ctx.input(|i| i.stable_dt));
         let time = ctx.input(|i| i.time);
+        // предупреждение о повреждённых настройках — один раз при старте
+        let warn = store::LOAD_WARN.lock().ok().and_then(|mut w| w.take());
+        if let Some(w) = warn {
+            self.notify(&w);
+        }
         self.pump(ctx, now);
         let palette_open = self.mode == Mode::Palette;
         if self.palette_was_open && !palette_open {
