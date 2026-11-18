@@ -1303,6 +1303,8 @@ struct App {
     /// скорость сети, байт в секунду: приём и отдача
     net: (f32, f32),
     net_prev: Option<(u64, u64, Instant)>,
+    /// сглаженная загрузка процессора — для текста, чтобы не мигал
+    cpu_smooth: f32,
 }
 
 impl App {
@@ -1584,6 +1586,7 @@ impl App {
             kill_arm: None,
             net: (0.0, 0.0),
             net_prev: None,
+            cpu_smooth: 0.0,
         };
         if test_mode() {
             // только для проверки вёрстки: выбрать персонажа и показать уведомление, ничего не сохраняя
@@ -2822,6 +2825,7 @@ impl App {
                 }
             }
             self.stats = self.meter.sample();
+            self.cpu_smooth = sys::ema(self.cpu_smooth, self.stats.cpu, 0.4);
             // для снимков батарейки в пилюле: OSTROVOK_BATTERY=8 (разряжается) или 15c (заряжается)
             if let Some(v) = std::env::var("OSTROVOK_BATTERY").ok().filter(|_| test_mode()) {
                 let charging = v.ends_with('c');
@@ -2830,11 +2834,15 @@ impl App {
                 }
             }
             if let Some((rx, tx)) = sys::net_bytes() {
-                if let Some((prx, ptx, at)) = self.net_prev {
-                    let dt = now.duration_since(at).as_secs_f32().max(0.2);
-                    self.net = (rx.saturating_sub(prx) as f32 / dt, tx.saturating_sub(ptx) as f32 / dt);
+                let prev = self.net_prev.map(|(a, b, _)| (a, b));
+                let dt = self.net_prev.map_or(0.0, |(_, _, at)| now.duration_since(at).as_secs_f32());
+                if let Some((d, u)) = sys::net_rate(prev, (rx, tx), dt) {
+                    self.net = (sys::ema(self.net.0, d, 0.4), sys::ema(self.net.1, u, 0.4));
                 }
-                self.net_prev = Some((rx, tx, now));
+                // короткий тик — ждём накопления; иначе (в т. ч. сброс/скачок) перебазируемся
+                if prev.is_none() || dt >= 0.2 {
+                    self.net_prev = Some((rx, tx, now));
+                }
             }
             let mem = if self.stats.mem_total > 0.0 { (self.stats.mem_used / self.stats.mem_total) as f32 } else { 0.0 };
             self.load_hist.push_back((self.stats.cpu, mem));
@@ -4416,8 +4424,13 @@ impl App {
         }
         let x = art.right() + 18.0;
         let text = p.with_clip_rect(Rect::from_min_max(pos2(x, row.top()), row.max));
-        text.text(pos2(x, row.top() + 4.0), Align2::LEFT_TOP, &m.title, semi(18.0), FG);
-        text.text(pos2(x, row.top() + 30.0), Align2::LEFT_TOP, &m.artist, FontId::proportional(13.5), DIM);
+        let (title, artist) = (media::ellipsize_chars(&m.title, 40), media::ellipsize_chars(&m.artist, 48));
+        let tr = text.text(pos2(x, row.top() + 4.0), Align2::LEFT_TOP, &title, semi(18.0), FG);
+        let ar = text.text(pos2(x, row.top() + 30.0), Align2::LEFT_TOP, &artist, FontId::proportional(13.5), DIM);
+        if title != m.title || artist != m.artist || tr.right() > row.right() || ar.right() > row.right() {
+            let full = format!("{} — {}", m.title, m.artist);
+            ui.interact(tr.union(ar).intersect(row), ui.id().with("music-title"), Sense::hover()).on_hover_text(full);
+        }
         // полоса прогресса со временем
         // щелчок или перетаскивание по полосе перематывают трек
         let bar = Rect::from_min_max(pos2(x, row.top() + 62.0), pos2(row.right(), row.top() + 67.0));
@@ -6777,13 +6790,12 @@ impl App {
         let green = Color32::from_rgb(0x7B, 0xE0, 0x9A);
         let (d, h, m) = (s.uptime / 86400, s.uptime % 86400 / 3600, s.uptime % 3600 / 60);
         // название, доля, крупное значение, пояснение, цвет, краснеть ли при переполнении
-        let mut items: Vec<(&str, f32, String, String, Color32, bool)> = vec![("Процессор", s.cpu, format!("{:.0}%", s.cpu * 100.0), "загрузка сейчас".into(), blue, true)];
+        let mut items: Vec<(&str, f32, String, String, Color32, bool)> = vec![("Процессор", s.cpu, format!("{:.0}%", self.cpu_smooth * 100.0), "загрузка сейчас".into(), blue, true)];
         if s.mem_total > 0.0 {
             let f = (s.mem_used / s.mem_total) as f32;
             items.push(("Память", f, format!("{:.0}%", f * 100.0), format!("{:.1} из {:.0} ГБ", s.mem_used, s.mem_total), accent(), true));
         }
-        if s.disk_total > 0.0 {
-            let f = (1.0 - s.disk_free / s.disk_total) as f32;
+        if let Some(f) = sys::disk_frac(s.disk_free, s.disk_total) {
             items.push(("Диск C:", f, format!("{:.0}%", f * 100.0), format!("свободно {:.0} ГБ", s.disk_free), Color32::from_rgb(0xFF, 0xB3, 0x40), true));
         }
         match s.battery {
