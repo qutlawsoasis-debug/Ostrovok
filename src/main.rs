@@ -13,6 +13,7 @@ mod setup;
 mod sound;
 mod live;
 mod media;
+mod pult;
 mod store;
 mod update;
 mod sys;
@@ -397,6 +398,8 @@ enum Tab {
     Home,
     Music,
     Control,
+    /// «Пульт»: яркость, громкость, «Не беспокоить», батарея, Bluetooth
+    Pult,
     Remind,
     Qr,
     Shelf,
@@ -1116,6 +1119,10 @@ struct App {
     sheen_at: Instant,
     hover_was: bool,
     awake: bool,
+    /// состояние «Пульта» (заполняет фоновый поток pult::start)
+    pult: Arc<Mutex<pult::State>>,
+    /// «Не беспокоить»: уведомления мессенджеров не всплывают, только копятся во «Входящих»
+    dnd: bool,
     last_fg: isize,
     album: Option<[u8; 3]>,
     live: live::Live,
@@ -1453,6 +1460,8 @@ impl App {
             bin: (0, 0),
             light_theme: None,
             awake: false,
+            pult: Default::default(),
+            dnd: false,
             last_fg: 0,
             album: None,
             live,
@@ -1733,6 +1742,7 @@ impl App {
             app.cfg.last_version = env!("CARGO_PKG_VERSION").to_string();
             app.cfg.save();
         }
+        pult::start(app.pult.clone(), cc.egui_ctx.clone());
         if let Ok(demo) = std::env::var("OSTROVOK_DEMO") {
             app.mode = Mode::Panel;
             app.sticky = true;
@@ -1761,6 +1771,20 @@ impl App {
                     Tab::Jarvis
                 }
                 "control" => Tab::Control,
+                "pult" => {
+                    // для снимков: образцы устройств и батареи (опрос их не перезапишет)
+                    let mut s = lock(&app.pult);
+                    s.frozen = true;
+                    s.brightness = Some(70);
+                    s.battery = Some(pult::Battery { pct: 64, charging: false, secs_left: Some(2 * 3600 + 40 * 60) });
+                    s.devices = vec![
+                        pult::BtDevice { name: "Sony WH-1000XM4".into(), battery: Some(80) },
+                        pult::BtDevice { name: "MX Master 3".into(), battery: Some(35) },
+                        pult::BtDevice { name: "Xbox Wireless Controller".into(), battery: None },
+                    ];
+                    drop(s);
+                    Tab::Pult
+                }
                 "inbox" => {
                     // для снимков: выдуманные сообщения (в проверочном запуске уведомления не читаются)
                     let samples = [
@@ -2369,6 +2393,11 @@ impl App {
                 self.ears.unwatch();
             }
         }
+        // «Пульт»: только что подключённые наушники — короткая плашка в свёрнутом острове
+        let fresh: Vec<pult::BtDevice> = std::mem::take(&mut lock(&self.pult).events);
+        if let Some(d) = fresh.last() {
+            self.show_toast("\u{E7F6}", [0x7B, 0xE0, 0x9A], &pult::headphones_text(d), &d.name, 4, false);
+        }
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::Note(t) => self.notify(&t),
@@ -2407,7 +2436,9 @@ impl App {
                         [0x3A, 0x9B, 0xFF]
                     };
                     let body = if n.body.is_empty() { n.app.clone() } else { n.body.clone() };
-                    self.show_toast("\u{E8BD}", color, &n.title, &body, 5, false);
+                    if pult::should_toast(self.dnd) {
+                        self.show_toast("\u{E8BD}", color, &n.title, &body, 5, false);
+                    }
                     self.push_inbox(n, color);
                 }
                 Msg::Download(name) => self.show_toast("\u{E896}", [0x3A, 0x9B, 0xFF], "Загрузка завершена", &name, 6, false),
@@ -3232,7 +3263,7 @@ impl App {
         // одна строка: слева значки разделов, рядом текстом — страницы выбранного раздела
         const GROUPS: [(&str, &str, &[(Tab, &str)]); 6] = [
             ("\u{E80F}", "Обзор", &[(Tab::Home, "Сводка"), (Tab::Music, "Музыка"), (Tab::Weather, "Погода"), (Tab::Calendar, "Календарь")]),
-            ("\u{E7F4}", "Система", &[(Tab::Control, "Управление"), (Tab::Sound, "Звук"), (Tab::System, "Монитор")]),
+            ("\u{E7F4}", "Система", &[(Tab::Pult, "Пульт"), (Tab::Control, "Управление"), (Tab::Sound, "Звук"), (Tab::System, "Монитор")]),
             ("\u{E90F}", "Инструменты", &[(Tab::Timer, "Таймер"), (Tab::Remind, "Напоминания"), (Tab::Qr, "QR-код")]),
             ("\u{E70B}", "Записи", &[(Tab::Clip, "Буфер"), (Tab::Inbox, "Уведомления"), (Tab::Todo, "Дела"), (Tab::Notes, "Заметки"), (Tab::Shelf, "Полка")]),
             ("\u{E8BD}", "ИИ", &[(Tab::Ai, "ИИ"), (Tab::Jarvis, "Джарвис")]),
@@ -3307,6 +3338,7 @@ impl App {
         match self.tab {
             Tab::Home => self.ui_home(ui, ctx),
             Tab::Control => self.ui_control(ui),
+            Tab::Pult => self.ui_pult(ui),
             Tab::Music => self.ui_music(ui),
             Tab::Remind => self.ui_remind(ui),
             Tab::Qr => self.ui_qr(ui),
@@ -4548,6 +4580,164 @@ impl App {
     }
 
     /// Обзор → Управление: сеть, звук, питание и мелкие удобства Windows.
+    fn pult_height(&self) -> f32 {
+        let s = lock(&self.pult);
+        let sliders = if s.brightness.is_some() { 2.0 } else { 1.0 };
+        let devs = s.devices.len().clamp(1, 4) as f32;
+        let bat = if s.battery.is_some() { 52.0 } else { 0.0 };
+        104.0 + 92.0 + sliders * 40.0 + bat + 26.0 + devs * 34.0
+    }
+
+    /// Система → Пульт: быстрые переключатели и устройства, как центр управления в телефоне.
+    fn ui_pult(&mut self, ui: &mut egui::Ui) {
+        if self.ctl_at.elapsed() > Duration::from_millis(600) || self.vol.is_none() {
+            self.ctl_at = Instant::now();
+            self.vol = sys::volume();
+        }
+        let (bright, battery, devices) = {
+            let s = lock(&self.pult);
+            (s.brightness, s.battery.clone(), s.devices.clone())
+        };
+        let p = ui.painter().clone();
+        let (level, muted) = self.vol.unwrap_or((0.0, false));
+        let moon = Color32::from_rgb(0xB4, 0x9C, 0xFF);
+        let sun = Color32::from_rgb(0xFF, 0xC8, 0x57);
+        let ink_dark = Color32::from_rgb(16, 14, 28);
+
+        // ── плитки: нажатие «вдавливает» плитку, включённые залиты своим цветом
+        let tiles: [(&str, &str, &str, &str, bool, Color32); 4] = [
+            ("mute", if muted { "\u{E74F}" } else { "\u{E767}" }, "Звук", if muted { "выключен" } else { "включён" }, !muted, accent()),
+            ("dnd", "\u{E708}", "Не беспокоить", if self.dnd { "тихо" } else { "выключено" }, self.dnd, moon),
+            ("night", "\u{E793}", "Ночной свет", "настройки", false, sun),
+            ("awake", "\u{E7E8}", "Не засыпать", if self.awake { "включено" } else { "выключено" }, self.awake, Color32::from_rgb(0x7B, 0xE0, 0x9A)),
+        ];
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 86.0), Sense::hover());
+        let gap = 8.0;
+        let w = (row.width() - gap * 3.0) / 4.0;
+        let mut act = "";
+        for (i, (id, glyph, title, state, on, tone)) in tiles.iter().enumerate() {
+            let r = Rect::from_min_size(pos2(row.left() + (w + gap) * i as f32, row.top()), vec2(w, row.height()));
+            let resp = ui.interact(r, ui.id().with(("pult", *id)), Sense::click());
+            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+            let down = ui.ctx().animate_bool_with_time(resp.id.with("down"), resp.is_pointer_button_down_on(), 0.06);
+            let lit = ui.ctx().animate_bool_with_time(resp.id.with("on"), *on, 0.18);
+            let r = r.shrink(3.0 * down);
+            glass_chip(&p, r, 18.0, 0.45 + 0.4 * hov);
+            if lit > 0.0 {
+                p.rect_filled(r.shrink(1.0), Rounding::same(17.0), Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), (lit * 215.0) as u8));
+            }
+            let ink = mix(FG, ink_dark, lit);
+            let c = pos2(r.left() + 24.0, r.top() + 26.0);
+            p.circle_filled(c, 15.0, rgba(255, 255, 255, (26.0 + 30.0 * (1.0 - lit)) as u8));
+            p.text(c, Align2::CENTER_CENTER, *glyph, FontId::proportional(15.0), ink);
+            let clip = p.with_clip_rect(r);
+            clip.text(pos2(r.left() + 12.0, r.bottom() - 30.0), Align2::LEFT_CENTER, *title, semi(12.5), ink);
+            clip.text(pos2(r.left() + 12.0, r.bottom() - 14.0), Align2::LEFT_CENTER, *state, FontId::proportional(10.5), mix(DIM, Color32::from_rgb(40, 34, 60), lit));
+            if resp.clicked() {
+                act = id;
+            }
+        }
+        match act {
+            "mute" => {
+                sys::set_mute(!muted);
+                self.vol = Some((level, !muted));
+            }
+            "dnd" => {
+                self.dnd = !self.dnd;
+                let (t, s) = if self.dnd { ("Не беспокоить", "уведомления копятся тихо") } else { ("Не беспокоить выключено", "уведомления снова всплывают") };
+                self.show_toast("\u{E708}", [0xB4, 0x9C, 0xFF], t, s, 3, false);
+            }
+            "night" => sys::open("ms-settings:nightlight"),
+            "awake" => {
+                self.awake = !self.awake;
+                sys::keep_awake(self.awake);
+            }
+            _ => {}
+        }
+
+        // ── ползунки-капсулы: громкость и яркость (если монитор отвечает по DDC/CI)
+        ui.add_space(6.0);
+        let slider = |ui: &mut egui::Ui, key: &str, glyph: &str, name: &str, val: f32, tone: Color32| -> Option<f32> {
+            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click_and_drag());
+            let hov = ui.ctx().animate_bool_with_time(resp.id.with(key), resp.hovered() || resp.dragged(), 0.12);
+            glass_chip(&p, r, 17.0, 0.45 + 0.35 * hov);
+            let shown = ui.ctx().animate_value_with_time(resp.id.with((key, "v")), val, 0.15);
+            let fill = Rect::from_min_max(r.min, pos2(r.left() + (r.width() * shown).max(34.0), r.bottom())).shrink(1.0);
+            p.rect_filled(fill, Rounding::same(16.0), Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), 200));
+            p.text(pos2(r.left() + 17.0, r.center().y), Align2::CENTER_CENTER, glyph, FontId::proportional(14.0), ink_dark);
+            p.text(pos2(r.left() + 40.0, r.center().y), Align2::LEFT_CENTER, name, semi(12.5), FG);
+            p.text(pos2(r.right() - 14.0, r.center().y), Align2::RIGHT_CENTER, format!("{:.0}%", val * 100.0), semi(12.5), FG);
+            if resp.dragged() || resp.clicked() {
+                resp.interact_pointer_pos().map(|pos| ((pos.x - r.left()) / r.width()).clamp(0.0, 1.0))
+            } else {
+                None
+            }
+        };
+        if let Some(v) = slider(ui, "vol", if muted { "\u{E74F}" } else { "\u{E767}" }, "Громкость", level, accent()) {
+            sys::set_volume(v);
+            if muted && v > 0.0 {
+                sys::set_mute(false);
+            }
+            self.vol = Some((v, false));
+            self.ctl_at = Instant::now();
+        }
+        if let Some(b) = bright {
+            ui.add_space(6.0);
+            if let Some(v) = slider(ui, "bri", "\u{E706}", "Яркость", b as f32 / 100.0, sun) {
+                let v = (v * 100.0).round() as u8;
+                let mut s = lock(&self.pult);
+                s.brightness = Some(v);
+                s.want_brightness = Some(v);
+            }
+        }
+
+        // ── батарея ноутбука
+        if let Some(b) = &battery {
+            ui.add_space(8.0);
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
+            glass_chip(&p, r, 16.0, 0.45);
+            let rgb = battery_rgb(b.pct, b.charging);
+            let tone = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+            p.text(pos2(r.left() + 22.0, r.center().y), Align2::CENTER_CENTER, pult::battery_glyph(b.pct, b.charging), FontId::proportional(20.0), tone);
+            p.text(pos2(r.left() + 44.0, r.top() + 15.0), Align2::LEFT_CENTER, format!("Батарея · {}%", b.pct), semi(12.5), FG);
+            p.text(pos2(r.left() + 44.0, r.top() + 31.0), Align2::LEFT_CENTER, pult::battery_status(b), FontId::proportional(10.5), DIM);
+            let bar = Rect::from_min_size(pos2(r.right() - 120.0, r.center().y - 3.0), vec2(104.0, 6.0));
+            p.rect_filled(bar, Rounding::same(3.0), rgba(255, 255, 255, 26));
+            p.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * b.pct as f32 / 100.0, 6.0)), Rounding::same(3.0), tone);
+        }
+
+        // ── Bluetooth-устройства с зарядом
+        ui.add_space(8.0);
+        let (h, hresp) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::click());
+        let hov = ui.ctx().animate_bool_with_time(hresp.id.with("hov"), hresp.hovered(), 0.10);
+        p.text(pos2(h.left() + 4.0, h.center().y), Align2::LEFT_CENTER, "\u{E702}  Устройства", semi(12.5), DIM);
+        p.text(pos2(h.right() - 4.0, h.center().y), Align2::RIGHT_CENTER, "настройки Bluetooth \u{E76C}", FontId::proportional(11.0), mix(DIM, accent(), hov));
+        if hresp.clicked() {
+            sys::open("ms-settings:bluetooth");
+        }
+        ui.add_space(4.0);
+        if devices.is_empty() {
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+            p.text(pos2(r.left() + 6.0, r.center().y), Align2::LEFT_CENTER, "Подключённых Bluetooth-устройств нет", FontId::proportional(12.0), DIM);
+        }
+        for d in devices.iter().take(4) {
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+            glass_chip(&p, r, 15.0, 0.35);
+            p.text(pos2(r.left() + 18.0, r.center().y), Align2::CENTER_CENTER, pult::device_glyph(&d.name), FontId::proportional(14.0), accent());
+            let name: String = d.name.chars().take(34).collect();
+            p.text(pos2(r.left() + 38.0, r.center().y), Align2::LEFT_CENTER, name, FontId::proportional(12.5), FG);
+            if let Some(pct) = d.battery {
+                let rgb = battery_rgb(pct, false);
+                let tone = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                p.text(pos2(r.right() - 12.0, r.center().y), Align2::RIGHT_CENTER, format!("{pct}%"), semi(12.0), tone);
+                let bar = Rect::from_min_size(pos2(r.right() - 90.0, r.center().y - 2.5), vec2(44.0, 5.0));
+                p.rect_filled(bar, Rounding::same(2.5), rgba(255, 255, 255, 26));
+                p.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * pct as f32 / 100.0, 5.0)), Rounding::same(2.5), tone);
+            }
+            ui.add_space(4.0);
+        }
+    }
+
     fn ui_control(&mut self, ui: &mut egui::Ui) {
         if self.ctl_at.elapsed() > Duration::from_millis(600) || self.vol.is_none() {
             self.ctl_at = Instant::now();
@@ -8142,6 +8332,7 @@ impl App {
         -saved + match self.tab {
             Tab::Home => 396.0,
             Tab::Control => 276.0,
+            Tab::Pult => self.pult_height(),
             Tab::Sound => 322.0,
             Tab::Music => 388.0,
             // напоминания: страница растёт по их числу (до шести без прокрутки)
