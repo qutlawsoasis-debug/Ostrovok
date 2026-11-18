@@ -32,6 +32,8 @@ pub struct State {
     pub primed: bool,
     /// для снимков: образцы не перезаписываются опросом
     pub frozen: bool,
+    /// страница «Пульт» сейчас на экране — опрос чаще
+    pub visible: bool,
 }
 
 // ───────────── чистая логика ─────────────
@@ -39,8 +41,9 @@ pub struct State {
 /// Служебные узлы Bluetooth, которые не являются устройствами пользователя.
 pub fn is_user_device(name: &str) -> bool {
     let low = name.to_lowercase();
-    let junk = ["enumerator", "adapter", "radio", "transport", "generic attribute", "generic access", "service", "avrcp", "rfcomm", "microsoft bluetooth", "device identification", "intel(r) wireless", "realtek", "qualcomm", "mediatek", "broadcom"];
-    !name.trim().is_empty() && !junk.iter().any(|j| low.contains(j))
+    // только явные служебные узлы: «JBL Radio» или «Xbox Adapter» — устройства пользователя
+    let junk = ["microsoft bluetooth", "bluetooth le enumerator", "bluetooth device (rfcomm", "bluetooth device (personal area", "generic attribute profile", "generic access profile", "device identification service", "avrcp transport", "intel(r) wireless bluetooth", "realtek bluetooth", "qualcomm", "mediatek bluetooth", "broadcom bluetooth"];
+    !name.trim().is_empty() && !junk.iter().any(|j| low.starts_with(j))
 }
 
 /// Похоже ли имя на наушники/гарнитуру.
@@ -140,33 +143,65 @@ pub fn should_toast(dnd: bool) -> bool {
 
 // ───────────── опрос Windows ─────────────
 
+/// Как часто опрашивать Bluetooth (секунды): страница открыта — часто, иначе редко,
+/// только чтобы заметить подключённые наушники.
+pub fn bt_poll_secs(visible: bool) -> u64 {
+    if visible { 10 } else { 90 }
+}
+
 pub fn start(state: Arc<Mutex<State>>, ctx: eframe::egui::Context) {
-    std::thread::spawn(move || {
-        let mut tick = 0u32;
-        loop {
-            let want = state.lock().ok().and_then(|mut s| s.want_brightness.take());
-            if let Some(v) = want {
-                set_brightness(v);
-                if let Ok(mut s) = state.lock() {
-                    s.brightness = Some(v);
+    // яркость и батарея: дешёвый поток, отвечает на ползунок без задержки
+    {
+        let state = state.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let mut tick = 0u32;
+            loop {
+                let (want, visible, frozen, known) = match state.lock() {
+                    Ok(mut s) => (s.want_brightness.take(), s.visible, s.frozen, s.brightness.is_some()),
+                    Err(_) => return,
+                };
+                if frozen {
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
                 }
+                if let Some(v) = want {
+                    if set_brightness(v) {
+                        if let Ok(mut s) = state.lock() {
+                            s.brightness = Some(v);
+                        }
+                    }
+                }
+                // раз в 10 с при открытой странице; DDC/CI медленный, поэтому в фоне не трогаем
+                if tick % 20 == 0 && (visible || tick == 0) {
+                    let bright = if known || tick % 120 == 0 { brightness() } else { None };
+                    let bat = battery();
+                    if let Ok(mut s) = state.lock() {
+                        if s.want_brightness.is_none() {
+                            s.brightness = bright;
+                        }
+                        s.battery = bat;
+                    }
+                    ctx.request_repaint();
+                }
+                tick = tick.wrapping_add(1);
+                std::thread::sleep(Duration::from_millis(if visible { 250 } else { 500 }));
             }
-            if tick % 20 == 0 {
-                let bright = if tick % 120 == 0 || state.lock().map(|s| s.brightness.is_some()).unwrap_or(false) { brightness() } else { None };
-                let bat = battery();
-                let devs = bt_devices();
-                if let Ok(mut s) = state.lock() {
-                    if s.frozen {
-                        drop(s);
-                        tick = tick.wrapping_add(1);
-                        std::thread::sleep(Duration::from_millis(500));
-                        continue;
-                    }
-                    if s.want_brightness.is_none() {
-                        s.brightness = bright;
-                    }
-                    s.battery = bat;
-                    if let Some(devs) = devs {
+        });
+    }
+    // Bluetooth: внешний процесс, поэтому отдельный поток и редкий опрос
+    std::thread::spawn(move || {
+        let mut last: Option<std::time::Instant> = None;
+        loop {
+            let (visible, frozen) = match state.lock() {
+                Ok(s) => (s.visible, s.frozen),
+                Err(_) => return,
+            };
+            let due = last.is_none_or(|t| t.elapsed() >= Duration::from_secs(bt_poll_secs(visible)));
+            if !frozen && due {
+                last = Some(std::time::Instant::now());
+                if let Some(devs) = bt_devices() {
+                    if let Ok(mut s) = state.lock() {
                         if s.primed {
                             let fresh = new_headphones(&s.devices, &devs);
                             s.events.extend(fresh);
@@ -174,11 +209,10 @@ pub fn start(state: Arc<Mutex<State>>, ctx: eframe::egui::Context) {
                         s.devices = devs;
                         s.primed = true;
                     }
+                    ctx.request_repaint();
                 }
-                ctx.request_repaint();
             }
-            tick = tick.wrapping_add(1);
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(Duration::from_secs(1));
         }
     });
 }
@@ -194,11 +228,22 @@ fn battery() -> Option<Battery> {
     Some(Battery { pct: p.BatteryLifePercent, charging: p.ACLineStatus == 1, secs_left: (p.BatteryLifeTime != u32::MAX).then_some(p.BatteryLifeTime) })
 }
 
+/// Физические мониторы, освобождаются в Drop (и при панике тоже).
+struct Monitors(Vec<windows::Win32::Devices::Display::PHYSICAL_MONITOR>);
+
+impl Drop for Monitors {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Devices::Display::DestroyPhysicalMonitors(&self.0);
+        }
+    }
+}
+
 fn with_primary_monitor<T>(f: impl FnOnce(windows::Win32::Foundation::HANDLE) -> Option<T>) -> Option<T> {
     use windows::Win32::Devices::Display::*;
     use windows::Win32::Foundation::POINT;
     use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
-    unsafe {
+    let mons = unsafe {
         let hmon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
         let mut n = 0u32;
         GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, &mut n).ok()?;
@@ -207,10 +252,9 @@ fn with_primary_monitor<T>(f: impl FnOnce(windows::Win32::Foundation::HANDLE) ->
         }
         let mut arr = vec![PHYSICAL_MONITOR::default(); n as usize];
         GetPhysicalMonitorsFromHMONITOR(hmon, &mut arr).ok()?;
-        let r = f(arr[0].hPhysicalMonitor);
-        let _ = DestroyPhysicalMonitors(&arr);
-        r
-    }
+        Monitors(arr)
+    };
+    f(mons.0[0].hPhysicalMonitor)
 }
 
 fn brightness() -> Option<u8> {
@@ -224,37 +268,58 @@ fn brightness() -> Option<u8> {
     })
 }
 
-fn set_brightness(v: u8) {
+/// true — монитор принял новую яркость.
+fn set_brightness(v: u8) -> bool {
     use windows::Win32::Devices::Display::{GetMonitorBrightness, SetMonitorBrightness};
     with_primary_monitor(|h| unsafe {
         let (mut lo, mut cur, mut hi) = (0u32, 0u32, 0u32);
         if GetMonitorBrightness(h, &mut lo, &mut cur, &mut hi) == 0 || hi <= lo {
             return None;
         }
-        SetMonitorBrightness(h, lo + (hi - lo) * v.min(100) as u32 / 100);
-        Some(())
-    });
+        (SetMonitorBrightness(h, lo + (hi - lo) * v.min(100) as u32 / 100) != 0).then_some(())
+    })
+    .is_some()
 }
 
 /// Подключённые Bluetooth-устройства и заряд (DEVPKEY_Bluetooth_Battery), через PowerShell без окна.
+/// Скрипт постоянный, без пользовательского ввода; зависший процесс снимается через 8 с.
 fn bt_devices() -> Option<Vec<BtDevice>> {
+    use std::io::Read;
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     const NO_WINDOW: u32 = 0x0800_0000;
-    // скрипт постоянный, без пользовательского ввода
+    const BELOW_NORMAL: u32 = 0x0000_4000;
     let script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; \
         Get-PnpDevice -Class Bluetooth,AudioEndpoint -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'OK' -and $_.InstanceId -like 'BTH*' } | ForEach-Object { \
-        $b = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName '{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2' -ErrorAction SilentlyContinue).Data; \
-        $c = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName '{83DA6326-97A6-4088-9453-A1923F573B29} 15' -ErrorAction SilentlyContinue).Data; \
+        $p = Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName '{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2','{83DA6326-97A6-4088-9453-A1923F573B29} 15' -ErrorAction SilentlyContinue; \
+        $b = ($p | Where-Object KeyName -like '{104EA319*').Data; $c = ($p | Where-Object KeyName -like '{83DA6326*').Data; \
         if ($c -ne $false) { \"$($_.FriendlyName)`t$b\" } }";
-    let out = Command::new("powershell.exe")
+    // полный путь: не подхватить чужой powershell.exe из PATH
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let exe = format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe");
+    let mut child = Command::new(exe)
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .creation_flags(NO_WINDOW)
-        .output()
+        .creation_flags(NO_WINDOW | BELOW_NORMAL)
+        .spawn()
         .ok()?;
-    out.status.success().then(|| parse_devices(&String::from_utf8_lossy(&out.stdout)))
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if started.elapsed() < Duration::from_secs(8) => std::thread::sleep(Duration::from_millis(100)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let mut text = String::new();
+    child.stdout.take()?.read_to_string(&mut text).ok()?;
+    status.success().then(|| parse_devices(&text))
 }
 
 #[cfg(test)]
@@ -316,6 +381,20 @@ mod tests {
         assert_eq!(device_glyph("Logitech Mouse"), "\u{E962}");
         assert_eq!(device_glyph("Galaxy Buds"), "\u{E7F6}");
         assert_eq!(device_glyph("Что-то"), "\u{E702}");
+    }
+
+    #[test]
+    fn user_devices_not_overfiltered() {
+        assert!(is_user_device("JBL Radio"));
+        assert!(is_user_device("Xbox Wireless Adapter"));
+        assert!(!is_user_device("Microsoft Bluetooth LE Enumerator"));
+        assert!(!is_user_device("Intel(R) Wireless Bluetooth(R)"));
+    }
+
+    #[test]
+    fn bt_poll_rare_in_background() {
+        assert_eq!(bt_poll_secs(true), 10);
+        assert!(bt_poll_secs(false) >= 60);
     }
 
     #[test]

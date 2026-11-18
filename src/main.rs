@@ -2394,7 +2394,11 @@ impl App {
             }
         }
         // «Пульт»: только что подключённые наушники — короткая плашка в свёрнутом острове
-        let fresh: Vec<pult::BtDevice> = std::mem::take(&mut lock(&self.pult).events);
+        let fresh: Vec<pult::BtDevice> = {
+            let mut s = lock(&self.pult);
+            s.visible = self.mode == Mode::Panel && self.tab == Tab::Pult;
+            std::mem::take(&mut s.events)
+        };
         if let Some(d) = fresh.last() {
             self.show_toast("\u{E7F6}", [0x7B, 0xE0, 0x9A], &pult::headphones_text(d), &d.name, 4, false);
         }
@@ -4579,7 +4583,7 @@ impl App {
         }
     }
 
-    /// Обзор → Управление: сеть, звук, питание и мелкие удобства Windows.
+    /// Высота страницы «Пульт» по тому, что на ней есть.
     fn pult_height(&self) -> f32 {
         let s = lock(&self.pult);
         let sliders = if s.brightness.is_some() { 2.0 } else { 1.0 };
@@ -4738,6 +4742,7 @@ impl App {
         }
     }
 
+    /// Обзор → Управление: сеть, звук, питание и мелкие удобства Windows.
     fn ui_control(&mut self, ui: &mut egui::Ui) {
         if self.ctl_at.elapsed() > Duration::from_millis(600) || self.vol.is_none() {
             self.ctl_at = Instant::now();
