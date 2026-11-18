@@ -8276,7 +8276,8 @@ fn restore_spot(spots: &[store::Spot]) -> Option<[f32; 2]> {
 impl App {
     /// Нажали на пустое место острова или на ручку: запоминаем, откуда пошли.
     fn drag_begin(&mut self, ppp: f32) {
-        if self.drag.is_some() || test_mode() {
+        // спрятанный остров (полноэкранная игра) и снимок экрана не тянутся: клики уходят игре
+        if self.drag.is_some() || test_mode() || self.hidden || self.shot.is_some() {
             return;
         }
         let Some((x, y)) = sys::cursor() else { return };
@@ -8287,6 +8288,11 @@ impl App {
     /// Каждый кадр: тянем за курсором (координаты экрана, не окна — окно само едет), при отпускании — магнит и сохранение.
     fn drag_step(&mut self, ppp: f32) {
         let Some((press, from, mut moved)) = self.drag else { return };
+        if self.hidden {
+            // остров спрятался посреди нажатия — бросаем, ничего не сохраняя
+            self.drag = None;
+            return;
+        }
         let Some((x, y)) = sys::cursor() else { return };
         let cur = [x as f32, y as f32];
         if !moved && place::drag_started(press, cur, ppp) {
