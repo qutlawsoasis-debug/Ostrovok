@@ -172,6 +172,72 @@ fn thumb_size(w: usize, h: usize, height: f32) -> Vec2 {
 }
 
 #[cfg(test)]
+mod calc_layout_tests {
+    use super::*;
+    #[test]
+    fn candidates() {
+        assert!(!calc_candidate("скидка 10%"));
+        assert!(calc_candidate("10%"));
+        assert!(calc_candidate("50% от 300"));
+        assert!(!calc_candidate("работа от 5"));
+        assert!(calc_candidate("2^3"));
+        assert!(!calc_candidate("привет"));
+    }
+    #[test]
+    fn layout_shift() {
+        assert_eq!(fix_layout("J<TL"), "ОБЕД");
+        assert_eq!(fix_layout("{jhjij"), "Хорошо");
+        assert_eq!(fix_layout("ytn'"), "нетэ"); // ' после буквы — это «э»
+        assert_eq!(fix_layout("ytn"), "нет");
+        assert_eq!(fix_layout("ghbdtn, vbh"), "привет, мир");
+        assert_eq!(fix_layout("ghbdtn 😀"), "привет 😀");
+        assert_eq!(fix_layout("ОБЕД"), "J<TL");
+        assert_eq!(map_key('{', true), Some('Х'));
+        assert_eq!(map_key('Х', false), Some('{'));
+        assert_eq!(swap_layout("J<TL"), "обед");
+    }
+    #[test]
+    fn percent_question() {
+        assert!(calc_candidate("сколько процентов 30 от 200"));
+        assert!(calc_candidate("30 от 200 в процентах"));
+        assert!(calc_candidate("15%от200"));
+        assert!(calc_candidate("15 процентов от 200"));
+        assert!(!calc_candidate("скидка 10%"));
+        assert_eq!(calc_answer("сколько процентов 30 от 200").as_deref(), Some("15%"));
+        assert_eq!(calc_answer("30 от 200 в процентах").as_deref(), Some("15%"));
+        assert_eq!(calc_answer("15 процентов от 200").as_deref(), Some("30"));
+        assert_eq!(calc_answer("сколько процентов 30 от 0"), None);
+    }
+    #[test]
+    fn layout_symbols() {
+        let pairs = [('/', '.'), ('?', ','), ('@', '"'), ('#', '№'), ('$', ';'), ('^', ':'), ('&', '?')];
+        for (en, ru) in pairs {
+            assert_eq!(map_key(en, true), Some(ru), "{en} -> ru");
+            assert_eq!(map_key(ru, false), Some(en), "{ru} -> en");
+        }
+        // буквенные клавиши не пострадали
+        assert_eq!(map_key(',', true), Some('б'));
+        assert_eq!(map_key('.', true), Some('ю'));
+        assert_eq!(map_key('"', true), Some('Э'));
+        assert_eq!(map_key(';', true), Some('ж'));
+    }
+    #[test]
+    fn layout_per_word() {
+        assert_eq!(fix_layout("привет ghbdtn"), "привет привет");
+        assert_eq!(fix_layout("ghbdtn привет"), "привет привет");
+        // «,» и «.» внутри слова — б/ю, в конце слова — знак препинания
+        assert_eq!(fix_layout("j,tl"), "обед");
+        assert_eq!(fix_layout("lj,hjt enhj."), "доброе утро.");
+        assert_eq!(fix_layout("rfr ltkf?"), "как дела?");
+        // обратно: знаки в конце слова остаются
+        assert_eq!(fix_layout("руддщ, цщкдв."), "hello, world.");
+        // направление строки поиска — по большинству букв
+        assert_eq!(swap_layout("тщеуpad"), "notepad");
+        assert_eq!(swap_layout("ghbdеn"), "привет");
+    }
+}
+
+#[cfg(test)]
 mod clip_img_tests {
     use super::*;
     #[test]
@@ -2039,12 +2105,9 @@ impl App {
         // ответ про дату не прячет «Спросить ИИ» (быстрые команды и конвертер — прячут)
         let converted = self.results.len() > date_items;
 
-        let is_expr = q.chars().all(|c| c.is_ascii_digit() || " +-*/^().,".contains(c))
-            && q.chars().any(|c| c.is_ascii_digit())
-            && q.chars().any(|c| "+-*/^".contains(c));
+        let is_expr = calc_candidate(&q);
         if is_expr {
-            if let Some(v) = sys::eval(&q) {
-                let s = fmt_num(v);
+            if let Some(s) = calc_answer(&q) {
                 self.results.push(Item { title: format!("= {s}"), sub: "скопировать".into(), action: Action::Copy(s) });
             }
         }
@@ -9488,10 +9551,10 @@ fn smart_hint(text: &str) -> Option<Hint> {
         }
     }
     // пример: только цифры и знаки, и знак действия стоит после первой цифры (номера телефонов и даты не считаем)
-    if t.chars().all(|c| c.is_ascii_digit() || " .,+-*/^()".contains(c)) {
+    if calc_candidate(t) {
         if let Some(first) = t.find(|c: char| c.is_ascii_digit()) {
             let rest = &t[first..];
-            if rest.contains(['+', '*', '/', '^']) || rest.contains(" - ") {
+            if rest.contains(['+', '*', '/', '^', '%']) || rest.contains(" - ") {
                 if let Some(v) = sys::eval(&t.replace(',', ".")).filter(|v| v.is_finite()) {
                     let res = fmt_num(v);
                     return Some(Hint { glyph: "\u{E8EF}", label: format!("= {res}"), color: [0xB9, 0xA4, 0xFF], act: HintAct::Copy(res) });
@@ -9512,20 +9575,62 @@ fn smart_hint(text: &str) -> Option<Hint> {
     None
 }
 
+/// Ответ калькулятора строкой: «сколько процентов 30 от 200» → «15%», иначе просто число.
+fn calc_answer(q: &str) -> Option<String> {
+    let v = sys::eval(q)?;
+    let s = fmt_num(v);
+    Some(if sys::asks_percent(q) { format!("{s}%") } else { s })
+}
+
+fn is_ru_letter(c: char) -> bool {
+    LAYOUT_RU.contains(c.to_lowercase().next().unwrap_or(c))
+}
+
 /// Переводит текст, набранный не в той раскладке: ЙЦУКЕН ↔ QWERTY по положению клавиш.
-/// Направление выбирается по первой букве.
+/// Направление — по большинству букв (поровну — по первой букве).
+/// Буквы выдаются строчными: поиск сравнивает без учёта регистра, а строчные не путают «Ntktuhfv» с «NТЕЛЕ…».
 fn swap_layout(s: &str) -> String {
-    const EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
-    const RU: &str = "йцукенгшщзхъфывапролджэячсмитьбюё";
-    let (en, ru): (Vec<char>, Vec<char>) = (EN.chars().collect(), RU.chars().collect());
-    let to_en = s.chars().find(|c| c.is_alphabetic()).is_some_and(|c| ru.contains(&c.to_lowercase().next().unwrap_or(c)));
-    s.chars()
-        .map(|c| {
-            let l = c.to_lowercase().next().unwrap_or(c);
-            let (from, to) = if to_en { (&ru, &en) } else { (&en, &ru) };
-            from.iter().position(|x| *x == l).map_or(c, |i| to[i])
-        })
-        .collect()
+    let latin = s.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    let cyr = s.chars().filter(|&c| is_ru_letter(c)).count();
+    let to_en = if latin != cyr { cyr > latin } else { s.chars().find(|c| c.is_alphabetic()).is_some_and(is_ru_letter) };
+    // Shift-знаки («<» → «б») тоже переводим
+    s.chars().map(|c| map_key(c, !to_en).map_or(c, |t| t.to_lowercase().next().unwrap_or(t))).collect()
+}
+
+const LAYOUT_EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
+const LAYOUT_RU: &str = "йцукенгшщзхъфывапролджэячсмитьбюё";
+const LAYOUT_EN_UP: &str = "QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>~";
+const LAYOUT_RU_UP: &str = "ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮЁ";
+/// Знаки без своей буквы: та же клавиша в другой раскладке. Таблица для каждого направления своя,
+/// поэтому «?» → «,» (EN→RU) и «?» → «&» (RU→EN) не спорят друг с другом.
+const SYM_EN: &str = "/?@#$^&";
+const SYM_RU: &str = ".,\"№;:?";
+
+/// Та же клавиша в другой раскладке (to_ru: QWERTY → ЙЦУКЕН), с учётом Shift-знаков.
+/// Сначала точный символ в верхнем ряду, потом нижний регистр (регистр буквы сохраняется), потом знаки.
+fn map_key(c: char, to_ru: bool) -> Option<char> {
+    let (from_up, to_up, from, to, sym_from, sym_to) = if to_ru {
+        (LAYOUT_EN_UP, LAYOUT_RU_UP, LAYOUT_EN, LAYOUT_RU, SYM_EN, SYM_RU)
+    } else {
+        (LAYOUT_RU_UP, LAYOUT_EN_UP, LAYOUT_RU, LAYOUT_EN, SYM_RU, SYM_EN)
+    };
+    if let Some(k) = from_up.chars().position(|x| x == c) {
+        return to_up.chars().nth(k);
+    }
+    let low = c.to_lowercase().next().unwrap_or(c);
+    if let Some(k) = from.chars().position(|x| x == low) {
+        let t = to.chars().nth(k)?;
+        return Some(if c != low { t.to_uppercase().next().unwrap_or(t) } else { t });
+    }
+    sym_to.chars().nth(sym_from.chars().position(|x| x == c)?)
+}
+
+/// Строка из калькулятора: цифры и знаки « +-*/^().,%» (и «% от»), хоть одна цифра и хоть один оператор.
+fn calc_candidate(q: &str) -> bool {
+    let n = sys::pct_of(q);
+    n.chars().all(|c| c.is_ascii_digit() || " +-*/^().,%".contains(c))
+        && n.chars().any(|c| c.is_ascii_digit())
+        && n.chars().any(|c| "+-*/^%".contains(c))
 }
 
 /// Латиница, в которой почти нет гласных, — скорее всего русский текст, набранный в английской раскладке.
@@ -9944,29 +10049,50 @@ fn translit(text: &str) -> String {
     out
 }
 
-/// Текст, набранный не в той раскладке: латиницу в кириллицу или наоборот — куда больше букв просится.
+/// Текст, набранный не в той раскладке: латиницу в кириллицу или наоборот.
+/// Только одна азбука — переводим всё; смешанный текст («привет ghbdtn») — направление по каждому слову:
+/// латинские слова переводятся в кириллицу, русские остаются.
 fn fix_layout(text: &str) -> String {
-    const EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
-    const RU: &str = "йцукенгшщзхъфывапролджэячсмитьбюё";
-    let (en, ru): (Vec<char>, Vec<char>) = (EN.chars().collect(), RU.chars().collect());
     let latin = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
-    let cyr = text.chars().filter(|c| ru.contains(&c.to_lowercase().next().unwrap_or(*c))).count();
-    let to_ru = latin >= cyr;
+    let cyr = text.chars().filter(|&c| is_ru_letter(c)).count();
+    let mixed = latin > 0 && cyr > 0;
     let cs: Vec<char> = text.chars().collect();
-    cs.iter()
-        .enumerate()
-        .map(|(i, &c)| {
-            let low = c.to_lowercase().next().unwrap_or(c);
-            let (from, to) = if to_ru { (&en, &ru) } else { (&ru, &en) };
-            let Some(k) = from.iter().position(|f| *f == low) else { return c };
-            // знаки препинания меняем только внутри слова: «j,tl» → «обед», а запятая в «ghbdtn, vbh» остаётся
-            if to_ru && !low.is_ascii_alphabetic() && !cs.get(i + 1).is_some_and(|n| n.is_ascii_alphabetic()) {
-                return c;
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i].is_whitespace() {
+            out.push(cs[i]);
+            i += 1;
+            continue;
+        }
+        let end = (i..cs.len()).find(|&j| cs[j].is_whitespace()).unwrap_or(cs.len());
+        let word = &cs[i..end];
+        let w_latin = word.iter().filter(|c| c.is_ascii_alphabetic()).count();
+        let w_cyr = word.iter().filter(|&&c| is_ru_letter(c)).count();
+        let to_ru = if mixed { w_latin > 0 && w_latin >= w_cyr } else { latin >= cyr };
+        let keep = mixed && !to_ru; // русское слово в смешанном тексте не трогаем
+        let src = |c: char| if to_ru { c.is_ascii_alphabetic() } else { is_ru_letter(c) };
+        for (k, &c) in word.iter().enumerate() {
+            let t = if keep { None } else { map_key(c, to_ru) };
+            let Some(t) = t else {
+                out.push(c);
+                continue;
+            };
+            // знаки препинания меняем только внутри слова: «j,tl» → «обед», а запятая в «ghbdtn, vbh»
+            // и точка в «enhj.» остаются; [ ] ; ' ` и их Shift-версии — буквы (х ъ ж э ё), их меняем и в конце слова
+            if !src(c) {
+                let next = word.get(k + 1).is_some_and(|&n| src(n));
+                let prev = k > 0 && src(word[k - 1]);
+                if !(next || (to_ru && prev && "[];'`{}:\"~".contains(c))) {
+                    out.push(c);
+                    continue;
+                }
             }
-            let t = to[k];
-            if c != low { t.to_uppercase().next().unwrap_or(t) } else { t }
-        })
-        .collect()
+            out.push(t);
+        }
+        i = end;
+    }
+    out
 }
 
 /// Показывать ли на полке миниатюру вместо значка: png/jpg до 40 МБ, файл на месте и это не папка.
