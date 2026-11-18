@@ -544,6 +544,87 @@ pub struct Stats {
 #[derive(Default)]
 pub struct CpuMeter {
     prev: Option<(u64, u64)>,
+    /// прошлое значение — отдаём его, если за тик время не сдвинулось
+    last_cpu: f32,
+}
+
+/// Доля загрузки процессора между замерами (total, busy). None — нет прошлого замера или время не сдвинулось.
+pub fn cpu_frac(prev: Option<(u64, u64)>, cur: (u64, u64)) -> Option<f32> {
+    let (pt, pb) = prev?;
+    let dt = cur.0.checked_sub(pt).filter(|d| *d > 0)?;
+    Some((cur.1.saturating_sub(pb) as f32 / dt as f32).clamp(0.0, 1.0))
+}
+
+/// Доля занятого места на диске; None — размер неизвестен или данные несуразные.
+pub fn disk_frac(free: f64, total: f64) -> Option<f32> {
+    if !(total > 0.0) || !(free >= 0.0) || free > total {
+        return None;
+    }
+    Some((1.0 - free / total) as f32)
+}
+
+/// Экспоненциальное сглаживание: чтобы цифры не мигали каждый тик.
+pub fn ema(prev: f32, x: f32, alpha: f32) -> f32 {
+    if !prev.is_finite() {
+        return x;
+    }
+    prev + (x - prev) * alpha.clamp(0.0, 1.0)
+}
+
+/// Скорость сети (приём, отдача) в байтах/с по счётчикам (rx, tx) за dt секунд.
+/// Первый замер и слишком короткий тик — None (оставить прошлое значение);
+/// сброс счётчика (стал меньше) или скачок больше 10 ГБ/с (появился адаптер, VPN) — тоже None, база перебазируется.
+pub fn net_rate(prev: Option<(u64, u64)>, cur: (u64, u64), dt: f32) -> Option<(f32, f32)> {
+    const MAX: f32 = 10.0 * 1024.0 * 1024.0 * 1024.0;
+    let (prx, ptx) = prev?;
+    if !(dt >= 0.2) {
+        return None;
+    }
+    let drx = cur.0.checked_sub(prx)?;
+    let dtx = cur.1.checked_sub(ptx)?;
+    let r = (drx as f32 / dt, dtx as f32 / dt);
+    (r.0 <= MAX && r.1 <= MAX).then_some(r)
+}
+
+#[cfg(test)]
+mod meter_tests {
+    use super::*;
+
+    #[test]
+    fn cpu() {
+        assert_eq!(cpu_frac(None, (100, 50)), None);
+        assert_eq!(cpu_frac(Some((100, 50)), (100, 60)), None, "dt=0");
+        assert_eq!(cpu_frac(Some((100, 50)), (90, 60)), None, "время назад");
+        assert_eq!(cpu_frac(Some((100, 50)), (200, 100)), Some(0.5));
+        assert_eq!(cpu_frac(Some((100, 50)), (200, 500)), Some(1.0), "clamp сверху");
+        assert_eq!(cpu_frac(Some((100, 50)), (200, 10)), Some(0.0), "clamp снизу");
+    }
+
+    #[test]
+    fn disk() {
+        assert_eq!(disk_frac(0.0, 0.0), None);
+        assert_eq!(disk_frac(5.0, 10.0), Some(0.5));
+        assert_eq!(disk_frac(11.0, 10.0), None);
+        assert_eq!(disk_frac(0.0, 10.0), Some(1.0));
+    }
+
+    #[test]
+    fn net() {
+        assert_eq!(net_rate(None, (1000, 1000), 1.0), None, "первый замер");
+        assert_eq!(net_rate(Some((0, 0)), (1000, 1000), 0.0), None, "dt=0");
+        assert_eq!(net_rate(Some((0, 0)), (1000, 1000), 0.1), None, "слишком короткий тик");
+        assert_eq!(net_rate(Some((5000, 0)), (1000, 1000), 1.0), None, "сброс счётчика");
+        assert_eq!(net_rate(Some((0, 0)), (50 << 30, 0), 1.0), None, "скачок от нового адаптера");
+        assert_eq!(net_rate(Some((0, 0)), (2048, 1024), 2.0), Some((1024.0, 512.0)));
+    }
+
+    #[test]
+    fn smoothing() {
+        assert_eq!(ema(0.0, 10.0, 0.4), 4.0);
+        assert_eq!(ema(10.0, 10.0, 0.4), 10.0);
+        assert_eq!(ema(f32::NAN, 3.0, 0.4), 3.0);
+        assert_eq!(ema(0.0, 10.0, 1.0), 10.0);
+    }
 }
 
 impl CpuMeter {
@@ -562,12 +643,11 @@ impl CpuMeter {
                 let v = |f: FILETIME| ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64;
                 let total = v(kernel) + v(user);
                 let busy = total.saturating_sub(v(idle));
-                if let Some((pt, pb)) = self.prev {
-                    let dt = total.saturating_sub(pt);
-                    if dt > 0 {
-                        s.cpu = (busy.saturating_sub(pb) as f32 / dt as f32).clamp(0.0, 1.0);
-                    }
+                match cpu_frac(self.prev, (total, busy)) {
+                    Some(f) => self.last_cpu = f,
+                    None => {}
                 }
+                s.cpu = self.last_cpu;
                 self.prev = Some((total, busy));
             }
 

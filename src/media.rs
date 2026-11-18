@@ -51,6 +51,37 @@ pub fn secs_to_ticks(secs: f64) -> i64 {
     (secs.max(0.0) * 10_000_000.0).round() as i64
 }
 
+/// Сколько раз на трек пытаться получить обложку.
+const MAX_THUMB_TRIES: u32 = 10;
+
+/// Следующая пауза (с) перед повторным запросом менеджера медиасеансов: 1, 2, 4 … до 30.
+fn mgr_backoff(prev: u32) -> u32 {
+    if prev == 0 { 1 } else { (prev * 2).min(30) }
+}
+
+/// Позиция для показа: сразу после смены трека Windows ещё отдаёт позицию прошлого
+/// (та же длительность, далеко от начала) — тогда показываем начало.
+pub fn sane_timeline(stale_dur: Option<f64>, pos: f64, dur: f64) -> f64 {
+    match stale_dur {
+        Some(d) if (d - dur).abs() < 0.5 && pos > 5.0 => 0.0,
+        _ => pos,
+    }
+}
+
+/// Обрезает строку до max символов (не байт) с «…» на конце.
+pub fn ellipsize_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out: String = s.chars().take(max - 1).collect();
+    out = out.trim_end().to_string();
+    out.push('…');
+    out
+}
+
 pub fn spawn() -> (Arc<Mutex<State>>, mpsc::Sender<Cmd>) {
     let state = Arc::new(Mutex::new(State::default()));
     let (tx, rx) = mpsc::channel::<Cmd>();
@@ -59,14 +90,27 @@ pub fn spawn() -> (Arc<Mutex<State>>, mpsc::Sender<Cmd>) {
         let mut mgr: Option<Manager> = None;
         let mut key = String::new();
         let mut have_thumb = false;
+        let mut thumb_tries = 0u32;
+        // нет менеджера медиасеансов — повторяем запрос всё реже (до 30 с)
+        let mut mgr_wait = 0u32;
+        let mut mgr_next = Instant::now();
+        // длительность прошлого трека: пока Windows отдаёт его позицию для нового — показываем 0
+        let mut stale_dur: Option<f64> = None;
+        let mut last_dur = 0.0f64;
         loop {
             let cmd = match rx.recv_timeout(Duration::from_millis(1000)) {
                 Ok(c) => Some(c),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
-            if mgr.is_none() {
+            if mgr.is_none() && Instant::now() >= mgr_next {
                 mgr = Manager::RequestAsync().and_then(|op| op.get()).ok();
+                if mgr.is_none() {
+                    mgr_wait = mgr_backoff(mgr_wait);
+                    mgr_next = Instant::now() + Duration::from_secs(mgr_wait as u64);
+                } else {
+                    mgr_wait = 0;
+                }
             }
             let Some(m) = &mgr else { continue };
             let session = m.GetCurrentSession().ok();
@@ -95,18 +139,27 @@ pub fn spawn() -> (Arc<Mutex<State>>, mpsc::Sender<Cmd>) {
                     key.clear();
                     have_thumb = false;
                 }
-                Some(info) => {
+                Some(mut info) => {
                     let new_key = format!("{}|{}", info.title, info.artist);
                     if new_key != key {
+                        stale_dur = (!key.is_empty()).then_some(last_dur);
                         key = new_key;
                         have_thumb = false;
+                        thumb_tries = 0;
                         let mut st = shared.lock().unwrap();
                         st.thumb = None;
                         st.accent = None;
                         st.thumb_gen += 1;
                     }
+                    last_dur = info.dur;
+                    let pos = sane_timeline(stale_dur, info.pos, info.dur);
+                    if pos == info.pos {
+                        stale_dur = None;
+                    }
+                    info.pos = pos;
                     shared.lock().unwrap().info = Some(info);
-                    if !have_thumb {
+                    if !have_thumb && thumb_tries < MAX_THUMB_TRIES {
+                        thumb_tries += 1;
                         // обложка могла прийти от прошлого трека — берём только с меткой текущего
                         if let Some((t, _, _)) = session.as_ref().and_then(|s| thumbnail(s, &key).ok()) {
                             have_thumb = true;
@@ -324,6 +377,33 @@ mod tests {
         assert_eq!(clean_title("YouTube"), "YouTube");
         assert_eq!(clean_title("(99+) Trap mix | SoundCloud"), "Trap mix");
         assert_eq!(clean_artist("Daft Punk - Topic"), "Daft Punk");
+        assert_eq!(clean_title("Кино — Группа крови — Яндекс Музыка"), "Кино — Группа крови");
+    }
+
+    #[test]
+    fn ellipsize() {
+        assert_eq!(ellipsize_chars("Коротко", 20), "Коротко");
+        assert_eq!(ellipsize_chars("Группа крови", 7), "Группа…");
+        assert_eq!(ellipsize_chars("🎵🎶🎵🎶", 3), "🎵🎶…");
+        assert_eq!(ellipsize_chars("abc", 3), "abc");
+        assert_eq!(ellipsize_chars("abcd", 0), "");
+    }
+
+    #[test]
+    fn timeline_after_switch() {
+        assert_eq!(sane_timeline(Some(200.0), 120.0, 200.0), 0.0, "старая позиция при той же длительности");
+        assert_eq!(sane_timeline(Some(200.0), 3.0, 200.0), 3.0, "уже с начала");
+        assert_eq!(sane_timeline(Some(200.0), 120.0, 180.0), 120.0, "длительность сменилась — позиция свежая");
+        assert_eq!(sane_timeline(None, 120.0, 200.0), 120.0);
+    }
+
+    #[test]
+    fn backoff() {
+        assert_eq!(mgr_backoff(0), 1);
+        assert_eq!(mgr_backoff(1), 2);
+        assert_eq!(mgr_backoff(2), 4);
+        assert_eq!(mgr_backoff(16), 30);
+        assert_eq!(mgr_backoff(30), 30);
     }
 }
 
