@@ -1098,6 +1098,8 @@ struct App {
     mixer: Vec<sys::AppVol>,
     /// когда последний раз слали громкость программы и что ещё не отправлено (путь, уровень)
     mix_push: (Option<Instant>, Option<(String, f32)>),
+    /// с какого времени буфер с метками занят другой программой (повтор без ожидания)
+    clip_busy: Option<Instant>,
     /// живой звук компьютера: источник и сглаженные столбики эквалайзера
     sound: sound::Sound,
     bars: [f32; sound::BANDS],
@@ -1429,6 +1431,7 @@ impl App {
             ctl_at: now,
             mixer: Vec::new(),
             mix_push: (None, None),
+            clip_busy: None,
             sound: sound::Sound::spawn(),
             bars: [0.0; sound::BANDS],
             beat: 0.0,
@@ -2195,12 +2198,24 @@ impl App {
                 unsafe {
                     let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
                 }
+                // тип диска по корню: опрос отключённого сетевого диска долог, спрашиваем его один раз
+                let mut drives: std::collections::HashMap<String, bool> = Default::default();
                 for path in req_rx {
-                    // сначала дешёвая проверка UNC; опрос диска сам может тормозить, поэтому он уже под таймаутом
+                    // пока тип диска неизвестен — даём сетевой предел, чтобы долгий опрос не стал «зависанием»
                     let unc = sys::unc_path(&path);
-                    let _ = tx.send(Msg::IconStart(generation, path.clone(), unc));
-                    if !unc && sys::is_remote_path(&path) {
-                        let _ = tx.send(Msg::IconStart(generation, path.clone(), true));
+                    let root = sys::drive_root(&path);
+                    let known = root.as_ref().and_then(|r| drives.get(r).copied());
+                    let first = icon_initial_remote(unc, root.is_some(), known);
+                    let _ = tx.send(Msg::IconStart(generation, path.clone(), first));
+                    if let (false, Some(r), None) = (unc, &root, known) {
+                        let remote = sys::is_remote_path(&path);
+                        // помним только «сетевой»: локальную букву могут переподключить как сетевую
+                        if remote {
+                            drives.insert(r.clone(), true);
+                        }
+                        if remote != first {
+                            let _ = tx.send(Msg::IconStart(generation, path.clone(), remote));
+                        }
                     }
                     let icon = sys::icon_rgba(&path);
                     let _ = tx.send(Msg::Icon(generation, path, icon));
@@ -2213,22 +2228,27 @@ impl App {
             self.icon_failed.remove(path);
             self.icon_pending.insert(path.to_string());
         } else {
-            // поток значков упал — пересоздадим при следующем запросе
-            self.reset_icon_worker();
+            // поток значков упал (не завис) — пересоздадим без штрафов
+            self.reset_icon_worker(false);
         }
         None
     }
 
     /// Бросает зависший/упавший поток значков: его ответы станут чужим поколением.
     /// Штраф получает только путь, на котором поток завис; прочие ожидающие просто перезапросятся.
-    fn reset_icon_worker(&mut self) {
+    /// `hung` — поток именно завис; упавший поток штрафа и счёта брошенных не даёт.
+    fn reset_icon_worker(&mut self, hung: bool) {
         let now = Instant::now();
         self.icon_tx = None;
         self.icon_gen += 1;
         self.icon_pending.clear();
-        if let Some((path, _, _)) = self.icon_current.take() {
-            // брошенный поток висит дальше — копить их нельзя, поэтому и предел icon_abandoned
-            self.icon_abandoned += 1;
+        let current = self.icon_current.take();
+        if let Some((path, _, _)) = current {
+            // брошенный поток висит дальше — копить их нельзя, поэтому и предел icon_abandoned;
+            // упавший не висит, но путь, на котором он падает, всё равно получает штраф — иначе круг падений
+            if icon_reset_penalizes(hung) {
+                self.icon_abandoned += 1;
+            }
             let strikes = self.icon_strikes.entry(path.clone()).or_insert(0);
             *strikes = strikes.saturating_add(1);
             let strikes = *strikes;
@@ -2454,7 +2474,7 @@ impl App {
         }
         let icon_now = Instant::now();
         if self.icon_current.as_ref().is_some_and(|(_, started, limit)| icon_overdue(*started, icon_now, *limit)) {
-            self.reset_icon_worker();
+            self.reset_icon_worker(true);
         }
         if let Some((_, started, limit)) = &self.icon_current {
             // проснуться ровно к сроку текущего пути
@@ -2603,7 +2623,15 @@ impl App {
         }
 
         let seq = sys::clipboard_seq();
-        if seq != self.clip_seq && sys::clipboard_private() {
+        let private = if seq != self.clip_seq { sys::clipboard_private() } else { Some(false) };
+        if private.is_none() {
+            // буфер с метками занят другой программой — не ждём; сначала часто, потом раз в секунду
+            let since = *self.clip_busy.get_or_insert(now);
+            ctx.request_repaint_after(clip_busy_retry(now.saturating_duration_since(since)));
+        } else if {
+            self.clip_busy = None;
+            seq != self.clip_seq && private == Some(true)
+        } {
             // пароль из менеджера паролей и прочие помеченные секреты не запоминаем
             self.clip_seq = seq;
             self.clip_skip = false;
@@ -8354,6 +8382,21 @@ fn icon_limit(remote: bool) -> Duration {
     }
 }
 
+/// Через сколько снова проверить занятый буфер: первые 2 с — каждые 100 мс, дальше — раз в секунду.
+fn clip_busy_retry(busy_for: Duration) -> Duration {
+    if busy_for < Duration::from_secs(2) { Duration::from_millis(100) } else { Duration::from_secs(1) }
+}
+
+/// Предел для первого IconStart: UNC — сетевой; буква диска с неизвестным типом — тоже сетевой, пока опрос не ответил.
+fn icon_initial_remote(unc: bool, has_drive: bool, known: Option<bool>) -> bool {
+    unc || (has_drive && known.unwrap_or(true))
+}
+
+/// Засчитывается ли сброшенный поток в брошенные (висящие): да — если завис, нет — если упал.
+fn icon_reset_penalizes(hung: bool) -> bool {
+    hung
+}
+
 /// Просрочен ли текущий запрос значка.
 fn icon_overdue(started: Instant, now: Instant, limit: Duration) -> bool {
     now.saturating_duration_since(started) >= limit
@@ -10476,6 +10519,14 @@ mod bg_tests {
     }
 
     #[test]
+    fn clip_busy_retry_backs_off() {
+        assert_eq!(clip_busy_retry(Duration::ZERO), Duration::from_millis(100));
+        assert_eq!(clip_busy_retry(Duration::from_millis(1999)), Duration::from_millis(100));
+        assert_eq!(clip_busy_retry(Duration::from_secs(2)), Duration::from_secs(1));
+        assert_eq!(clip_busy_retry(Duration::from_secs(3600)), Duration::from_secs(1));
+    }
+
+    #[test]
     fn icon_overdue_rules() {
         let t = Instant::now();
         let lim = Duration::from_secs(5);
@@ -10483,6 +10534,25 @@ mod bg_tests {
         assert!(icon_overdue(t, t + lim, lim));
         assert!(!icon_overdue(t + Duration::from_secs(1), t, lim), "часы назад — не просрочка");
         assert!(!icon_overdue(t, t + Duration::from_secs(14), ICON_STALL_REMOTE));
+        assert_eq!(icon_limit(icon_initial_remote(false, true, None)), ICON_STALL_REMOTE);
+    }
+
+    #[test]
+    fn icon_initial_remote_rules() {
+        for k in [None, Some(false), Some(true)] {
+            assert!(icon_initial_remote(true, false, k), "UNC всегда сетевой");
+            assert!(icon_initial_remote(true, true, k));
+            assert!(!icon_initial_remote(false, false, k), "ни буквы, ни UNC — локальный");
+        }
+        assert!(icon_initial_remote(false, true, None), "тип диска неизвестен — сетевой");
+        assert!(icon_initial_remote(false, true, Some(true)));
+        assert!(!icon_initial_remote(false, true, Some(false)));
+    }
+
+    #[test]
+    fn icon_reset_penalizes_only_hung() {
+        assert!(icon_reset_penalizes(true));
+        assert!(!icon_reset_penalizes(false));
     }
 
     #[test]

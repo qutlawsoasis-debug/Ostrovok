@@ -57,9 +57,8 @@ pub fn clip_is_private(exclude: bool, history: Option<u32>, cloud: Option<u32>) 
     exclude || history == Some(0) || cloud == Some(0)
 }
 
-/// true, если содержимое буфера помечено как приватное и запоминать его нельзя.
-/// При любой ошибке чтения меток считаем буфер приватным только по доступным признакам.
-pub fn clipboard_private() -> bool {
+/// Some(true), если содержимое буфера помечено как приватное; None — буфер занят, спросить позже.
+pub fn clipboard_private() -> Option<bool> {
     use windows::Win32::Foundation::{HANDLE, HGLOBAL};
     use windows::Win32::System::DataExchange::*;
     use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
@@ -71,11 +70,11 @@ pub fn clipboard_private() -> bool {
         let has = |f: u32| f != 0 && IsClipboardFormatAvailable(f).is_ok();
         let exclude = has(excl);
         if exclude {
-            return true;
+            return Some(true);
         }
         let (hh, hc) = (has(hist), has(cloud));
         if !hh && !hc {
-            return false;
+            return Some(false);
         }
         // формат есть, а прочитать не удалось — перестраховываемся
         let read = |f: u32| -> Option<u32> {
@@ -92,21 +91,14 @@ pub fn clipboard_private() -> bool {
             let _ = GlobalUnlock(g);
             Some(v)
         };
-        let mut opened = false;
-        for _ in 0..5 {
-            if OpenClipboard(None).is_ok() {
-                opened = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        if !opened {
-            return true;
+        // без ожидания в потоке интерфейса: занят — вызывающий повторит на следующем кадре
+        if OpenClipboard(None).is_err() {
+            return None;
         }
         let h = if hh { Some(read(hist).unwrap_or(0)) } else { None };
         let c = if hc { Some(read(cloud).unwrap_or(0)) } else { None };
         let _ = CloseClipboard();
-        clip_is_private(false, h, c)
+        Some(clip_is_private(false, h, c))
     }
 }
 
