@@ -1030,6 +1030,8 @@ struct App {
     note_sel: usize,
     note_query: String,
     notes_dirty: Option<Instant>,
+    /// подряд неудачных записей заметок — для паузы перед повтором
+    notes_fails: u32,
 
     clipboard: Option<arboard::Clipboard>,
     clips: Vec<String>,
@@ -1385,6 +1387,7 @@ impl App {
             note_sel: 0,
             note_query: String::new(),
             notes_dirty: None,
+            notes_fails: 0,
             clipboard: arboard::Clipboard::new().ok(),
             clips: Vec::new(),
             clip_query: String::new(),
@@ -1885,6 +1888,12 @@ impl App {
         self.glow = Some((accent(), Instant::now()));
     }
 
+    /// Отмечает несохранённую правку заметок: момент ставится только при первой правке.
+    fn mark_notes_dirty(&mut self) {
+        self.notes_dirty.get_or_insert_with(Instant::now);
+        store::set_snapshot_notes(&self.notes);
+    }
+
     fn show_toast(&mut self, glyph: &'static str, color: [u8; 3], title: &str, text: &str, secs: u64, cover: bool) {
         let short = |v: &str, n: usize| -> String {
             let mut out: String = v.chars().take(n).collect();
@@ -2306,7 +2315,7 @@ impl App {
                     self.notes.insert(0, text);
                 }
                 self.note_sel = 0;
-                self.notes_dirty = Some(Instant::now());
+                self.mark_notes_dirty();
                 self.notify("Заметка сохранена");
             }
             Action::Quick(Quick::Remind(text, at)) => {
@@ -2765,9 +2774,20 @@ impl App {
             self.refresh_weather(ctx);
         }
 
-        if self.notes_dirty.is_some_and(|t| now.duration_since(t) > Duration::from_secs(1)) {
-            store::save_notes(&self.notes);
-            self.notes_dirty = None;
+        // заметки пишутся не позже 1,5 с после первой несохранённой правки, даже при непрерывном наборе
+        match store::due_flush(self.notes_dirty, now) {
+            store::Flush::Save => {
+                if store::save_notes(&self.notes) {
+                    self.notes_dirty = None;
+                    self.notes_fails = 0;
+                } else {
+                    // файл занят (OneDrive, антивирус): текст ждёт в снимке, повтор всё реже — до раза в 30 с
+                    self.notes_fails = self.notes_fails.saturating_add(1);
+                    self.notes_dirty = Some(now + notes_retry_delay(self.notes_fails));
+                }
+            }
+            store::Flush::WaitFor(d) => ctx.request_repaint_after(d),
+            store::Flush::Idle => {}
         }
 
         self.hidden = !test_mode() && !self.cfg.over_games && sys::fullscreen_app_active();
@@ -6053,7 +6073,7 @@ impl App {
                     .margin(egui::Margin::symmetric(10.0, 8.0)),
             );
             if r.changed() {
-                self.notes_dirty = Some(Instant::now());
+                self.mark_notes_dirty();
                 toggle = None; // текст сдвинулся — номер строки мог устареть
             }
         });
@@ -6064,7 +6084,7 @@ impl App {
                 del = ui.add_enabled(self.notes.len() > 1 || n > 0, egui::Button::new("Удалить")).clicked();
                 if jelly(ui, "+ пункт").on_hover_text("Добавить пункт чек-листа «- [ ] »").clicked() {
                     self.notes[sel] = store::append_check(&self.notes[sel]);
-                    self.notes_dirty = Some(Instant::now());
+                    self.mark_notes_dirty();
                 }
                 if jelly(ui, "Копировать").clicked() {
                     let text = self.notes[sel].clone();
@@ -6076,7 +6096,7 @@ impl App {
 
         if let Some(line) = toggle {
             self.notes[sel] = store::toggle_check(&self.notes[sel], line);
-            self.notes_dirty = Some(Instant::now());
+            self.mark_notes_dirty();
         }
         if let Some(i) = pick {
             self.note_sel = i;
@@ -6098,7 +6118,7 @@ impl App {
                 self.notes.push(String::new());
             }
             self.note_sel = sel.min(self.notes.len() - 1);
-            self.notes_dirty = Some(Instant::now());
+            self.mark_notes_dirty();
             self.notify("Заметка удалена");
         }
     }
@@ -7529,6 +7549,10 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(pass));
             self.passthrough = Some(pass);
         }
+        // при завершении сеанса Windows несохранённое пишется прямо из оконной процедуры
+        if let Some(hwnd) = hwnd_of(frame) {
+            sys::watch_end_session(hwnd);
+        }
         // жидкое стекло: раз в ~0,7 с (и сразу при смене размера) берём снимок экрана под островом
         // Стекло видит фон, только пока остров скрыт от захвата экрана. Если остров должен быть виден
         // на демонстрации (галочка в настройках или идёт звонок в Discord), стекло сменяется плотным корпусом.
@@ -8403,6 +8427,12 @@ fn icon_limit(remote: bool) -> Duration {
     } else {
         ICON_STALL_LOCAL
     }
+}
+
+/// Дополнительная пауза перед повтором записи заметок после `fails` неудач подряд (сверх 1,5 с), не больше 30 с в сумме.
+fn notes_retry_delay(fails: u32) -> Duration {
+    let total = store::FLUSH_AFTER.saturating_mul(1u32 << fails.min(5)).min(Duration::from_secs(30));
+    total.saturating_sub(store::FLUSH_AFTER)
 }
 
 /// Через сколько снова проверить занятый буфер: первые 2 с — каждые 100 мс, дальше — раз в секунду.
@@ -10716,6 +10746,14 @@ mod bg_tests {
         assert_eq!(icon_limit(true), ICON_STALL_REMOTE);
         assert_eq!(ICON_STALL_LOCAL, Duration::from_secs(5));
         assert_eq!(ICON_STALL_REMOTE, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn notes_retry_delay_grows_to_30s() {
+        assert_eq!(notes_retry_delay(1) + store::FLUSH_AFTER, store::FLUSH_AFTER * 2);
+        assert!(notes_retry_delay(2) > notes_retry_delay(1));
+        assert_eq!(notes_retry_delay(10) + store::FLUSH_AFTER, Duration::from_secs(30));
+        assert_eq!(notes_retry_delay(u32::MAX) + store::FLUSH_AFTER, Duration::from_secs(30));
     }
 
     #[test]

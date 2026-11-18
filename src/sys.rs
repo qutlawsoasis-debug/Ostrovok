@@ -1742,3 +1742,34 @@ pub fn sleep_clock() -> Option<SleepClock> {
     let tick_ms = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
     ok.then_some(SleepClock { tick_ms, unbiased_100ns: unbiased })
 }
+
+/// Подклассирует окно (один раз): при завершении сеанса Windows записывает снимок
+/// несохранённых заметок и настроек прямо из оконной процедуры, без участия UI.
+/// Вызывать из потока окна.
+pub fn watch_end_session(hwnd: isize) {
+    use windows::Win32::UI::Shell::SetWindowSubclass;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if hwnd == 0 || DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    let ok = unsafe { SetWindowSubclass(HWND(hwnd as *mut core::ffi::c_void), Some(end_session_proc), 0x05E5, 0).as_bool() };
+    if ok {
+        DONE.store(true, Ordering::Relaxed);
+    }
+}
+
+unsafe extern "system" fn end_session_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+    _id: usize,
+    _data: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::Shell::DefSubclassProc;
+    // WM_QUERYENDSESSION не блокируем — уходит дальше как есть
+    if msg == WM_ENDSESSION && wparam.0 != 0 {
+        let _ = std::panic::catch_unwind(crate::store::write_snapshot);
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
