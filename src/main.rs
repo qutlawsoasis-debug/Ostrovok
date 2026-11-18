@@ -194,7 +194,7 @@ mod calc_layout_tests {
         assert_eq!(fix_layout("ОБЕД"), "J<TL");
         assert_eq!(map_key('{', true), Some('Х'));
         assert_eq!(map_key('Х', false), Some('{'));
-        assert_eq!(swap_layout("J<TL"), "обед");
+        assert_eq!(swap_layout("J<TL"), "Обед");
     }
     #[test]
     fn percent_question() {
@@ -2131,7 +2131,7 @@ impl App {
             };
             let direct = rank(&low, 0);
             // набрали в другой раскладке («тщеузфв» вместо «notepad») — ищем и так, но ниже прямых совпадений
-            let swapped = swap_layout(&low);
+            let swapped = swap_layout(&low).to_lowercase();
             let other = rank(&swapped, 3);
             let mut found: Vec<(u8, &(String, String))> = apps
                 .iter()
@@ -9552,12 +9552,15 @@ fn smart_hint(text: &str) -> Option<Hint> {
     }
     // пример: только цифры и знаки, и знак действия стоит после первой цифры (номера телефонов и даты не считаем)
     if calc_candidate(t) {
-        if let Some(first) = t.find(|c: char| c.is_ascii_digit()) {
-            let rest = &t[first..];
-            if rest.contains(['+', '*', '/', '^', '%']) || rest.contains(" - ") {
-                if let Some(v) = sys::eval(&t.replace(',', ".")).filter(|v| v.is_finite()) {
-                    let res = fmt_num(v);
-                    return Some(Hint { glyph: "\u{E8EF}", label: format!("= {res}"), color: [0xB9, 0xA4, 0xFF], act: HintAct::Copy(res) });
+        let n = sys::pct_of(t);
+        if let Some(first) = n.find(|c: char| c.is_ascii_digit()) {
+            let rest = &n[first..];
+            if rest.contains(['+', '*', '/', '^']) || rest.contains(" - ") {
+                if let Some(ans) = calc_answer(&t.replace(',', ".")) {
+                    let num = ans.trim_end_matches('%').to_string();
+                    if num.parse::<f64>().is_ok_and(f64::is_finite) {
+                        return Some(Hint { glyph: "\u{E8EF}", label: format!("= {ans}"), color: [0xB9, 0xA4, 0xFF], act: HintAct::Copy(num) });
+                    }
                 }
             }
         }
@@ -9594,7 +9597,20 @@ fn swap_layout(s: &str) -> String {
     let cyr = s.chars().filter(|&c| is_ru_letter(c)).count();
     let to_en = if latin != cyr { cyr > latin } else { s.chars().find(|c| c.is_alphabetic()).is_some_and(is_ru_letter) };
     // Shift-знаки («<» → «б») тоже переводим
-    s.chars().map(|c| map_key(c, !to_en).map_or(c, |t| t.to_lowercase().next().unwrap_or(t))).collect()
+    // первая буква сохраняет регистр исходника («Ntktuhfv» → «Телеграм»), остальные строчные
+    let mut first = true;
+    s.chars()
+        .map(|c| {
+            let t = map_key(c, !to_en).unwrap_or(c);
+            let low = t.to_lowercase().next().unwrap_or(t);
+            if !t.is_alphabetic() {
+                return t;
+            }
+            let keep = first && (c.is_uppercase() || (!c.is_alphabetic() && t.is_uppercase()));
+            first = false;
+            if keep { t.to_uppercase().next().unwrap_or(t) } else { low }
+        })
+        .collect()
 }
 
 const LAYOUT_EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
@@ -9673,8 +9689,17 @@ mod hint_tests {
         assert!(matches!(smart_hint("ghbdtn, rfr ltkf?").map(|h| h.label), Some(l) if l.starts_with("→ привет, как")));
         assert_eq!(swap_layout("тщеузфв"), "notepad");
         assert_eq!(swap_layout("ghbdtn"), "привет");
-        assert_eq!(swap_layout("Ntktuhfv"), "телеграм");
+        assert_eq!(swap_layout("Ntktuhfv"), "Телеграм");
+        assert_eq!(swap_layout("Ghbdtn"), "Привет");
+        assert_eq!(swap_layout("Ntktuhfv").to_lowercase(), "телеграм");
         assert_eq!(swap_layout("123"), "123");
+        // проценты в «Умном буфере»
+        let lbl = |s: &str| smart_hint(s).map(|h| h.label);
+        assert_eq!(lbl("10%"), None);
+        assert_eq!(lbl("15 процентов от 200").as_deref(), Some("= 30"));
+        assert_eq!(lbl("15% от 200").as_deref(), Some("= 30"));
+        assert_eq!(lbl("200+10%").as_deref(), Some("= 220"));
+        assert_eq!(lbl("скидка 10%"), None);
         // ссылки и почта по-прежнему узнаются первыми
         assert!(matches!(smart_hint("https://example.org").map(|h| h.label), Some(l) if l == "Открыть ссылку"));
     }
