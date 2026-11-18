@@ -2173,6 +2173,7 @@ impl App {
             let failed_at = now.checked_add(icon_retry_after(strikes).saturating_sub(ICON_RETRY)).unwrap_or(now);
             self.icon_failed.insert(path.clone(), failed_at);
             if icon_should_ban(strikes) {
+                self.icon_strikes.remove(&path);
                 self.icon_stuck.insert(path);
             }
         }
@@ -2539,9 +2540,16 @@ impl App {
         }
 
         let seq = sys::clipboard_seq();
-        if seq != self.clip_seq {
+        if seq != self.clip_seq && sys::clipboard_private() {
+            // пароль из менеджера паролей и прочие помеченные секреты не запоминаем
             self.clip_seq = seq;
-            let text = self.clipboard.as_mut().map(|cb| cb.get_text());
+            self.clip_skip = false;
+        } else if let Some(text) = (seq != self.clip_seq)
+            .then(|| self.clipboard.as_mut().map(|cb| cb.get_text()))
+            // буфер мог смениться между проверкой меток и чтением — тогда разберём его заново на следующем кадре
+            .filter(|_| sys::clipboard_seq() == seq)
+        {
+            self.clip_seq = seq;
             if !matches!(text, Some(Ok(_))) {
                 // в буфере не текст — возможно, картинка (снимок экрана, «копировать изображение»)
                 if !std::mem::take(&mut self.clip_skip) {
@@ -4805,21 +4813,16 @@ impl App {
         });
         if let Some((i, v)) = set {
             self.mixer[i].level = v;
-            self.mix_push.1 = Some((self.mixer[i].path.clone(), v));
-        }
-        // перебор всех звуковых сессий дорог: пока тянут — не чаще раза в 40 мс, при отпускании — последнее значение
-        if self.mix_push.1.is_some() {
-            let now = Instant::now();
-            let released = !ui.input(|i| i.pointer.any_down());
-            if should_push(self.mix_push.0, now, released) {
-                if let Some((path, v)) = self.mix_push.1.take() {
-                    sys::set_app_volume(&path, v);
-                    self.mix_push.0 = Some(now);
+            let path = self.mixer[i].path.clone();
+            // другой ползунок: неотправленный уровень прежней программы уходит сразу, а не теряется
+            if let Some((old, ov)) = self.mix_push.1.take() {
+                if old != path {
+                    sys::set_app_volume(&old, ov);
                 }
-            } else {
-                ui.ctx().request_repaint_after(MIX_PUSH_EVERY);
             }
+            self.mix_push.1 = Some((path, v));
         }
+        // отправку (не чаще раза в 40 мс, последнее значение при отпускании) делает pump
         if let Some(i) = mute {
             let on = !self.mixer[i].muted;
             sys::set_app_mute(&self.mixer[i].path, on);

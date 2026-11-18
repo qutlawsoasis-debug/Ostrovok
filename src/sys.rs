@@ -50,6 +50,66 @@ pub fn screen_width() -> i32 {
     unsafe { GetSystemMetrics(SM_CXSCREEN) }
 }
 
+/// Решает по меткам буфера, секрет ли это (менеджеры паролей и т. п.).
+/// `exclude` — есть формат ExcludeClipboardContentFromMonitorProcessing;
+/// `history`/`cloud` — значения CanIncludeInClipboardHistory / CanUploadToCloudClipboard, если формат есть.
+pub fn clip_is_private(exclude: bool, history: Option<u32>, cloud: Option<u32>) -> bool {
+    exclude || history == Some(0) || cloud == Some(0)
+}
+
+/// true, если содержимое буфера помечено как приватное и запоминать его нельзя.
+/// При любой ошибке чтения меток считаем буфер приватным только по доступным признакам.
+pub fn clipboard_private() -> bool {
+    use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+    use windows::Win32::System::DataExchange::*;
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    unsafe {
+        let fmt = |name: PCWSTR| RegisterClipboardFormatW(name);
+        let excl = fmt(w!("ExcludeClipboardContentFromMonitorProcessing"));
+        let hist = fmt(w!("CanIncludeInClipboardHistory"));
+        let cloud = fmt(w!("CanUploadToCloudClipboard"));
+        let has = |f: u32| f != 0 && IsClipboardFormatAvailable(f).is_ok();
+        let exclude = has(excl);
+        if exclude {
+            return true;
+        }
+        let (hh, hc) = (has(hist), has(cloud));
+        if !hh && !hc {
+            return false;
+        }
+        // формат есть, а прочитать не удалось — перестраховываемся
+        let read = |f: u32| -> Option<u32> {
+            let h: HANDLE = GetClipboardData(f).ok()?;
+            let g = HGLOBAL(h.0);
+            if GlobalSize(g) < 4 {
+                return Some(0);
+            }
+            let p = GlobalLock(g) as *const u8;
+            if p.is_null() {
+                return Some(0);
+            }
+            let v = u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
+            let _ = GlobalUnlock(g);
+            Some(v)
+        };
+        let mut opened = false;
+        for _ in 0..5 {
+            if OpenClipboard(None).is_ok() {
+                opened = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !opened {
+            return true;
+        }
+        let h = if hh { Some(read(hist).unwrap_or(0)) } else { None };
+        let c = if hc { Some(read(cloud).unwrap_or(0)) } else { None };
+        let _ = CloseClipboard();
+        clip_is_private(false, h, c)
+    }
+}
+
 pub fn clipboard_seq() -> u32 {
     unsafe { GetClipboardSequenceNumber() }
 }
@@ -950,8 +1010,9 @@ fn audio_sessions(mut f: impl FnMut(String, bool, &windows::Win32::Media::Audio:
             let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { continue };
             let mut buf = vec![0u16; 512];
             let mut len = buf.len() as u32;
-            let mut ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
-            if !ok && windows::Win32::Foundation::GetLastError() == windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER {
+            let r = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len);
+            let mut ok = r.is_ok();
+            if matches!(&r, Err(e) if e.code() == windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER.to_hresult()) {
                 // длинный путь (\\?\…) не влез — повторяем с наибольшим буфером
                 buf = vec![0u16; 32768];
                 len = buf.len() as u32;
@@ -1547,5 +1608,34 @@ mod eval_power_tests {
         assert_eq!(eval(&"2^".repeat(300)), None);
         let e = format!("{}1{}", "(".repeat(50), ")".repeat(50));
         close(&e, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod clip_private_tests {
+    use super::clip_is_private;
+
+    #[test]
+    fn exclude_flag_is_private() {
+        assert!(clip_is_private(true, None, None));
+        assert!(clip_is_private(true, Some(1), Some(1)));
+    }
+
+    #[test]
+    fn zero_history_or_cloud_is_private() {
+        assert!(clip_is_private(false, Some(0), None));
+        assert!(clip_is_private(false, None, Some(0)));
+        assert!(clip_is_private(false, Some(0), Some(1)));
+        assert!(clip_is_private(false, Some(1), Some(0)));
+        assert!(clip_is_private(true, Some(0), Some(0)));
+    }
+
+    #[test]
+    fn allowed_or_absent_is_not_private() {
+        assert!(!clip_is_private(false, None, None));
+        assert!(!clip_is_private(false, Some(1), None));
+        assert!(!clip_is_private(false, None, Some(1)));
+        assert!(!clip_is_private(false, Some(1), Some(1)));
+        assert!(!clip_is_private(false, Some(7), Some(u32::MAX)));
     }
 }
