@@ -9,6 +9,7 @@ mod glass;
 mod install;
 mod jarvis;
 mod jarvis_ui;
+mod place;
 mod setup;
 mod sound;
 mod live;
@@ -1209,7 +1210,16 @@ struct App {
     /// системное размытие фона включено (None — ещё не пробовали)
     acrylic: Option<bool>,
     /// последнее заданное положение и размер настоящего окна
-    win_last: Option<[f32; 4]>,
+    win_last: Option<[i32; 4]>,
+    /// начало поля острова в пикселях экрана, если остров перетащили (None — по центру сверху)
+    spot: Option<[f32; 2]>,
+    /// идёт нажатие на остров: где нажали, откуда поле, тронулось ли
+    drag: Option<([f32; 2], [f32; 2], bool)>,
+    /// перетаскивание только что кончилось — щелчок в этом кадре не считается
+    drag_eat: bool,
+    drag_eat_until: Option<Instant>,
+    /// масштаб, при котором ставили окно
+    win_ppp: f32,
 
     // встроенный чат ИИ: веб-окно внутри панели
     web: Option<wry::WebView>,
@@ -1344,6 +1354,7 @@ impl App {
         let (lens_tx, lens_rx) = glass::spawn(ctx.clone());
         let fx = cc.gl.as_ref().and_then(|gl| fx::Fx::new(gl)).map(Arc::new);
         let mut cfg = store::Settings::load();
+        let spot0 = if test_mode() { None } else { restore_spot(&cfg.spots) };
         cfg.world = sanitize_world(&cfg.world);
         THEME.store((cfg.theme as usize).min(THEMES.len() - 1), Ordering::Relaxed);
         if let Some(t) = std::env::var("OSTROVOK_THEME").ok().and_then(|v| v.parse::<usize>().ok()) {
@@ -1526,6 +1537,11 @@ impl App {
             lyrics_key: String::new(),
             acrylic: None,
             win_last: None,
+            spot: spot0,
+            drag: None,
+            drag_eat: false,
+            drag_eat_until: None,
+            win_ppp: 0.0,
             web: None,
             web_ctx: None,
             web_slot: None,
@@ -6506,6 +6522,22 @@ impl App {
             if switch_row(ui, &mut self.cfg.capture_visible, "Виден на записи экрана", "стекло перестанет размывать фон; в звонке Discord виден и так") {
                 self.cfg.save();
             }
+            {
+                // «Вернуть остров в центр»: строка-кнопка, видна, когда остров сдвинут
+                let moved = self.spot.is_some();
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), if moved { Sense::click() } else { Sense::hover() });
+                let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered() && moved, 0.10);
+                let p = ui.painter();
+                if hov > 0.0 {
+                    p.rect_filled(r.expand2(vec2(6.0, 0.0)), Rounding::same(9.0), rgba(255, 255, 255, (12.0 * hov) as u8));
+                }
+                p.text(pos2(r.left(), r.top() + 12.0), Align2::LEFT_CENTER, "Вернуть остров в центр", FontId::proportional(13.0), if moved { FG } else { DIM });
+                let hint = if moved { "остров можно тянуть мышью; двойной щелчок по ручке — тоже на место" } else { "остров на месте; его можно перетащить мышью" };
+                p.text(pos2(r.left(), r.top() + 29.0), Align2::LEFT_CENTER, hint, FontId::proportional(11.0), DIM);
+                if resp.clicked() {
+                    self.spot_reset();
+                }
+            }
             if switch_row(ui, &mut self.cfg.over_games, "Поверх полноэкранных игр", "работает, если игра в режиме окна без рамки") {
                 self.cfg.save();
             }
@@ -7534,7 +7566,28 @@ impl eframe::App for App {
         // Остров живёт в координатах «поля» шириной WIN_W вверху основного экрана,
         // а настоящее окно подгоняется под его размер: системное размытие ложится только под остров.
         let ppp = ctx.pixels_per_point();
-        let base = pos2(base_x(ppp), 0.0);
+        // щелчок, который egui увидит чуть позже отпускания, тоже гасим
+        self.drag_eat = self.drag_eat_until.is_some_and(|t| Instant::now() < t);
+        if self.win_ppp != ppp {
+            // сменился масштаб (другой монитор): winit сам менял окно, ставим заново
+            self.win_ppp = ppp;
+            self.win_last = None;
+        }
+        self.drag_step(ppp);
+        let base = match self.spot {
+            Some(s) => {
+                // сдвинутый остров разворачивается от своего места, но за край монитора не вылезает
+                let part = match self.mode {
+                    Mode::Pill => Rect::from_center_size(pos2(WIN_W / 2.0, TOP + PILL_H / 2.0), vec2(PILL_H * 4.0, PILL_H)),
+                    Mode::Panel => Rect::from_min_size(pos2(WIN_W / 2.0 - PANEL_W / 2.0, TOP), vec2(PANEL_W, self.panel_height())),
+                    Mode::Palette => Rect::from_min_size(pos2(WIN_W / 2.0 - PANEL_W / 2.0, TOP), vec2(PANEL_W, 360.0)),
+                };
+                let mon = sys::monitor_at((s[0] + WIN_W / 2.0 * ppp) as i32, (s[1] + TOP * ppp) as i32);
+                let s = if self.drag.is_some_and(|d| d.2) { s } else { place::clamp_into(s, part, ppp, mon) };
+                pos2(s[0] / ppp, s[1] / ppp)
+            }
+            None => pos2(base_x(ppp), 0.0),
+        };
         let cursor: Option<Pos2> = sys::cursor().map(|(x, y)| pos2(x as f32 / ppp - base.x, y as f32 / ppp - base.y));
         let home = pos2(WIN_W / 2.0, TOP + PILL_H / 2.0);
         let d = cursor.map(|c| c - home).unwrap_or(vec2(9999.0, 9999.0));
@@ -7573,13 +7626,13 @@ impl eframe::App for App {
                 vec2(PANEL_W, 50.0 + n * ROW_H + if n > 0.0 { 10.0 } else { 0.0 } + hints)
             }
         };
-        let target = self.upd_shape.unwrap_or(target);
-        // пружина: остров слегка «переливается» за цель и возвращается, как капля
-        let sdt = dt.min(0.02);
-        self.vel += ((target - self.size) * 340.0 - self.vel * 31.0) * sdt;
-        self.size += self.vel * sdt;
-        self.size = self.size.max(vec2(40.0, 20.0));
-        let animating = (target - self.size).length() > 0.4 || self.vel.length() > 3.0;
+        // цель — в целых точках: ширина текста не сдвигает окно на доли пикселя
+        let target = self.upd_shape.unwrap_or(target).round();
+        // пружина: остров слегка «переливается» за цель и возвращается, как капля, а у цели замирает
+        let (size, vel, settled) = place::spring(self.size, self.vel, target, dt);
+        self.size = size.max(vec2(40.0, 20.0));
+        self.vel = vel;
+        let animating = !settled;
 
         let rect_v = Rect::from_min_size(pos2(WIN_W / 2.0 - self.size.x / 2.0, TOP + self.drop_y), self.size);
         let layout_v = Rect::from_min_size(pos2(WIN_W / 2.0 - target.x / 2.0, TOP + self.drop_y), target);
@@ -7680,7 +7733,7 @@ impl eframe::App for App {
         let glowing_music = self.album.is_some() && self.media_now.as_ref().is_some_and(|m| m.playing);
         let glowing = self.glow.is_some_and(|g| g.1.elapsed().as_secs_f32() < 1.3);
         let moving = !self.reach.settled() || self.reach.v > 0.01 || !self.lean_s.settled() || !self.jelly.settled() || self.ripple > 0.0 || dripping || glowing || glowing_music || self.sound.active() || sloshing || !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || !self.bub_dl.settled() || self.sheen_at.elapsed().as_secs_f32() < 0.75;
-        let animating = animating || moving;
+        let animating = animating || moving || self.drag.is_some();
         let scaled = rect_v.size() * self.jelly.v;
         let rect_v = Rect::from_min_size(pos2(WIN_W / 2.0 - scaled.x / 2.0 + self.lean_s.v, TOP + self.drop_y), scaled);
         // для снимков страницы проекта: тестовая копия пишет, где сейчас корпус острова (в пикселях экрана)
@@ -7744,11 +7797,21 @@ impl eframe::App for App {
         }
         let grown = span.expand(46.0);
         let win_v = Rect::from_min_max(grown.min.floor(), grown.max.ceil());
-        let win_pos = if invisible { pos2(-9000.0, 0.0) } else { base + win_v.min.to_vec2() };
-        let want = [win_pos.x, win_pos.y, win_v.width(), win_v.height()];
+        // позиция и размер — одним SetWindowPos в целых пикселях экрана и только когда изменились:
+        // раньше размер и место уходили двумя командами с дробными точками, и окно прыгало между ними
+        let mut want = place::phys_rect([base.x * ppp, base.y * ppp], win_v, ppp);
+        if invisible {
+            want[0] = -9000;
+            want[1] = 0;
+        }
         if self.win_last != Some(want) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(win_v.size()));
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(win_pos));
+            match hwnd_of(frame) {
+                Some(hwnd) => sys::place_window(hwnd, want),
+                None => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(win_v.size()));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos2(want[0] as f32 / ppp, want[1] as f32 / ppp)));
+                }
+            }
             self.win_last = Some(want);
         }
         let pass = !over || invisible;
@@ -7976,7 +8039,12 @@ impl eframe::App for App {
                             sys::set_volume(v);
                         }
                     }
-                    if face.clicked() {
+                    if island.is_pointer_button_down_on() && !face.is_pointer_button_down_on() {
+                        self.drag_begin(ppp);
+                    }
+                    if self.drag_eat || self.drag.is_some_and(|d| d.2) {
+                        // перетаскивали — это не щелчок
+                    } else if face.clicked() {
                         self.next_emotion(now);
                         self.splash(0.12, 90.0);
                         self.jelly.vel += 1.4;
@@ -8077,6 +8145,17 @@ impl eframe::App for App {
                     child.set_clip_rect(rect.shrink(2.0));
                     child.set_opacity(mode_t);
                     self.ui_panel(&mut child, ctx);
+                    // ручка сверху по центру: тянуть — двигать остров, двойной щелчок — на место
+                    let grip = Rect::from_center_size(pos2(rect.center().x, rect.top() + 6.0), vec2(56.0, 12.0));
+                    let g = ui.interact(grip, Id::new("grip"), Sense::click());
+                    let col = if g.hovered() || self.drag.is_some() { Color32::from_white_alpha(120) } else { Color32::from_white_alpha(46) };
+                    ui.painter().rect_filled(Rect::from_center_size(grip.center(), vec2(36.0, 4.0)), 2.0, col);
+                    if self.drag_eat {
+                    } else if g.double_clicked() {
+                        self.spot_reset();
+                    } else if g.is_pointer_button_down_on() {
+                        self.drag_begin(ppp);
+                    }
                     let face = ui.interact(Rect::from_min_size(face_at, vec2(38.0, 18.0)).expand(4.0), Id::new("face"), Sense::click());
                     if face.clicked() {
                         self.next_emotion(now);
@@ -8394,6 +8473,87 @@ fn base_x(ppp: f32) -> f32 {
         -6000.0
     } else {
         ((sys::screen_width() as f32 / ppp - WIN_W) / 2.0).max(0.0)
+    }
+}
+
+/// Сохранённое место острова: первое, чей монитор и сейчас на месте.
+fn restore_spot(spots: &[store::Spot]) -> Option<[f32; 2]> {
+    // монитор ищем по середине его же сохранённого прямоугольника; мусорные числа пропускаем
+    spots
+        .iter()
+        .filter(|s| s.x.is_finite() && s.y.is_finite() && s.x.abs() < 1e6 && s.y.abs() < 1e6)
+        .find(|s| {
+            let r: Vec<i32> = s.mon.split(',').filter_map(|v| v.parse().ok()).collect();
+            r.len() == 4 && place::mon_key(sys::monitor_at((r[0] + r[2]) / 2, (r[1] + r[3]) / 2)) == s.mon
+        })
+        .map(|s| [s.x, s.y])
+}
+
+impl App {
+    /// Нажали на пустое место острова или на ручку: запоминаем, откуда пошли.
+    fn drag_begin(&mut self, ppp: f32) {
+        // спрятанный остров (полноэкранная игра) и снимок экрана не тянутся: клики уходят игре
+        if self.drag.is_some() || test_mode() || self.hidden || self.shot.is_some() || sys::fullscreen_app_active() {
+            return;
+        }
+        let Some((x, y)) = sys::cursor() else { return };
+        let from = self.spot.unwrap_or([base_x(ppp) * ppp, 0.0]);
+        self.drag = Some(([x as f32, y as f32], from, false));
+    }
+
+    /// Каждый кадр: тянем за курсором (координаты экрана, не окна — окно само едет), при отпускании — магнит и сохранение.
+    fn drag_step(&mut self, ppp: f32) {
+        let Some((press, from, mut moved)) = self.drag else { return };
+        if self.hidden {
+            // остров спрятался посреди нажатия — бросаем, ничего не сохраняя
+            self.drag = None;
+            return;
+        }
+        let (Some((x, y)), true) = (sys::cursor(), sys::left_button_down() || self.drag.is_some_and(|d| d.2)) else {
+            // курсор недоступен или кнопку отпустили, не сдвинув, — просто бросаем
+            self.drag = None;
+            return;
+        };
+        let cur = [x as f32, y as f32];
+        if !moved && place::drag_started(press, cur, ppp) {
+            moved = true;
+        }
+        let at = [(from[0] + cur[0] - press[0]).round(), (from[1] + cur[1] - press[1]).round()];
+        if !sys::left_button_down() {
+            self.drag = None;
+            if moved {
+                self.drag_eat_until = Some(Instant::now() + Duration::from_millis(250));
+                let mon = sys::monitor_at(x, y);
+                let at = place::snap(at, WIN_W, ppp, mon);
+                let pill = Rect::from_center_size(pos2(WIN_W / 2.0, TOP + PILL_H / 2.0), vec2(PILL_H * 4.0, PILL_H));
+                let at = place::clamp_into(at, pill, ppp, mon);
+                if at == place::home(WIN_W, ppp, mon) && mon == sys::monitor_at(0, 0) {
+                    self.spot_reset();
+                } else {
+                    self.spot = Some(at);
+                    let key = place::mon_key(mon);
+                    self.cfg.spots.retain(|s| s.mon != key);
+                    self.cfg.spots.insert(0, store::Spot { mon: key, x: at[0], y: at[1] });
+                    self.cfg.spots.truncate(8);
+                    self.cfg.save();
+                }
+            }
+            return;
+        }
+        self.drag = Some((press, from, moved));
+        if moved {
+            self.spot = Some(at);
+        }
+    }
+
+    /// Остров — обратно по центру сверху основного экрана.
+    fn spot_reset(&mut self) {
+        self.spot = None;
+        self.drag = None;
+        if !self.cfg.spots.is_empty() {
+            self.cfg.spots.clear();
+            self.cfg.save();
+        }
     }
 }
 

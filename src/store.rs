@@ -51,6 +51,9 @@ pub struct Settings {
     /// остров виден на демонстрации и записи экрана (тогда стекло непрозрачное)
     #[serde(default)]
     pub capture_visible: bool,
+    /// куда пользователь перетащил остров: по монитору, последний — первым
+    #[serde(default)]
+    pub spots: Vec<Spot>,
     /// выключить жидкость в пилюле (остров-колбу)
     #[serde(default)]
     pub no_flask: bool,
@@ -113,6 +116,14 @@ pub struct Settings {
     pub fish_key: String,
     #[serde(default)]
     pub fish_voice: String,
+}
+
+/// Место острова на одном мониторе: ключ монитора и начало поля острова в пикселях экрана.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct Spot {
+    pub mon: String,
+    pub x: f32,
+    pub y: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
