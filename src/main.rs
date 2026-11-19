@@ -10,6 +10,8 @@ mod glass;
 mod install;
 mod jarvis;
 mod jarvis_ui;
+mod meter;
+mod place;
 mod setup;
 mod sound;
 mod live;
@@ -1132,8 +1134,6 @@ struct App {
     toast_tab: Option<Tab>,
     /// напоминания, сработавшие во время игры: покажем после неё
     held_reminder: Option<String>,
-    /// «Не беспокоить»: уведомления мессенджеров не всплывают, только копятся во «Входящих»
-    dnd: bool,
     last_fg: isize,
     album: Option<[u8; 3]>,
     live: live::Live,
@@ -1220,7 +1220,29 @@ struct App {
     /// системное размытие фона включено (None — ещё не пробовали)
     acrylic: Option<bool>,
     /// последнее заданное положение и размер настоящего окна
-    win_last: Option<[f32; 4]>,
+    win_last: Option<[i32; 4]>,
+    /// начало поля острова в пикселях экрана, если остров перетащили (None — по центру сверху)
+    spot: Option<[f32; 2]>,
+    /// идёт нажатие на остров: где нажали, откуда поле, тронулось ли
+    drag: Option<([f32; 2], [f32; 2], bool)>,
+    /// перетаскивание только что кончилось — щелчок в этом кадре не считается
+    drag_eat: bool,
+    drag_eat_until: Option<Instant>,
+    /// на мониторе острова сейчас полноэкранное приложение (считается раз за кадр)
+    fs_now: bool,
+    /// эквалайзер в пилюле: уровень устройства вывода, когда опрашивали, текущие и целевые высоты
+    vu: Option<sys::Meter>,
+    meter_at: Instant,
+    eq: [f32; meter::N],
+    eq_target: [f32; meter::N],
+    eq_last: Instant,
+    eq_epoch: Instant,
+    /// после неудачного открытия устройства не пробуем снова до этого момента
+    vu_retry: Instant,
+    /// OSTROVOK_EQ_DEMO в тестовом запуске: столбики пляшут без звука — для снимка
+    eq_demo: bool,
+    /// масштаб, при котором ставили окно
+    win_ppp: f32,
 
     // встроенный чат ИИ: веб-окно внутри панели
     web: Option<wry::WebView>,
@@ -1355,6 +1377,7 @@ impl App {
         let (lens_tx, lens_rx) = glass::spawn(ctx.clone());
         let fx = cc.gl.as_ref().and_then(|gl| fx::Fx::new(gl)).map(Arc::new);
         let mut cfg = store::Settings::load();
+        let spot0 = if test_mode() { None } else { restore_spot(&cfg.spots) };
         cfg.world = sanitize_world(&cfg.world);
         THEME.store((cfg.theme as usize).min(THEMES.len() - 1), Ordering::Relaxed);
         if let Some(t) = std::env::var("OSTROVOK_THEME").ok().and_then(|v| v.parse::<usize>().ok()) {
@@ -1476,7 +1499,6 @@ impl App {
             game_quiet: false,
             toast_tab: None,
             held_reminder: None,
-            dnd: false,
             last_fg: 0,
             album: None,
             live,
@@ -1541,6 +1563,20 @@ impl App {
             lyrics_key: String::new(),
             acrylic: None,
             win_last: None,
+            spot: spot0,
+            drag: None,
+            drag_eat: false,
+            drag_eat_until: None,
+            fs_now: false,
+            vu: None,
+            meter_at: Instant::now(),
+            eq: [0.0; meter::N],
+            eq_target: [0.0; meter::N],
+            eq_last: Instant::now(),
+            eq_epoch: Instant::now(),
+            vu_retry: Instant::now(),
+            eq_demo: test_mode() && std::env::var_os("OSTROVOK_EQ_DEMO").is_some(),
+            win_ppp: 0.0,
             web: None,
             web_ctx: None,
             web_slot: None,
@@ -2465,8 +2501,10 @@ impl App {
         let (quiet, done) = {
             let mut s = lock(&self.game);
             s.visible = self.mode == Mode::Panel && self.tab == Tab::Game;
-            // сразу началась новая игра — сводка подождёт её конца, а не пропадёт молча
-            let quiet = s.session.is_some();
+            // поток наблюдения ловит игру по тому же флагу, что прячет остров (монитор острова)
+            s.fs_now = self.fs_now;
+            // полноэкранное приложение или идёт игра — молчим; сводка подождёт, а не пропадёт молча
+            let quiet = s.session.is_some() || self.fs_now;
             (quiet, if quiet { Vec::new() } else { std::mem::take(&mut s.events) })
         };
         self.game_quiet = quiet;
@@ -2511,7 +2549,7 @@ impl App {
                         [0x3A, 0x9B, 0xFF]
                     };
                     let body = if n.body.is_empty() { n.app.clone() } else { n.body.clone() };
-                    if pult::should_toast(self.dnd) {
+                    if pult::should_toast(self.cfg.dnd) {
                         self.show_toast("\u{E8BD}", color, &n.title, &body, 5, false);
                     }
                     self.push_inbox(n, color);
@@ -2919,7 +2957,11 @@ impl App {
             store::Flush::Idle => {}
         }
 
-        self.hidden = !test_mode() && !self.cfg.over_games && sys::fullscreen_app_active();
+        // полноэкранное приложение смотрим на мониторе, где стоит остров (его могли перетащить)
+        let (ix, iy) = self.island_px(ctx.pixels_per_point());
+        self.fs_now = !test_mode() && sys::fullscreen_app_active_at(ix, iy);
+        self.hidden = !self.cfg.over_games && self.fs_now;
+        self.pump_eq(ctx, now);
         let fg = sys::foreground_other();
         if fg != 0 {
             self.last_fg = fg;
@@ -3033,7 +3075,7 @@ impl App {
         for s in segs {
             w += match s {
                 Seg::Thumb => 20.0,
-                Seg::Eq => 24.0,
+                Seg::Eq => meter::EQ_W,
                 Seg::Track(t) => ctx.fonts(|f| f.layout_no_wrap(t.clone(), semi(13.0), FG).size().x).clamp(96.0, 170.0),
                 Seg::Text(t, _) => ctx.fonts(|f| f.layout_no_wrap(t.clone(), semi(13.5), FG).size().x),
                 Seg::Badge(n, _) => badge_w(ctx, *n),
@@ -3256,20 +3298,20 @@ impl App {
                     x += 30.0;
                 }
                 Seg::Eq => {
-                    let color = self.album.map_or(accent(), |c| Color32::from_rgb(c[0], c[1], c[2]));
-                    let live = self.sound.active();
-                    for i in 0..5 {
-                        // пять столбиков: каждый — среднее по трём соседним полосам настоящего звука
-                        let h = if live {
-                            let k = i * 3;
-                            3.0 + 13.0 * ((self.bars[k] + self.bars[k + 1] + self.bars[k + 2]) / 3.0).powf(1.4)
+                    // живой эквалайзер: высоты — по пиковому уровню устройства вывода (meter.rs), цвет — акцент темы
+                    let color = accent();
+                    let measured = self.eq_demo || self.vu.is_some() || self.fs_now;
+                    for i in 0..meter::N {
+                        let h = if measured {
+                            meter::height(self.eq[i])
                         } else {
+                            // уровень недоступен (нет устройства) — спокойное покачивание, как раньше
                             4.0 + 9.0 * (0.5 + 0.5 * ((time * (5.0 + i as f64 * 1.7) + i as f64 * 1.3).sin() as f32))
                         };
-                        let bx = x + i as f32 * 4.5;
-                        p.rect_filled(Rect::from_min_max(pos2(bx, cy + 8.0 - h), pos2(bx + 3.0, cy + 8.0)), Rounding::same(1.5), color);
+                        let bx = x + meter::bar_x(i);
+                        p.rect_filled(Rect::from_min_max(pos2(bx, cy + 8.0 - h), pos2(bx + meter::BAR_W, cy + 8.0)), Rounding::same(1.5), color);
                     }
-                    x += 34.0;
+                    x += meter::EQ_W + 10.0;
                 }
                 Seg::Track(t) => {
                     // название трека; под курсором на его месте — кнопки управления
@@ -4703,7 +4745,7 @@ impl App {
         // ── плитки: нажатие «вдавливает» плитку, включённые залиты своим цветом
         let tiles: [(&str, &str, &str, &str, bool, Color32); 4] = [
             ("mute", if muted { "\u{E74F}" } else { "\u{E767}" }, "Звук", if muted { "выключен" } else { "включён" }, !muted, accent()),
-            ("dnd", "\u{E708}", "Не беспокоить", if self.dnd { "тихо" } else { "выключено" }, self.dnd, moon),
+            ("dnd", "\u{E708}", "Не беспокоить", if self.cfg.dnd { "тихо" } else { "выключено" }, self.cfg.dnd, moon),
             ("night", "\u{E793}", "Ночной свет", "настройки", false, sun),
             ("awake", "\u{E7E8}", "Не засыпать", if self.awake { "включено" } else { "выключено" }, self.awake, Color32::from_rgb(0x7B, 0xE0, 0x9A)),
         ];
@@ -4739,8 +4781,9 @@ impl App {
                 self.vol = Some((level, !muted));
             }
             "dnd" => {
-                self.dnd = !self.dnd;
-                let (t, s) = if self.dnd { ("Не беспокоить", "уведомления копятся тихо") } else { ("Не беспокоить выключено", "уведомления снова всплывают") };
+                self.cfg.dnd = !self.cfg.dnd;
+                self.cfg.save();
+                let (t, s) = if self.cfg.dnd { ("Не беспокоить", "уведомления копятся тихо") } else { ("Не беспокоить выключено", "уведомления снова всплывают") };
                 self.show_toast("\u{E708}", [0xB4, 0x9C, 0xFF], t, s, 3, false);
             }
             "night" => sys::open("ms-settings:nightlight"),
@@ -6944,6 +6987,22 @@ impl App {
             if switch_row(ui, &mut self.cfg.capture_visible, "Виден на записи экрана", "стекло перестанет размывать фон; в звонке Discord виден и так") {
                 self.cfg.save();
             }
+            {
+                // «Вернуть остров в центр»: строка-кнопка, видна, когда остров сдвинут
+                let moved = self.spot.is_some();
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), if moved { Sense::click() } else { Sense::hover() });
+                let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered() && moved, 0.10);
+                let p = ui.painter();
+                if hov > 0.0 {
+                    p.rect_filled(r.expand2(vec2(6.0, 0.0)), Rounding::same(9.0), rgba(255, 255, 255, (12.0 * hov) as u8));
+                }
+                p.text(pos2(r.left(), r.top() + 12.0), Align2::LEFT_CENTER, "Вернуть остров в центр", FontId::proportional(13.0), if moved { FG } else { DIM });
+                let hint = if moved { "остров можно тянуть мышью; двойной щелчок по ручке — тоже на место" } else { "остров на месте; его можно перетащить мышью" };
+                p.text(pos2(r.left(), r.top() + 29.0), Align2::LEFT_CENTER, hint, FontId::proportional(11.0), DIM);
+                if resp.clicked() {
+                    self.spot_reset();
+                }
+            }
             if switch_row(ui, &mut self.cfg.over_games, "Поверх полноэкранных игр", "работает, если игра в режиме окна без рамки") {
                 self.cfg.save();
             }
@@ -7972,7 +8031,30 @@ impl eframe::App for App {
         // Остров живёт в координатах «поля» шириной WIN_W вверху основного экрана,
         // а настоящее окно подгоняется под его размер: системное размытие ложится только под остров.
         let ppp = ctx.pixels_per_point();
-        let base = pos2(base_x(ppp), 0.0);
+        // щелчок, который egui увидит чуть позже отпускания, тоже гасим
+        self.drag_eat = self.drag_eat_until.is_some_and(|t| Instant::now() < t);
+        if self.win_ppp != ppp {
+            // сменился масштаб (другой монитор): winit сам менял окно, ставим заново
+            self.win_ppp = ppp;
+            self.win_last = None;
+        }
+        self.drag_step(ppp);
+        // отпускание замечено в этом же кадре — щелчок тоже не считается
+        self.drag_eat |= self.drag_eat_until.is_some_and(|t| Instant::now() < t);
+        let base = match self.spot {
+            Some(s) => {
+                // сдвинутый остров разворачивается от своего места, но за край монитора не вылезает
+                let part = match self.mode {
+                    Mode::Pill => Rect::from_center_size(pos2(WIN_W / 2.0, TOP + PILL_H / 2.0), vec2(PILL_H * 4.0, PILL_H)),
+                    Mode::Panel => Rect::from_min_size(pos2(WIN_W / 2.0 - PANEL_W / 2.0, TOP), vec2(PANEL_W, self.panel_height())),
+                    Mode::Palette => Rect::from_min_size(pos2(WIN_W / 2.0 - PANEL_W / 2.0, TOP), vec2(PANEL_W, 360.0)),
+                };
+                let mon = sys::monitor_at((s[0] + WIN_W / 2.0 * ppp) as i32, (s[1] + TOP * ppp) as i32);
+                let s = if self.drag.is_some_and(|d| d.2) { s } else { place::clamp_into(s, part, ppp, mon) };
+                pos2(s[0] / ppp, s[1] / ppp)
+            }
+            None => pos2(base_x(ppp), 0.0),
+        };
         let cursor: Option<Pos2> = sys::cursor().map(|(x, y)| pos2(x as f32 / ppp - base.x, y as f32 / ppp - base.y));
         let home = pos2(WIN_W / 2.0, TOP + PILL_H / 2.0);
         let d = cursor.map(|c| c - home).unwrap_or(vec2(9999.0, 9999.0));
@@ -8011,13 +8093,13 @@ impl eframe::App for App {
                 vec2(PANEL_W, 50.0 + n * ROW_H + if n > 0.0 { 10.0 } else { 0.0 } + hints)
             }
         };
-        let target = self.upd_shape.unwrap_or(target);
-        // пружина: остров слегка «переливается» за цель и возвращается, как капля
-        let sdt = dt.min(0.02);
-        self.vel += ((target - self.size) * 340.0 - self.vel * 31.0) * sdt;
-        self.size += self.vel * sdt;
-        self.size = self.size.max(vec2(40.0, 20.0));
-        let animating = (target - self.size).length() > 0.4 || self.vel.length() > 3.0;
+        // цель — в целых точках: ширина текста не сдвигает окно на доли пикселя
+        let target = self.upd_shape.unwrap_or(target).round();
+        // пружина: остров слегка «переливается» за цель и возвращается, как капля, а у цели замирает
+        let (size, vel, settled) = place::spring(self.size, self.vel, target, dt);
+        self.size = size.max(vec2(40.0, 20.0));
+        self.vel = vel;
+        let animating = !settled;
 
         let rect_v = Rect::from_min_size(pos2(WIN_W / 2.0 - self.size.x / 2.0, TOP + self.drop_y), self.size);
         let layout_v = Rect::from_min_size(pos2(WIN_W / 2.0 - target.x / 2.0, TOP + self.drop_y), target);
@@ -8117,8 +8199,8 @@ impl eframe::App for App {
         let dripping = !flask && self.mode == Mode::Pill && self.media_now.as_ref().is_some_and(|m| m.playing);
         let glowing_music = self.album.is_some() && self.media_now.as_ref().is_some_and(|m| m.playing);
         let glowing = self.glow.is_some_and(|g| g.1.elapsed().as_secs_f32() < 1.3);
-        let moving = !self.reach.settled() || self.reach.v > 0.01 || !self.lean_s.settled() || !self.jelly.settled() || self.ripple > 0.0 || dripping || glowing || glowing_music || self.sound.active() || sloshing || !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || !self.bub_dl.settled() || self.sheen_at.elapsed().as_secs_f32() < 0.75;
-        let animating = animating || moving;
+        let moving = !self.hidden && (!self.reach.settled() || self.reach.v > 0.01 || !self.lean_s.settled() || !self.jelly.settled() || self.ripple > 0.0 || dripping || glowing || glowing_music || self.sound.active() || sloshing || !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || !self.bub_dl.settled() || self.sheen_at.elapsed().as_secs_f32() < 0.75);
+        let animating = animating || moving || self.drag.is_some();
         let scaled = rect_v.size() * self.jelly.v;
         let rect_v = Rect::from_min_size(pos2(WIN_W / 2.0 - scaled.x / 2.0 + self.lean_s.v, TOP + self.drop_y), scaled);
         // для снимков страницы проекта: тестовая копия пишет, где сейчас корпус острова (в пикселях экрана)
@@ -8182,11 +8264,21 @@ impl eframe::App for App {
         }
         let grown = span.expand(46.0);
         let win_v = Rect::from_min_max(grown.min.floor(), grown.max.ceil());
-        let win_pos = if invisible { pos2(-9000.0, 0.0) } else { base + win_v.min.to_vec2() };
-        let want = [win_pos.x, win_pos.y, win_v.width(), win_v.height()];
+        // позиция и размер — одним SetWindowPos в целых пикселях экрана и только когда изменились:
+        // раньше размер и место уходили двумя командами с дробными точками, и окно прыгало между ними
+        let mut want = place::phys_rect([base.x * ppp, base.y * ppp], win_v, ppp);
+        if invisible {
+            want[0] = -9000;
+            want[1] = 0;
+        }
         if self.win_last != Some(want) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(win_v.size()));
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(win_pos));
+            match hwnd_of(frame) {
+                Some(hwnd) => sys::place_window(hwnd, want),
+                None => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(win_v.size()));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos2(want[0] as f32 / ppp, want[1] as f32 / ppp)));
+                }
+            }
             self.win_last = Some(want);
         }
         let pass = !over || invisible;
@@ -8414,7 +8506,12 @@ impl eframe::App for App {
                             sys::set_volume(v);
                         }
                     }
-                    if face.clicked() {
+                    if island.is_pointer_button_down_on() && !face.is_pointer_button_down_on() {
+                        self.drag_begin(ppp);
+                    }
+                    if self.drag_eat || self.drag.is_some_and(|d| d.2) {
+                        // перетаскивали — это не щелчок
+                    } else if face.clicked() {
                         self.next_emotion(now);
                         self.splash(0.12, 90.0);
                         self.jelly.vel += 1.4;
@@ -8515,6 +8612,17 @@ impl eframe::App for App {
                     child.set_clip_rect(rect.shrink(2.0));
                     child.set_opacity(mode_t);
                     self.ui_panel(&mut child, ctx);
+                    // ручка сверху по центру: тянуть — двигать остров, двойной щелчок — на место
+                    let grip = Rect::from_center_size(pos2(rect.center().x, rect.top() + 6.0), vec2(56.0, 12.0));
+                    let g = ui.interact(grip, Id::new("grip"), Sense::click());
+                    let col = if g.hovered() || self.drag.is_some() { Color32::from_white_alpha(120) } else { Color32::from_white_alpha(46) };
+                    ui.painter().rect_filled(Rect::from_center_size(grip.center(), vec2(36.0, 4.0)), 2.0, col);
+                    if self.drag_eat {
+                    } else if g.double_clicked() {
+                        self.spot_reset();
+                    } else if g.is_pointer_button_down_on() {
+                        self.drag_begin(ppp);
+                    }
                     let face = ui.interact(Rect::from_min_size(face_at, vec2(38.0, 18.0)).expand(4.0), Id::new("face"), Sense::click());
                     if face.clicked() {
                         self.next_emotion(now);
@@ -8837,6 +8945,145 @@ fn base_x(ppp: f32) -> f32 {
         -6000.0
     } else {
         ((sys::screen_width() as f32 / ppp - WIN_W) / 2.0).max(0.0)
+    }
+}
+
+/// Сохранённое место острова: первое, чей монитор и сейчас на месте.
+fn restore_spot(spots: &[store::Spot]) -> Option<[f32; 2]> {
+    // монитор ищем по середине его же сохранённого прямоугольника; мусорные числа пропускаем
+    spots
+        .iter()
+        .filter(|s| s.x.is_finite() && s.y.is_finite() && s.x.abs() < 1e6 && s.y.abs() < 1e6)
+        .find(|s| {
+            let r: Vec<i32> = s.mon.split(',').filter_map(|v| v.parse().ok()).collect();
+            r.len() == 4 && place::mon_key(sys::monitor_at(((r[0] as i64 + r[2] as i64) / 2) as i32, ((r[1] as i64 + r[3] as i64) / 2) as i32)) == s.mon
+        })
+        .map(|s| [s.x, s.y])
+}
+
+impl App {
+    /// Нажали на пустое место острова или на ручку: запоминаем, откуда пошли.
+    fn drag_begin(&mut self, ppp: f32) {
+        // спрятанный остров (полноэкранная игра) и снимок экрана не тянутся: клики уходят игре
+        if self.drag.is_some() || test_mode() || self.hidden || self.shot.is_some() || self.fs_now {
+            return;
+        }
+        let Some((x, y)) = sys::cursor() else { return };
+        let from = self.spot.unwrap_or([base_x(ppp) * ppp, 0.0]);
+        self.drag = Some(([x as f32, y as f32], from, false));
+    }
+
+    /// Эквалайзер пилюли: опрос уровня не чаще 30 раз/с и только когда пилюля видна и звук идёт;
+    /// поверх полноэкранного приложения не опрашиваем совсем и отпускаем устройство.
+    fn pump_eq(&mut self, ctx: &egui::Context, now: Instant) {
+        let dt = now.duration_since(self.eq_last).as_secs_f32();
+        self.eq_last = now;
+        if self.fs_now || self.hidden {
+            // полноэкранная игра или остров спрятан: ни опроса, ни устройства, ни перерисовки
+            self.eq = [0.0; meter::N];
+            self.eq_target = self.eq;
+            self.vu = None;
+            return;
+        }
+        let playing = self.media_now.as_ref().is_some_and(|m| m.playing) || self.sound.active();
+        // те же условия, при которых segments() кладёт в пилюлю эквалайзер
+        let visible = self.mode == Mode::Pill && self.toast.is_none() && self.note.is_none() && self.shot.is_none();
+        if !visible || !playing {
+            self.eq_target = [0.0; meter::N];
+            if !playing {
+                self.vu = None;
+            }
+        } else if meter::should_poll(visible, playing, self.fs_now, now.duration_since(self.meter_at)) {
+            self.meter_at = now;
+            // время по кругу в час: синусы покачивания не теряют точность за сутки работы
+            let t = (now.duration_since(self.eq_epoch).as_secs_f64() % 3600.0) as f32;
+            let muted = self.watch.lock().map(|w| w.ok && w.muted).unwrap_or(false);
+            let peaks = if self.eq_demo {
+                Some(meter::demo_peak(t))
+            } else if muted {
+                Some((0.0, [0.0, 0.0]))
+            } else {
+                if self.vu.as_ref().is_none_or(|m| m.stale()) && now >= self.vu_retry {
+                    self.vu = sys::Meter::open();
+                    if self.vu.is_none() {
+                        self.vu_retry = now + Duration::from_secs(3);
+                    }
+                }
+                let p = self.vu.as_ref().and_then(|m| m.peaks());
+                if p.is_none() && self.vu.take().is_some() {
+                    self.vu_retry = now + Duration::from_secs(3);
+                }
+                p
+            };
+            self.eq_target = peaks.map_or([0.0; meter::N], |(pk, [l, r])| meter::spread(meter::level(pk), [meter::level(l), meter::level(r)], t));
+        }
+        for (v, t) in self.eq.iter_mut().zip(self.eq_target) {
+            *v = meter::smooth(*v, t, dt);
+        }
+        if self.eq.iter().zip(self.eq_target).any(|(v, t)| *v > 0.0 || t > 0.0) {
+            ctx.request_repaint_after(meter::POLL);
+        }
+    }
+
+    /// Точка острова на экране (пиксели): середина поля чуть ниже верха.
+    fn island_px(&self, ppp: f32) -> (i32, i32) {
+        let s = self.spot.unwrap_or([base_x(ppp) * ppp, 0.0]);
+        ((s[0] + WIN_W / 2.0 * ppp) as i32, (s[1] + (TOP + PILL_H / 2.0) * ppp) as i32)
+    }
+
+    /// Каждый кадр: тянем за курсором (координаты экрана, не окна — окно само едет), при отпускании — магнит и сохранение.
+    fn drag_step(&mut self, ppp: f32) {
+        let Some((press, from, mut moved)) = self.drag else { return };
+        if self.hidden {
+            // остров спрятался посреди нажатия — бросаем, ничего не сохраняя
+            self.drag = None;
+            return;
+        }
+        let (Some((x, y)), true) = (sys::cursor(), sys::left_button_down() || self.drag.is_some_and(|d| d.2)) else {
+            // курсор недоступен или кнопку отпустили, не сдвинув, — просто бросаем
+            self.drag = None;
+            return;
+        };
+        let cur = [x as f32, y as f32];
+        if !moved && place::drag_started(press, cur, ppp) {
+            moved = true;
+        }
+        let at = [(from[0] + cur[0] - press[0]).round(), (from[1] + cur[1] - press[1]).round()];
+        if !sys::left_button_down() {
+            self.drag = None;
+            if moved {
+                self.drag_eat_until = Some(Instant::now() + Duration::from_millis(250));
+                let mon = sys::monitor_at(x, y);
+                let at = place::snap(at, WIN_W, ppp, mon);
+                let pill = Rect::from_center_size(pos2(WIN_W / 2.0, TOP + PILL_H / 2.0), vec2(PILL_H * 4.0, PILL_H));
+                let at = place::clamp_into(at, pill, ppp, mon);
+                if at == place::home(WIN_W, ppp, mon) && mon == sys::monitor_at(0, 0) {
+                    self.spot_reset();
+                } else {
+                    self.spot = Some(at);
+                    let key = place::mon_key(mon);
+                    self.cfg.spots.retain(|s| s.mon != key);
+                    self.cfg.spots.insert(0, store::Spot { mon: key, x: at[0], y: at[1] });
+                    self.cfg.spots.truncate(8);
+                    self.cfg.save();
+                }
+            }
+            return;
+        }
+        self.drag = Some((press, from, moved));
+        if moved {
+            self.spot = Some(at);
+        }
+    }
+
+    /// Остров — обратно по центру сверху основного экрана.
+    fn spot_reset(&mut self) {
+        self.spot = None;
+        self.drag = None;
+        if !self.cfg.spots.is_empty() {
+            self.cfg.spots.clear();
+            self.cfg.save();
+        }
     }
 }
 

@@ -136,10 +136,19 @@ pub fn spawn_hotkey(flag: Arc<AtomicBool>, ctx: eframe::egui::Context) -> &'stat
     rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or("не назначена")
 }
 
-/// Нужно ли спрятать остров: активное чужое окно находится на основном экране (там, где остров)
-/// и либо занимает его целиком, либо это полноэкранная игра или презентация.
-/// Полноэкранное окно на другом мониторе острову не мешает.
+/// Есть ли полноэкранное приложение на любом мониторе — для осторожных действий
+/// (перезапуск после обновления, создание окна при запуске).
 pub fn fullscreen_app_active() -> bool {
+    fullscreen_on(None)
+}
+
+/// Нужно ли спрятать остров, стоящий в точке (x, y) экрана: активное чужое окно на том же мониторе
+/// занимает его целиком или это полноэкранная игра/презентация. Полноэкранное окно на другом мониторе не мешает.
+pub fn fullscreen_app_active_at(x: i32, y: i32) -> bool {
+    fullscreen_on(Some(monitor_at(x, y)))
+}
+
+fn fullscreen_on(island_mon: Option<[i32; 4]>) -> bool {
     use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN};
     unsafe {
         let fg = GetForegroundWindow();
@@ -163,13 +172,9 @@ pub fn fullscreen_app_active() -> bool {
             return false;
         }
         let m = mi.rcMonitor;
-        // основной экран начинается в точке (0, 0)
-        if m.left != 0 || m.top != 0 {
-            return false;
-        }
-        let covers = r.left == m.left && r.top == m.top && r.right == m.right && r.bottom == m.bottom;
+        let win_mon = [m.left, m.top, m.right, m.bottom];
         let game = matches!(SHQueryUserNotificationState(), Ok(st) if st == QUNS_RUNNING_D3D_FULL_SCREEN || st == QUNS_PRESENTATION_MODE);
-        covers || game
+        crate::place::hides_island([r.left, r.top, r.right, r.bottom], win_mon, island_mon.unwrap_or(win_mon), game)
     }
 }
 
@@ -978,6 +983,49 @@ fn endpoint_volume(capture: bool) -> Option<windows::Win32::Media::Audio::Endpoi
         let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
         let device = if capture { enumerator.GetDefaultAudioEndpoint(eCapture, eCommunications) } else { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }.ok()?;
         device.Activate(CLSCTX_ALL, None).ok()
+    }
+}
+
+/// Пиковый уровень устройства вывода по умолчанию (IAudioMeterInformation) — для эквалайзера в пилюле.
+/// Звук не захватывается: Windows отдаёт только пики. Объект живёт в потоке интерфейса
+/// и пересоздаётся раз в 3 секунды, чтобы переживать смену устройства вывода.
+pub struct Meter {
+    meter: windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation,
+    born: std::time::Instant,
+}
+
+impl Meter {
+    pub fn open() -> Option<Self> {
+        use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+        unsafe {
+            let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+            let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
+            let meter = device.Activate(CLSCTX_ALL, None).ok()?;
+            Some(Self { meter, born: std::time::Instant::now() })
+        }
+    }
+
+    /// Пора пересоздать (устройство вывода могли сменить).
+    pub fn stale(&self) -> bool {
+        self.born.elapsed() > std::time::Duration::from_secs(3)
+    }
+
+    /// Общий пик и пики левого/правого каналов, 0…1 (выключенный звук учитывает вызывающий).
+    pub fn peaks(&self) -> Option<(f32, [f32; 2])> {
+        unsafe {
+            let peak = sane_level(self.meter.GetPeakValue().ok()?).unwrap_or(0.0);
+            let n = (self.meter.GetMeteringChannelCount().unwrap_or(0) as usize).min(32);
+            let mut ch = [0.0f32; 32];
+            let lr = if n >= 1 && self.meter.GetChannelsPeakValues(&mut ch[..n]).is_ok() {
+                let l = sane_level(ch[0]).unwrap_or(0.0);
+                let r = if n >= 2 { sane_level(ch[1]).unwrap_or(0.0) } else { l };
+                [l, r]
+            } else {
+                [peak, peak]
+            };
+            Some((peak, lr))
+        }
     }
 }
 
@@ -1852,4 +1900,42 @@ unsafe extern "system" fn end_session_proc(
         let _ = std::panic::catch_unwind(crate::store::write_snapshot);
     }
     DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
+// ---------------------------------------------------------------- место окна острова
+
+/// Монитор, на котором точка (пиксели экрана): [лево, верх, право, низ].
+pub fn monitor_at(x: i32, y: i32) -> [i32; 4] {
+    unsafe {
+        let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            let r = mi.rcMonitor;
+            [r.left, r.top, r.right, r.bottom]
+        } else {
+            [0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)]
+        }
+    }
+}
+
+/// Позиция и размер окна одним вызовом (пиксели экрана), без смены порядка окон и фокуса.
+pub fn place_window(hwnd: isize, r: [i32; 4]) {
+    unsafe {
+        let _ = SetWindowPos(
+            HWND(hwnd as *mut core::ffi::c_void),
+            HWND::default(),
+            r[0],
+            r[1],
+            r[2],
+            r[3],
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        );
+    }
+}
+
+/// Зажата ли левая кнопка мыши (с учётом перестановки кнопок).
+pub fn left_button_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
+    let vk = if unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0 { VK_RBUTTON } else { VK_LBUTTON };
+    unsafe { GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000 != 0 }
 }

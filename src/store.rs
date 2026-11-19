@@ -51,6 +51,9 @@ pub struct Settings {
     /// остров виден на демонстрации и записи экрана (тогда стекло непрозрачное)
     #[serde(default)]
     pub capture_visible: bool,
+    /// куда пользователь перетащил остров: по монитору, последний — первым
+    #[serde(default)]
+    pub spots: Vec<Spot>,
     /// выключить жидкость в пилюле (остров-колбу)
     #[serde(default)]
     pub no_flask: bool,
@@ -60,6 +63,9 @@ pub struct Settings {
     /// показывать остров и поверх полноэкранных игр и видео
     #[serde(default)]
     pub over_games: bool,
+    /// «Не беспокоить» из «Пульта»: уведомления копятся тихо, переживает перезапуск
+    #[serde(default)]
+    pub dnd: bool,
     /// не рисовать в пилюле дождь и снег по погоде
     #[serde(default)]
     pub no_wx: bool,
@@ -113,6 +119,14 @@ pub struct Settings {
     pub fish_key: String,
     #[serde(default)]
     pub fish_voice: String,
+}
+
+/// Место острова на одном мониторе: ключ монитора и начало поля острова в пикселях экрана.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct Spot {
+    pub mon: String,
+    pub x: f32,
+    pub y: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -444,6 +458,16 @@ mod tests {
 #[cfg(test)]
 mod data_tests {
     use super::*;
+
+    #[test]
+    fn dnd_survives_restart() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!s.dnd);
+        let s: Settings = serde_json::from_str(r#"{"dnd":true}"#).unwrap();
+        assert!(s.dnd);
+        let again: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(again.dnd);
+    }
     use std::sync::atomic::Ordering;
 
     /// общий замок: каталог данных и флаги — глобальные

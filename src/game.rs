@@ -164,6 +164,8 @@ pub struct Summary {
 pub struct State {
     /// страница «Игра» на экране — выставляет интерфейс
     pub visible: bool,
+    /// на мониторе острова полноэкранное приложение — копия App::fs_now, выставляет интерфейс
+    pub fs_now: bool,
     /// для снимков: образцы не перезаписываются потоками
     pub frozen: bool,
     /// шлюз (обычно роутер) и индекс адреса интернета в INET_TARGETS
@@ -1358,8 +1360,8 @@ fn watch_loop(state: &Mutex<State>, ctx: &eframe::egui::Context, sessions: bool)
     let mut scanner = Scanner::default();
     let mut last_scan: Option<Instant> = None;
     loop {
-        let (frozen, visible) = match state.lock() {
-            Ok(s) => (s.frozen, s.visible),
+        let (frozen, visible, fullscreen) = match state.lock() {
+            Ok(s) => (s.frozen, s.visible, s.fs_now),
             Err(_) => return,
         };
         if frozen {
@@ -1367,7 +1369,7 @@ fn watch_loop(state: &Mutex<State>, ctx: &eframe::egui::Context, sessions: bool)
             continue;
         }
         if sessions {
-            let fullscreen = crate::sys::fullscreen_app_active();
+            // полноэкранность берём у интерфейса (fs_now — монитор острова): второй раз не опрашиваем Windows
             let (fg_pid, fg_exe) = if fullscreen { foreground() } else { (0, String::new()) };
             let alive = match tracker.pid() {
                 None => true,
