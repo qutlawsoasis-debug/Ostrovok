@@ -7379,6 +7379,8 @@ impl eframe::App for App {
             self.win_last = None;
         }
         self.drag_step(ppp);
+        // отпускание замечено в этом же кадре — щелчок тоже не считается
+        self.drag_eat |= self.drag_eat_until.is_some_and(|t| Instant::now() < t);
         let base = match self.spot {
             Some(s) => {
                 // сдвинутый остров разворачивается от своего места, но за край монитора не вылезает
@@ -8288,7 +8290,7 @@ fn restore_spot(spots: &[store::Spot]) -> Option<[f32; 2]> {
         .filter(|s| s.x.is_finite() && s.y.is_finite() && s.x.abs() < 1e6 && s.y.abs() < 1e6)
         .find(|s| {
             let r: Vec<i32> = s.mon.split(',').filter_map(|v| v.parse().ok()).collect();
-            r.len() == 4 && place::mon_key(sys::monitor_at((r[0] + r[2]) / 2, (r[1] + r[3]) / 2)) == s.mon
+            r.len() == 4 && place::mon_key(sys::monitor_at(((r[0] as i64 + r[2] as i64) / 2) as i32, ((r[1] as i64 + r[3] as i64) / 2) as i32)) == s.mon
         })
         .map(|s| [s.x, s.y])
 }
