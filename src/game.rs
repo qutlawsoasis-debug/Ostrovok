@@ -37,10 +37,12 @@ pub struct Limits {
     pub loss: (f32, f32),
 }
 
-/// ориентир CS2: пинг ≤60 зелёный, ≤100 жёлтый; джиттер ≤5/≤15; потери 0/≤2%
-pub const INET: Limits = Limits { ping: (60, 100), jitter: (5.0, 15.0), loss: (0.0, 2.0) };
+/// ориентир CS2: пинг ≤60 зелёный, ≤100 жёлтый; джиттер ≤5/≤15; потери ≤0,5%/≤2%.
+/// Зелёные потери не нулевые: за несколько часов игры пинг до 1.1.1.1 почти всегда теряется раз-другой —
+/// одна потеря из тысяч не делает игру «терпимой». На странице (60 замеров) одна потеря — уже 1,7%, жёлтый.
+pub const INET: Limits = Limits { ping: (60, 100), jitter: (5.0, 15.0), loss: (0.5, 2.0) };
 /// до роутера всё должно быть почти мгновенно (Wi‑Fi 2–10 мс)
-pub const GATEWAY: Limits = Limits { ping: (10, 30), jitter: (4.0, 12.0), loss: (0.0, 2.0) };
+pub const GATEWAY: Limits = Limits { ping: (10, 30), jitter: (4.0, 12.0), loss: (0.5, 2.0) };
 
 /// Единственные адреса, которые открывают кнопки страницы (кроме проверенного пути программы).
 pub const ALLOWED_URIS: [&str; 5] = ["ms-settings:windowsupdate", "steam://open/downloads", "ms-settings:gaming-gamedvr", "taskmgr", "ms-settings:storagesense"];
@@ -111,6 +113,9 @@ pub struct Culprit {
     pub title: String,
     pub detail: String,
     pub open: Option<Open>,
+    /// мешает прямо сейчас (идёт установка, видна скорость), а не только косвенно
+    /// (служба запущена, флаг в реестре) — только такие помехи можно винить в плохой сети
+    pub sure: bool,
 }
 
 /// Запущенный процесс из тех, за которыми следим.
@@ -325,21 +330,25 @@ pub fn usable_gw(gw: &Stats, inet: &Stats) -> bool {
     !(gw.ok() == 0 && inet.ok() > 0)
 }
 
-/// Где проблема: если до роутера уже не лучше, чем до интернета, — дома; иначе дальше.
+/// Где проблема. Смотрим только то, из-за чего плох интернет (худшие из пинга, джиттера, потерь),
+/// и считаем «дома», если до роутера та же беда хотя бы наполовину: половина пинга, половина джиттера
+/// (и сам джиттер до роутера не в норме) или половина потерь. Уровни роутера и интернета напрямую
+/// не сравниваем: у них разные шкалы — 15 мс до роутера уже «жёлтые», но не объясняют 80 мс до интернета.
+/// Потери до роутера сами по себе не в счёт: роутер отвечает на пинг к себе в последнюю очередь
+/// и теряет его, даже когда чужие пакеты пропускает исправно.
 pub fn place(gw: Option<&Stats>, inet: &Stats) -> Place {
     let li = level_of(inet, &INET);
     if li == Level::Green {
         return Place::Fine;
     }
-    match gw {
-        Some(g) if usable_gw(g, inet) => {
-            if level_of(g, &GATEWAY) >= li {
-                Place::Home
-            } else {
-                Place::Beyond
-            }
-        }
-        _ => Place::Unknown,
+    let Some(g) = gw.filter(|g| usable_gw(g, inet)) else { return Place::Unknown };
+    let ping = ping_level(inet, &INET) == li && g.median as u64 * 2 >= inet.median as u64;
+    let jitter = jitter_level(inet, &INET) == li && jitter_level(g, &GATEWAY) != Level::Green && g.jitter * 2.0 >= inet.jitter;
+    let loss = loss_level(inet, &INET) == li && g.lost > 0 && g.loss_pct() * 2.0 >= inet.loss_pct();
+    if ping || jitter || loss {
+        Place::Home
+    } else {
+        Place::Beyond
     }
 }
 
@@ -579,6 +588,15 @@ impl Tracker {
         }
     }
 
+    /// Наблюдение стояло с `since` дольше, чем можно быть вне игры (компьютер спал): игра кончилась тогда,
+    /// время сна в неё не идёт. Если игра идёт и после сна, следующий тик начнёт новую.
+    pub fn interrupted(&mut self, since: Instant) -> Step {
+        match self.live.take() {
+            Some(t) => Step::Ended { secs: t.away.unwrap_or(since).saturating_duration_since(t.started).as_secs(), exe: t.exe },
+            None => Step::Nothing,
+        }
+    }
+
     /// pid и имя (строчными) отслеживаемой игры.
     pub fn pid(&self) -> Option<(u32, &str)> {
         self.live.as_ref().map(|t| (t.pid, t.exe.as_str()))
@@ -587,6 +605,11 @@ impl Tracker {
     pub fn active(&self) -> bool {
         self.live.is_some()
     }
+}
+
+/// Между тиками наблюдения прошло не меньше AWAY_SECS — компьютер спал (тики идут раз в секунду).
+pub fn stalled(prev: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(prev).as_secs() >= AWAY_SECS
 }
 
 /// Короче трёх минут — не игра (видео, случайное окно на весь экран): без сводки.
@@ -607,9 +630,9 @@ impl Live {
         }
     }
 
-    /// Запомнить, какие помехи были за игру.
+    /// Запомнить, какие помехи были за игру (только явные: косвенные признаки винить не будем).
     pub fn note(&mut self, list: &[Culprit]) {
-        for c in list {
+        for c in list.iter().filter(|c| c.sure) {
             if !self.seen.contains(&c.kind) {
                 self.seen.push(c.kind);
             }
@@ -625,6 +648,12 @@ pub fn hits_network(k: Kind) -> bool {
 /// Кого винить в плохой сети: самую приоритетную из сетевых помех за игру.
 pub fn blame(seen: &[Kind]) -> Option<Kind> {
     seen.iter().copied().filter(|k| hits_network(*k)).min()
+}
+
+/// Кто, похоже, мешает сейчас: самая приоритетная из явных сетевых помех в списке.
+/// Запущенная служба обновлений или флаг Steam в реестре — не улика: служба запускается сама и работает часто.
+pub fn suspect(list: &[Culprit]) -> Option<Kind> {
+    list.iter().filter(|c| c.sure && hits_network(c.kind)).map(|c| c.kind).min()
 }
 
 pub fn kind_glyph(k: Kind) -> &'static str {
@@ -717,10 +746,14 @@ pub fn io_watched(exe: &str) -> bool {
     exe == "onedrive.exe" || exe == "steam.exe" || LAUNCHERS.iter().any(|l| l.0 == exe)
 }
 
-/// Скорость ввода-вывода по двум замерам; None — прошлого нет, промежуток короткий или счётчик сбросился.
+/// Прошлый замер ввода-вывода старше этого (страницу закрывали, игры не было) — скорость по нему не считаем:
+/// среднее за десять минут покажет «качает» про синхронизацию, давно закончившуюся.
+pub const IO_MAX_GAP: f64 = 45.0;
+
+/// Скорость ввода-вывода по двум замерам; None — прошлого нет, промежуток короткий или давний, счётчик сбросился.
 pub fn io_rate(prev: Option<u64>, cur: u64, dt: f64) -> Option<f64> {
     let prev = prev?;
-    (dt >= 0.5 && cur >= prev).then(|| (cur - prev) as f64 / dt)
+    ((0.5..=IO_MAX_GAP).contains(&dt) && cur >= prev).then(|| (cur - prev) as f64 / dt)
 }
 
 /// Что может мешать игре: не больше одного пункта на вид, по приоритету.
@@ -738,7 +771,8 @@ pub fn detect(procs: &[Proc], f: &Flags) -> Vec<Culprit> {
             parts.push("служба wuauserv".into());
         }
         let title = if wu.is_empty() { "Обновления Windows могут качаться" } else { "Устанавливаются обновления Windows" };
-        out.push(Culprit { kind: Kind::Updates, title: title.into(), detail: parts.join(", "), open: Some(Open::Uri("ms-settings:windowsupdate")) });
+        // одна служба — не улика: она запускается по расписанию и работает часто
+        out.push(Culprit { kind: Kind::Updates, title: title.into(), detail: parts.join(", "), open: Some(Open::Uri("ms-settings:windowsupdate")), sure: !wu.is_empty() });
     }
 
     if let Some((exe, name, window, p)) = TORRENTS.iter().find_map(|&(exe, name, window)| find(exe).map(|p| (exe, name, window, p))) {
@@ -749,36 +783,42 @@ pub fn detect(procs: &[Proc], f: &Flags) -> Vec<Culprit> {
             detail: if manager { "загрузки забивают канал" } else { "раздачи забивают канал" }.into(),
             // у службы без окна открывать нечего
             open: if window { p.path.clone().map(Open::Exe) } else { None },
+            sure: true,
         });
     }
 
     if find("steam.exe").is_some() {
         let rate = rate_of("steam.exe").filter(|r| *r >= STEAM_IO);
+        // флаг «обновляется» в реестре Steam залипает: без скорости это только очередь
+        let (title, detail) = match rate {
+            Some(r) => ("Steam качает обновление", fmt_rate(r)),
+            None => ("Steam: обновление в очереди", "может начать качать прямо в игре".into()),
+        };
         if f.steam_updating || rate.is_some() {
-            out.push(Culprit { kind: Kind::Steam, title: "Steam качает обновление".into(), detail: rate.map_or_else(|| "обновление в очереди".into(), fmt_rate), open: Some(Open::Uri("steam://open/downloads")) });
+            out.push(Culprit { kind: Kind::Steam, title: title.into(), detail, open: Some(Open::Uri("steam://open/downloads")), sure: rate.is_some() });
         }
     }
 
     if let Some((name, rate, p)) = LAUNCHERS.iter().find_map(|&(exe, name)| Some((name, rate_of(exe).filter(|r| *r >= LAUNCHER_IO)?, find(exe)?))) {
-        out.push(Culprit { kind: Kind::Launcher, title: format!("{name} качает"), detail: fmt_rate(rate), open: p.path.clone().map(Open::Exe) });
+        out.push(Culprit { kind: Kind::Launcher, title: format!("{name} качает"), detail: fmt_rate(rate), open: p.path.clone().map(Open::Exe), sure: true });
     }
 
     if let Some(rate) = rate_of("onedrive.exe").filter(|r| *r >= ONEDRIVE_IO) {
-        out.push(Culprit { kind: Kind::OneDrive, title: "OneDrive синхронизирует".into(), detail: fmt_rate(rate), open: find("onedrive.exe").and_then(|p| p.path.clone()).map(Open::Exe) });
+        out.push(Culprit { kind: Kind::OneDrive, title: "OneDrive синхронизирует".into(), detail: fmt_rate(rate), open: find("onedrive.exe").and_then(|p| p.path.clone()).map(Open::Exe), sure: true });
     }
 
     if f.clips_module && any_of(DISCORD).next().is_some() {
         let path = any_of(DISCORD).find_map(|p| p.path.clone());
-        out.push(Culprit { kind: Kind::DiscordClips, title: "Discord: запись клипов".into(), detail: "модуль клипов установлен — проверьте, выключена ли запись".into(), open: path.map(Open::Exe) });
+        out.push(Culprit { kind: Kind::DiscordClips, title: "Discord: запись клипов".into(), detail: "модуль клипов установлен — проверьте, выключена ли запись".into(), open: path.map(Open::Exe), sure: false });
     }
 
     if any_of(NVIDIA).next().is_some() {
         let app = any_of(NVIDIA_APPS).find_map(|p| p.path.clone());
-        out.push(Culprit { kind: Kind::NvidiaReplay, title: "NVIDIA: оверлей и мгновенный повтор".into(), detail: "оверлей запущен — проверьте, выключен ли повтор".into(), open: app.map(Open::Exe) });
+        out.push(Culprit { kind: Kind::NvidiaReplay, title: "NVIDIA: оверлей и мгновенный повтор".into(), detail: "оверлей запущен — проверьте, выключен ли повтор".into(), open: app.map(Open::Exe), sure: false });
     }
 
     if f.xbox_bg {
-        out.push(Culprit { kind: Kind::XboxDvr, title: "Xbox Game Bar пишет игру в фоне".into(), detail: "запись последних минут включена".into(), open: Some(Open::Uri("ms-settings:gaming-gamedvr")) });
+        out.push(Culprit { kind: Kind::XboxDvr, title: "Xbox Game Bar пишет игру в фоне".into(), detail: "запись последних минут включена".into(), open: Some(Open::Uri("ms-settings:gaming-gamedvr")), sure: true });
     }
 
     let mut tools: Vec<String> = Vec::new();
@@ -790,7 +830,7 @@ pub fn detect(procs: &[Proc], f: &Flags) -> Vec<Culprit> {
     }
     if !tools.is_empty() {
         tools.truncate(3);
-        out.push(Culprit { kind: Kind::Build, title: "Идёт сборка в фоне".into(), detail: tools.join(", "), open: Some(Open::Uri("taskmgr")) });
+        out.push(Culprit { kind: Kind::Build, title: "Идёт сборка в фоне".into(), detail: tools.join(", "), open: Some(Open::Uri("taskmgr")), sure: true });
     }
 
     out.sort_by_key(|c| c.kind);
@@ -961,6 +1001,7 @@ pub fn fill_demo(s: &mut State) {
         Proc { pid: 2, exe: "steam.exe".into(), path: None, io_rate: None },
         Proc { pid: 3, exe: "discord.exe".into(), path: Some(r"C:\Users\user\AppData\Local\Discord\app-1.0.9175\Discord.exe".into()), io_rate: None },
     ];
+    // Steam в образце — с флагом в реестре и без скорости: строка «обновление в очереди»
     s.culprits = detect(&procs, &Flags { wu_service: true, steam_updating: true, clips_module: true, xbox_bg: false });
     s.scanned = true;
     s.last = Some(demo_summary());
@@ -1162,22 +1203,32 @@ fn xbox_bg_record() -> bool {
     xbox_bg(get(r"System\GameConfigStore", "GameDVR_Enabled"), get(DVR, "AppCaptureEnabled"), get(DVR, "HistoricalCaptureEnabled"))
 }
 
-/// Процесс переднего окна: pid и имя файла (регистр как есть). Своё окно — (0, "").
-fn foreground() -> (u32, String) {
+/// pid процесса переднего окна. Своё окно или окна нет — 0.
+fn foreground_pid() -> u32 {
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
     let mut pid = 0u32;
     unsafe {
         let fg = GetForegroundWindow();
         if fg.0.is_null() {
-            return (0, String::new());
+            return 0;
         }
         GetWindowThreadProcessId(fg, Some(&mut pid));
     }
-    if pid == 0 || pid == std::process::id() {
-        return (0, String::new());
+    if pid == std::process::id() {
+        0
+    } else {
+        pid
     }
-    let name = open_proc(pid).and_then(|h| path_of(&h)).and_then(|p| p.rsplit('\\').next().map(str::to_string)).unwrap_or_default();
-    (pid, name)
+}
+
+/// Имя файла процесса (регистр как есть): из полного пути, а если процесс закрыт от чтения (античит) —
+/// из списка процессов, где имя видно всегда. Не нашлось — "".
+fn exe_name(pid: u32) -> String {
+    open_proc(pid)
+        .and_then(|h| path_of(&h))
+        .and_then(|p| p.rsplit('\\').next().map(str::to_string))
+        .or_else(|| snapshot().into_iter().find(|(p, _)| *p == pid).map(|(_, n)| n))
+        .unwrap_or_default()
 }
 
 /// Фоновые потоки «Игры» уступают процессор игре. Время ответа меряет ядро, приоритет на него не влияет.
@@ -1294,6 +1345,10 @@ fn ping_loop(state: &Mutex<State>, ctx: &eframe::egui::Context) {
             gw = gateway();
             gw_at = Some(t0);
             gw_fails = 0;
+            if gw != old_gw {
+                // сеть сменилась: в новой 1.1.1.1 может и не отвечать — адрес интернета выбираем заново
+                (target, ever_ok, fails, tried_all) = (0, false, 0, false);
+            }
         }
         let g = gw.map(|ip| ic.echo(ip, GW_TIMEOUT_MS));
         gw_fails = if g == Some(None) { gw_fails + 1 } else { 0 };
@@ -1359,6 +1414,8 @@ fn watch_loop(state: &Mutex<State>, ctx: &eframe::egui::Context, sessions: bool)
     let mut game: Option<Owned> = None;
     let mut scanner = Scanner::default();
     let mut last_scan: Option<Instant> = None;
+    // прошлый тик наблюдения: большой разрыв — компьютер спал
+    let mut prev_tick: Option<Instant> = None;
     loop {
         let (frozen, visible, fullscreen) = match state.lock() {
             Ok(s) => (s.frozen, s.visible, s.fs_now),
@@ -1370,17 +1427,24 @@ fn watch_loop(state: &Mutex<State>, ctx: &eframe::egui::Context, sessions: bool)
         }
         if sessions {
             // полноэкранность берём у интерфейса (fs_now — монитор острова): второй раз не опрашиваем Windows
-            let (fg_pid, fg_exe) = if fullscreen { foreground() } else { (0, String::new()) };
+            let fg_pid = if fullscreen { foreground_pid() } else { 0 };
+            // имя нужно только чтобы начать игру: в игре сверяем лишь pid
+            let fg_exe = if fg_pid != 0 && !tracker.active() { exe_name(fg_pid) } else { String::new() };
             let alive = match tracker.pid() {
                 None => true,
                 Some((pid, exe)) => match &game {
                     Some(h) => !exited(h),
-                    // античит не дал открыть процесс — смотрим, есть ли он в списке
-                    None => snapshot().iter().any(|(p, n)| *p == pid && n.to_lowercase() == exe),
+                    // античит не дал открыть процесс — смотрим, есть ли он в списке (имя не узнали — хватит pid)
+                    None => snapshot().iter().any(|(p, n)| *p == pid && (exe.is_empty() || n.to_lowercase() == exe)),
                 },
             };
             let now = Instant::now();
-            match tracker.tick(now, &Seen { fullscreen, fg_pid, fg_exe: &fg_exe, alive }) {
+            let step = match prev_tick {
+                Some(p) if stalled(p, now) => tracker.interrupted(p),
+                _ => tracker.tick(now, &Seen { fullscreen, fg_pid, fg_exe: &fg_exe, alive }),
+            };
+            prev_tick = Some(now);
+            match step {
                 Step::Started { pid, exe } => {
                     game = open_proc(pid);
                     // осмотреть сразу: что мешает, видно с первой минуты
@@ -1539,6 +1603,8 @@ mod tests {
         assert_eq!([jl(5.0), jl(5.1), jl(15.0), jl(15.1)], [Green, Yellow, Yellow, Red]);
         let ll = |lost| loss_level(&st(20, 0.0, 1000, lost), &INET);
         assert_eq!([ll(0), ll(17), ll(20), ll(21)], [Green, Yellow, Yellow, Red]);
+        assert_eq!([ll(5), ll(6)], [Green, Yellow], "до 0,5% потерь — ещё зелёный");
+        assert_eq!(loss_level(&st(20, 0.0, 60, 1), &INET), Yellow, "на странице одна потеря из 60 — уже жёлтый");
         // уровень — худший из трёх
         assert_eq!(level_of(&st(20, 1.0, 1000, 0), &INET), Green);
         assert_eq!(level_of(&st(80, 1.0, 1000, 0), &INET), Yellow);
@@ -1566,12 +1632,38 @@ mod tests {
         let (gi, yi, ri) = (st(20, 1.0, 60, 0), st(80, 1.0, 60, 0), st(150, 1.0, 60, 0));
         let (gg, yg, rg) = (st(2, 1.0, 60, 0), st(20, 1.0, 60, 0), st(50, 1.0, 60, 0));
         assert_eq!(place(Some(&gg), &yi), Place::Beyond);
-        assert_eq!(place(Some(&yg), &yi), Place::Home);
+        assert_eq!(place(Some(&yg), &yi), Place::Beyond, "20 из 80 мс до роутера: основная задержка дальше");
+        assert_eq!(place(Some(&st(45, 1.0, 60, 0)), &yi), Place::Home, "больше половины пинга — уже до роутера");
         assert_eq!(place(Some(&yg), &ri), Place::Beyond);
-        assert_eq!(place(Some(&rg), &ri), Place::Home);
+        assert_eq!(place(Some(&rg), &ri), Place::Beyond, "50 из 150 мс — больше за роутером");
+        assert_eq!(place(Some(&st(90, 1.0, 60, 0)), &ri), Place::Home);
         assert_eq!(place(Some(&rg), &gi), Place::Fine);
         assert_eq!(place(None, &ri), Place::Unknown);
         assert_eq!(place(None, &gi), Place::Fine);
+        // ни роутер, ни интернет не отвечают — дома (Wi‑Fi отвалился)
+        let dead = Stats { sent: 60, lost: 60, ..Default::default() };
+        assert_eq!(place(Some(&dead), &dead), Place::Home);
+    }
+
+    #[test]
+    fn router_own_losses_do_not_mean_home() {
+        // роутер отвечает на пинг к себе в последнюю очередь: его потери без потерь до интернета ничего не значат
+        let gw = st(2, 1.0, 100, 10);
+        assert_eq!(place(Some(&gw), &st(30, 9.0, 100, 0)), Place::Beyond, "интернет плох джиттером, роутер только теряет пинг к себе");
+        assert_eq!(place(Some(&gw), &st(80, 1.0, 100, 0)), Place::Beyond);
+        // потери и там и там — дома (Wi‑Fi)
+        assert_eq!(place(Some(&st(3, 1.0, 100, 4)), &st(30, 1.0, 100, 5)), Place::Home);
+        // до интернета теряется намного больше, чем до роутера, — дальше
+        assert_eq!(place(Some(&st(3, 1.0, 100, 1)), &st(30, 1.0, 100, 8)), Place::Beyond);
+    }
+
+    #[test]
+    fn wifi_jitter_is_home() {
+        assert_eq!(place(Some(&st(6, 9.0, 60, 0)), &st(30, 12.0, 60, 0)), Place::Home);
+        assert_eq!(place(Some(&st(2, 5.0, 60, 0)), &st(30, 14.0, 60, 0)), Place::Beyond, "дома скачет втрое меньше");
+        assert_eq!(place(Some(&st(2, 3.0, 60, 0)), &st(30, 5.5, 60, 0)), Place::Beyond, "до роутера джиттер в норме");
+        // плох прежде всего пинг (далёкий сервер), а джиттер дома лишь «жёлтый» — винить дом не за что
+        assert_eq!(place(Some(&st(6, 9.0, 60, 0)), &st(150, 12.0, 60, 0)), Place::Beyond);
     }
 
     #[test]
@@ -1817,6 +1909,28 @@ mod tests {
     }
 
     #[test]
+    fn sleep_interrupts_session() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        assert!(!stalled(at(10), at(11)));
+        assert!(!stalled(at(10), at(129)));
+        assert!(stalled(at(10), at(130)));
+        assert!(!stalled(at(20), at(10)), "часы назад — не сон");
+        let mut tr = Tracker::default();
+        assert_eq!(tr.interrupted(at(0)), Step::Nothing, "игры нет — нечего обрывать");
+        tr.tick(at(0), &seen(true, 42, "cs2.exe", true));
+        tr.tick(at(600), &seen(true, 42, "cs2.exe", true));
+        // уснул посреди игры: сон в длительность не идёт
+        assert_eq!(tr.interrupted(at(600)), Step::Ended { exe: "cs2.exe".into(), secs: 600 });
+        assert!(!tr.active());
+        // после сна игра на экране — новая сессия
+        assert!(matches!(tr.tick(at(9000), &seen(true, 42, "cs2.exe", true)), Step::Started { .. }));
+        // уснул, уже выйдя из игры: считаем до ухода
+        tr.tick(at(9300), &seen(false, 0, "", true));
+        assert_eq!(tr.interrupted(at(9310)), Step::Ended { exe: "cs2.exe".into(), secs: 300 });
+    }
+
+    #[test]
     fn unknown_exe_counts_as_game() {
         let mut tr = Tracker::default();
         assert_eq!(tr.tick(Instant::now(), &seen(true, 5, "", true)), Step::Started { pid: 5, exe: String::new() });
@@ -1837,10 +1951,12 @@ mod tests {
         l.push(None, None);
         assert_eq!(l.inet, VecDeque::from(vec![Some(20), None]));
         assert_eq!(l.gw, VecDeque::from(vec![Some(2)]), "шлюз неизвестен — замер роутера не пишем");
-        let c = |kind| Culprit { kind, title: String::new(), detail: String::new(), open: None };
+        let c = |kind| Culprit { kind, title: String::new(), detail: String::new(), open: None, sure: true };
         l.note(&[c(Kind::Build), c(Kind::Updates)]);
         l.note(&[c(Kind::Updates)]);
         assert_eq!(l.seen, vec![Kind::Build, Kind::Updates]);
+        l.note(&[Culprit { sure: false, ..c(Kind::Steam) }]);
+        assert_eq!(l.seen, vec![Kind::Build, Kind::Updates], "косвенный признак за игру не копим");
         for _ in 0..MAX_SESSION_SAMPLES + 10 {
             l.push(Some(1), None);
         }
@@ -1853,6 +1969,9 @@ mod tests {
         assert_eq!(io_rate(Some(0), 5, 0.2), None);
         assert_eq!(io_rate(Some(10), 5, 2.0), None);
         assert_eq!(io_rate(Some(0), 2_000_000, 2.0), Some(1e6));
+        assert_eq!(io_rate(Some(0), 40_000_000, 20.0), Some(2e6), "раз в 20 с в игре — считаем");
+        assert_eq!(io_rate(Some(0), 600_000_000, 600.0), None, "замеру десять минут — среднее ничего не говорит");
+        assert_eq!(io_rate(Some(0), 5, f64::NAN), None);
     }
 
     #[test]
@@ -1881,9 +2000,11 @@ mod tests {
         assert_eq!(c[0].title, "Устанавливаются обновления Windows");
         assert!(c[0].detail.contains("TiWorker"), "{}", c[0].detail);
         assert_eq!(c[0].open, Some(Open::Uri("ms-settings:windowsupdate")));
+        assert!(c[0].sure, "идёт установка — явная помеха");
         let c = detect(&[], &Flags { wu_service: true, ..Default::default() });
         assert_eq!(c[0].title, "Обновления Windows могут качаться");
         assert!(c[0].detail.contains("wuauserv"));
+        assert!(!c[0].sure, "одна служба — только косвенный признак");
         // и процесс, и служба — один пункт
         let c = detect(&[p("tiworker.exe"), p("tiworker.exe")], &Flags { wu_service: true, ..Default::default() });
         assert_eq!(c.len(), 1);
@@ -1921,11 +2042,14 @@ mod tests {
         let flag = Flags { steam_updating: true, ..Default::default() };
         assert!(detect(&[], &flag).is_empty(), "флаг без steam.exe — нет");
         let c = detect(&[pio("steam.exe", None)], &flag);
-        assert_eq!(c[0].title, "Steam качает обновление");
-        assert_eq!(c[0].detail, "обновление в очереди");
+        assert_eq!(c[0].title, "Steam: обновление в очереди", "флаг без скорости — не «качает»");
+        assert_eq!(c[0].detail, "может начать качать прямо в игре");
         assert_eq!(c[0].open, Some(Open::Uri("steam://open/downloads")));
+        assert!(!c[0].sure);
         let c = detect(&[pio("steam.exe", Some(3.0 * 1_048_576.0))], &Flags::default());
+        assert_eq!(c[0].title, "Steam качает обновление");
         assert_eq!(c[0].detail, "3,0 МБ/с");
+        assert!(c[0].sure);
         assert!(detect(&[pio("steam.exe", Some(500_000.0))], &Flags::default()).is_empty());
     }
 
@@ -2038,6 +2162,44 @@ mod tests {
         assert_eq!(blame(&[Kind::Build, Kind::DiscordClips]), None);
         assert_eq!(blame(&[]), None);
         assert!(hits_network(Kind::Torrent) && !hits_network(Kind::XboxDvr));
+    }
+
+    #[test]
+    fn service_alone_is_not_blamed() {
+        let wu = Flags { wu_service: true, ..Default::default() };
+        let list = detect(&[], &wu);
+        assert_eq!(suspect(&list), None, "служба запускается сама и работает часто — не повод винить обновления");
+        let mut l = Live::new("cs2.exe", Instant::now());
+        l.note(&list);
+        for i in 0..60 {
+            // пинг скачет 20 ↔ 40 мс: джиттер 20, сеть плохая
+            l.push(Some(if i % 2 == 0 { 20 } else { 40 }), Some(Some(2)));
+        }
+        let s = summarize(&l, 600, "22:00".into());
+        assert_eq!(s.level, Some(Red));
+        assert_eq!(s.blame, None);
+        assert!(!summary_toast(&s).1.contains("Windows Update"), "{}", summary_toast(&s).1);
+        assert_eq!(summary_toast(&s).1, "в интернете: провайдер или канал забит");
+        // процесс установки — уже улика
+        let list = detect(&[p("tiworker.exe")], &wu);
+        assert_eq!(suspect(&list), Some(Kind::Updates));
+        // Steam только с флагом в реестре — тоже не улика, со скоростью — улика
+        let flag = Flags { steam_updating: true, ..Default::default() };
+        assert_eq!(suspect(&detect(&[pio("steam.exe", None)], &flag)), None);
+        assert_eq!(suspect(&detect(&[pio("steam.exe", Some(5e6))], &flag)), Some(Kind::Steam));
+        // не сетевые помехи на сеть не наговаривают
+        assert_eq!(suspect(&detect(&[p("cargo.exe")], &Flags { xbox_bg: true, ..Default::default() })), None);
+    }
+
+    #[test]
+    fn rare_loss_in_long_game_is_fine() {
+        let mut l = Live::new("cs2.exe", Instant::now());
+        for i in 0..3600 {
+            l.push(if i == 1800 { None } else { Some(22) }, Some(Some(2)));
+        }
+        let s = summarize(&l, 3600, "22:00".into());
+        assert_eq!(s.level, Some(Green), "одна потеря за час игры — сеть в порядке");
+        assert_eq!(summary_toast(&s).0, "Игра: пинг 22 мс, джиттер 0, потери <0,1%");
     }
 
     #[test]
@@ -2156,7 +2318,8 @@ mod tests {
 
     #[test]
     fn summary_toast_fits_limits() {
-        let inets = [st(1500, 999.0, 100, 100), st(1500, 999.0, 100, 0), st(60, 5.0, 100, 0), st(9999, 0.0, 14400, 1), st(30, 99.5, 100, 50), Stats { sent: 10, lost: 10, ..Default::default() }];
+        // самые длинные зелёные: двузначный пинг и потери «<0,1%» или «0,5%»
+        let inets = [st(1500, 999.0, 100, 100), st(1500, 999.0, 100, 0), st(60, 5.0, 100, 0), st(60, 4.9, 100_000, 1), st(60, 5.0, 1000, 5), st(9999, 0.0, 14400, 1), st(30, 99.5, 100, 50), Stats { sent: 10, lost: 10, ..Default::default() }];
         let blames = [None, Some(Kind::Updates), Some(Kind::Torrent), Some(Kind::Steam), Some(Kind::Launcher), Some(Kind::OneDrive)];
         for inet in inets {
             for worst in [None, Some(1500), Some(99_999)] {

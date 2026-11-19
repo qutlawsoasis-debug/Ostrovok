@@ -2031,9 +2031,10 @@ impl App {
     }
 
     /// Щелчок по пилюле: панель, а если висит плашка со своей страницей — сразу на неё.
+    /// Маленькая всплывашка (громкость, шкала обновления) плашку не заменяет: её ставят и в обход show_toast.
     fn open_panel_from_pill(&mut self) {
         self.mode = Mode::Panel;
-        if let Some(t) = self.toast.as_ref().and(self.toast_tab) {
+        if let Some(t) = self.toast.as_ref().filter(|t| !t.compact).and(self.toast_tab) {
             self.tab = t;
             self.toast = None;
             self.toast_tab = None;
@@ -2500,7 +2501,8 @@ impl App {
         // «Игра»: страница на экране — замер чаще; идёт игра — остров молчит; игра кончилась — сводка
         let (quiet, done) = {
             let mut s = lock(&self.game);
-            s.visible = self.mode == Mode::Panel && self.tab == Tab::Game;
+            // спрятанный остров (полноэкранное приложение) страницу не показывает: ни частого замера, ни перерисовок
+            s.visible = self.mode == Mode::Panel && self.tab == Tab::Game && !self.hidden;
             // поток наблюдения ловит игру по тому же флагу, что прячет остров (монитор острова)
             s.fs_now = self.fs_now;
             // полноэкранное приложение или идёт игра — молчим; сводка подождёт, а не пропадёт молча
@@ -2642,8 +2644,9 @@ impl App {
         } else if !self.icon_pending.is_empty() {
             ctx.request_repaint_after(ICON_STALL_LOCAL);
         }
-        // в игре Alt+Пробел не раскрывает поиск (флаг всё равно сбрасывается: swap стоит первым)
-        if self.hotkey.swap(false, Ordering::Relaxed) && !self.game_quiet {
+        // поверх полноэкранной игры Alt+Пробел не раскрывает поиск и не забирает фокус (флаг всё равно
+        // сбрасывается: swap стоит первым); вышли из игры на рабочий стол — поиск работает, хоть сессия и не кончилась
+        if self.hotkey.swap(false, Ordering::Relaxed) && !self.fs_now {
             self.toggle_palette(ctx);
         }
         if self.toast.as_ref().is_some_and(|t| now >= t.until) {
@@ -2653,7 +2656,8 @@ impl App {
         // напоминание, сработавшее во время игры, — когда игра кончилась и остров свободен
         if !self.game_quiet && self.toast.is_none() && self.mode == Mode::Pill {
             if let Some(t) = self.held_reminder.take() {
-                self.show_toast("\u{E823}", [0xFF, 0x6B, 0x61], "Напоминание во время игры", &t, 12, false);
+                // «отложенное»: молчали не только в игре, но и над любым полноэкранным окном
+                self.show_toast("\u{E823}", [0xFF, 0x6B, 0x61], "Отложенное напоминание", &t, 12, false);
             }
         }
         // новый трек — живое уведомление «сейчас играет»
@@ -4968,7 +4972,7 @@ impl App {
         };
         let target_ip = game::INET_TARGETS[target];
         probe(card(0), "inet", "\u{E774}  Интернет", target_ip.to_string(), &inet_v, inet.as_ref(), &game::INET, icmp_failed.then_some("пинг недоступен"));
-        ui.interact(card(0), id.with("game-inet"), Sense::hover()).on_hover_text(format!("Пинг до {target_ip} раз в секунду — так быстро отвечает интернет. Для CS2 хорошо до 60 мс"));
+        ui.interact(card(0), id.with("game-inet"), Sense::hover()).on_hover_text(format!("Пинг до {target_ip} раз в секунду — так быстро отвечает интернет. Для CS2 хорошо до 60 мс.\nДжиттер — насколько пинг скачет от замера к замеру: больше 5 мс уже заметно в стрельбе"));
         let gw_empty = if icmp_failed {
             Some("пинг недоступен")
         } else if gw_ip.is_none() && !inet_v.is_empty() {
@@ -4993,9 +4997,10 @@ impl App {
                 (game::level_word(None), "меряю пинг раз в секунду".to_string(), "до роутера и до интернета".to_string())
             } else {
                 let (a, b) = game::place_lines(place);
-                // плохо за роутером, и запущено то, что качает, — скорее всего, дело в нём
-                let b = match culprits.iter().find(|c| game::hits_network(c.kind)) {
-                    Some(c) if place == game::Place::Beyond => format!("похоже, мешает {}", game::kind_short(c.kind)),
+                // плохо за роутером, и видно, что что-то качает, — скорее всего, дело в нём
+                // (одна запущенная служба обновлений или флаг Steam — не улика)
+                let b = match game::suspect(&culprits) {
+                    Some(k) if place == game::Place::Beyond => format!("похоже, мешает {}", game::kind_short(k)),
                     _ => b.to_string(),
                 };
                 (game::level_word(level), a.to_string(), b)
@@ -8646,8 +8651,9 @@ impl eframe::App for App {
 
         // частота перерисовки: быстро только когда есть на что смотреть
         let playing = self.media_now.as_ref().is_some_and(|m| m.playing);
-        // идёт игра, остров висит пилюлей без плашки: редкие кадры, видеокарта — игре
-        let game_calm = self.game_quiet && !self.hidden && self.mode == Mode::Pill && self.toast.is_none() && self.shot.is_none() && (target - self.size).length() < 0.4 && self.vel.length() < 3.0;
+        // остров висит пилюлей без плашки поверх полноэкранной игры: редкие кадры, видеокарта — игре
+        // (вышли из игры на рабочий стол — обычная частота, хоть сессия ещё не кончилась)
+        let game_calm = self.fs_now && !self.hidden && self.mode == Mode::Pill && self.toast.is_none() && self.shot.is_none() && (target - self.size).length() < 0.4 && self.vel.length() < 3.0;
         if game_calm {
             ctx.request_repaint_after(Duration::from_millis(250));
         } else if self.hidden && self.shot.is_none() && !animating {
