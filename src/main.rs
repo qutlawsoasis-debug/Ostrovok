@@ -1210,6 +1210,9 @@ struct App {
     drag: Option<([f32; 2], [f32; 2], bool)>,
     /// перетаскивание только что кончилось — щелчок в этом кадре не считается
     drag_eat: bool,
+    drag_eat_until: Option<Instant>,
+    /// масштаб, при котором ставили окно
+    win_ppp: f32,
 
     // встроенный чат ИИ: веб-окно внутри панели
     web: Option<wry::WebView>,
@@ -1528,6 +1531,8 @@ impl App {
             spot: spot0,
             drag: None,
             drag_eat: false,
+            drag_eat_until: None,
+            win_ppp: 0.0,
             web: None,
             web_ctx: None,
             web_slot: None,
@@ -7366,7 +7371,13 @@ impl eframe::App for App {
         // Остров живёт в координатах «поля» шириной WIN_W вверху основного экрана,
         // а настоящее окно подгоняется под его размер: системное размытие ложится только под остров.
         let ppp = ctx.pixels_per_point();
-        self.drag_eat = false;
+        // щелчок, который egui увидит чуть позже отпускания, тоже гасим
+        self.drag_eat = self.drag_eat_until.is_some_and(|t| Instant::now() < t);
+        if self.win_ppp != ppp {
+            // сменился масштаб (другой монитор): winit сам менял окно, ставим заново
+            self.win_ppp = ppp;
+            self.win_last = None;
+        }
         self.drag_step(ppp);
         let base = match self.spot {
             Some(s) => {
@@ -7944,7 +7955,8 @@ impl eframe::App for App {
                     let g = ui.interact(grip, Id::new("grip"), Sense::click());
                     let col = if g.hovered() || self.drag.is_some() { Color32::from_white_alpha(120) } else { Color32::from_white_alpha(46) };
                     ui.painter().rect_filled(Rect::from_center_size(grip.center(), vec2(36.0, 4.0)), 2.0, col);
-                    if g.double_clicked() {
+                    if self.drag_eat {
+                    } else if g.double_clicked() {
                         self.spot_reset();
                     } else if g.is_pointer_button_down_on() {
                         self.drag_begin(ppp);
@@ -8270,14 +8282,22 @@ fn base_x(ppp: f32) -> f32 {
 
 /// Сохранённое место острова: первое, чей монитор и сейчас на месте.
 fn restore_spot(spots: &[store::Spot]) -> Option<[f32; 2]> {
-    spots.iter().find(|s| place::mon_key(sys::monitor_at(s.x as i32 + 40, s.y as i32 + 10)) == s.mon).map(|s| [s.x, s.y])
+    // монитор ищем по середине его же сохранённого прямоугольника; мусорные числа пропускаем
+    spots
+        .iter()
+        .filter(|s| s.x.is_finite() && s.y.is_finite() && s.x.abs() < 1e6 && s.y.abs() < 1e6)
+        .find(|s| {
+            let r: Vec<i32> = s.mon.split(',').filter_map(|v| v.parse().ok()).collect();
+            r.len() == 4 && place::mon_key(sys::monitor_at((r[0] + r[2]) / 2, (r[1] + r[3]) / 2)) == s.mon
+        })
+        .map(|s| [s.x, s.y])
 }
 
 impl App {
     /// Нажали на пустое место острова или на ручку: запоминаем, откуда пошли.
     fn drag_begin(&mut self, ppp: f32) {
         // спрятанный остров (полноэкранная игра) и снимок экрана не тянутся: клики уходят игре
-        if self.drag.is_some() || test_mode() || self.hidden || self.shot.is_some() {
+        if self.drag.is_some() || test_mode() || self.hidden || self.shot.is_some() || sys::fullscreen_app_active() {
             return;
         }
         let Some((x, y)) = sys::cursor() else { return };
@@ -8293,7 +8313,11 @@ impl App {
             self.drag = None;
             return;
         }
-        let Some((x, y)) = sys::cursor() else { return };
+        let (Some((x, y)), true) = (sys::cursor(), sys::left_button_down() || self.drag.is_some_and(|d| d.2)) else {
+            // курсор недоступен или кнопку отпустили, не сдвинув, — просто бросаем
+            self.drag = None;
+            return;
+        };
         let cur = [x as f32, y as f32];
         if !moved && place::drag_started(press, cur, ppp) {
             moved = true;
@@ -8302,9 +8326,11 @@ impl App {
         if !sys::left_button_down() {
             self.drag = None;
             if moved {
-                self.drag_eat = true;
+                self.drag_eat_until = Some(Instant::now() + Duration::from_millis(250));
                 let mon = sys::monitor_at(x, y);
                 let at = place::snap(at, WIN_W, ppp, mon);
+                let pill = Rect::from_center_size(pos2(WIN_W / 2.0, TOP + PILL_H / 2.0), vec2(PILL_H * 4.0, PILL_H));
+                let at = place::clamp_into(at, pill, ppp, mon);
                 if at == place::home(WIN_W, ppp, mon) && mon == sys::monitor_at(0, 0) {
                     self.spot_reset();
                 } else {
