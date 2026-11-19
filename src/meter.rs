@@ -12,6 +12,13 @@ pub const STEP: f32 = 4.0;
 pub const EQ_W: f32 = STEP * (N as f32 - 1.0) + BAR_W;
 /// Опрос уровня не чаще 30 раз в секунду.
 pub const POLL: Duration = Duration::from_millis(33);
+/// Пока тихо — проверка «не заиграло ли что-нибудь» раз в полсекунды.
+pub const PROBE: Duration = Duration::from_millis(500);
+
+/// Слышно ли что-то громче шороха (около −56 дБ).
+pub fn heard(peak: f32) -> bool {
+    peak.is_finite() && peak > 0.0015
+}
 
 /// Пик 0…1 (линейный) → высота 0…1: от −48 дБ до 0 дБ, тишина и мусор — ноль.
 pub fn level(peak: f32) -> f32 {
@@ -48,6 +55,15 @@ pub fn spread(level: f32, lr: [f32; 2], t: f32) -> [f32; N] {
         *v = if x.is_finite() { x.clamp(0.0, 1.0) } else { 0.0 };
     }
     out
+}
+
+/// «Удар» для свечения по пикам: насколько уровень выше своего среднего (у громкой музыки
+/// сам пик почти всегда у потолка, а пульс виден в отклонениях). Тишина — ноль.
+pub fn beat(level: f32, avg: f32) -> f32 {
+    if !level.is_finite() || !avg.is_finite() || level <= 0.0 {
+        return 0.0;
+    }
+    ((level - avg) * 4.0 + 0.3).clamp(0.0, 1.0)
 }
 
 /// Левый край столбика `i` от начала эквалайзера.
@@ -149,6 +165,24 @@ mod tests {
         assert!(!should_poll(false, true, false, ok));
         assert!(!should_poll(true, false, false, ok));
         assert!(!should_poll(true, true, true, ok));
+    }
+
+    #[test]
+    fn beat_follows_peaks_above_average() {
+        assert_eq!(beat(0.0, 0.5), 0.0);
+        assert_eq!(beat(f32::NAN, 0.5), 0.0);
+        assert!(beat(0.95, 0.85) > beat(0.85, 0.85));
+        assert!(beat(0.70, 0.85) < beat(0.85, 0.85));
+        assert_eq!(beat(1.0, 0.0), 1.0);
+    }
+
+    #[test]
+    fn heard_threshold() {
+        assert!(!heard(0.0));
+        assert!(!heard(0.001));
+        assert!(!heard(f32::NAN));
+        assert!(heard(0.01));
+        assert!(PROBE > POLL);
     }
 
     #[test]

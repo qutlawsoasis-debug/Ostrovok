@@ -169,8 +169,6 @@ pub struct Summary {
 pub struct State {
     /// страница «Игра» на экране — выставляет интерфейс
     pub visible: bool,
-    /// на мониторе острова полноэкранное приложение — копия App::fs_now, выставляет интерфейс
-    pub fs_now: bool,
     /// для снимков: образцы не перезаписываются потоками
     pub frozen: bool,
     /// шлюз (обычно роутер) и индекс адреса интернета в INET_TARGETS
@@ -1451,8 +1449,8 @@ fn watch_loop(state: &Mutex<State>, ctx: &eframe::egui::Context, sessions: bool)
     // прошлый тик наблюдения: большой разрыв — компьютер спал
     let mut prev_tick: Option<Instant> = None;
     loop {
-        let (frozen, visible, fullscreen) = match state.lock() {
-            Ok(s) => (s.frozen, s.visible, s.fs_now),
+        let (frozen, visible) = match state.lock() {
+            Ok(s) => (s.frozen, s.visible),
             Err(_) => return,
         };
         if frozen {
@@ -1460,7 +1458,9 @@ fn watch_loop(state: &Mutex<State>, ctx: &eframe::egui::Context, sessions: bool)
             continue;
         }
         if sessions {
-            // полноэкранность берём у интерфейса (fs_now — монитор острова): второй раз не опрашиваем Windows
+            // полноэкранность — общий флаг тихого режима (интерфейс ставит его по монитору острова):
+            // второй раз Windows не опрашиваем. Замер пинга и этот поток в игре работают — для этого они и нужны.
+            let fullscreen = crate::quiet::in_game();
             let fg_pid = if fullscreen { foreground_pid() } else { 0 };
             // имя нужно только чтобы начать игру: в игре сверяем лишь pid
             let fg_exe = if fg_pid != 0 && !tracker.active() { exe_name(fg_pid) } else { String::new() };

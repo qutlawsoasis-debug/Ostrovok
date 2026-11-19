@@ -12,6 +12,7 @@ mod jarvis;
 mod jarvis_ui;
 mod meter;
 mod place;
+mod quiet;
 mod setup;
 mod sound;
 mod live;
@@ -1239,6 +1240,11 @@ struct App {
     eq_epoch: Instant,
     /// после неудачного открытия устройства не пробуем снова до этого момента
     vu_retry: Instant,
+    /// уровень по пикам 0…1 — для свечения, когда захват звука выключен
+    vu_level: f32,
+    vu_avg: f32,
+    /// когда пики в последний раз были громче шороха
+    vu_heard: Option<Instant>,
     /// OSTROVOK_EQ_DEMO в тестовом запуске: столбики пляшут без звука — для снимка
     eq_demo: bool,
     /// масштаб, при котором ставили окно
@@ -1314,6 +1320,8 @@ struct App {
     /// самообновление: состояние проверки, время следующей и момент установки
     upd: Arc<Mutex<update::State>>,
     upd_at: Instant,
+    /// когда в последний раз проверяли обновление (в игре проверка ждёт, но не дольше quiet::UPDATE_MAX_DEFER)
+    upd_checked: Instant,
     /// идёт представление обновления: когда началось, какая версия и где её файл (пустой путь — проверочный прогон)
     upd_anim: Option<(Instant, String, std::path::PathBuf)>,
     /// форма острова, которую диктует представление, и его сдвиг по высоте
@@ -1575,6 +1583,9 @@ impl App {
             eq_last: Instant::now(),
             eq_epoch: Instant::now(),
             vu_retry: Instant::now(),
+            vu_level: 0.0,
+            vu_avg: 0.0,
+            vu_heard: None,
             eq_demo: test_mode() && std::env::var_os("OSTROVOK_EQ_DEMO").is_some(),
             win_ppp: 0.0,
             web: None,
@@ -1624,6 +1635,7 @@ impl App {
             procs_at: now.checked_sub(Duration::from_secs(60)).unwrap_or(now),
             upd: Default::default(),
             upd_at: now + Duration::from_secs(15),
+            upd_checked: now,
             upd_anim: (test_mode() && std::env::var_os("OSTROVOK_UPD_ANIM").is_some()).then(|| (now + Duration::from_secs(3), "0.1.17".to_string(), std::path::PathBuf::new())),
             upd_shape: None,
             drop_y: 0.0,
@@ -1969,7 +1981,7 @@ impl App {
         } else {
             drop(next);
         }
-        if should_reindex(self.apps_building.load(Ordering::Relaxed), self.apps_at, now) {
+        if quiet::allowed(quiet::Job::Reindex, self.fs_now) && should_reindex(self.apps_building.load(Ordering::Relaxed), self.apps_at, now) {
             self.spawn_index(ctx, false);
         }
     }
@@ -2476,7 +2488,10 @@ impl App {
         for (b, t) in self.bars.iter_mut().zip(snd.bands) {
             *b += (t - *b) * if t > *b { 0.6 } else { 0.25 };
         }
-        self.beat += (snd.bass - self.beat) * 0.4;
+        // «удар» для свечения: из захвата, если он идёт, иначе из пиков устройства (pump_eq)
+        self.vu_avg += (self.vu_level - self.vu_avg) * 0.05;
+        let bass = if self.sound.active() { snd.bass } else { meter::beat(self.vu_level, self.vu_avg) };
+        self.beat += (bass - self.beat) * 0.4;
         // постоянное прослушивание включается и выключается по настройке
         if !test_mode() && self.cfg.jarvis_listen != self.ears.watching() {
             if self.cfg.jarvis_listen {
@@ -2499,17 +2514,15 @@ impl App {
             self.show_toast("\u{E7F6}", [0x7B, 0xE0, 0x9A], &pult::headphones_text(d), &d.name, 4, false);
         }
         // «Игра»: страница на экране — замер чаще; идёт игра — остров молчит; игра кончилась — сводка
-        let (quiet, done) = {
+        let (silent, done) = {
             let mut s = lock(&self.game);
             // спрятанный остров (полноэкранное приложение) страницу не показывает: ни частого замера, ни перерисовок
             s.visible = self.mode == Mode::Panel && self.tab == Tab::Game && !self.hidden;
-            // поток наблюдения ловит игру по тому же флагу, что прячет остров (монитор острова)
-            s.fs_now = self.fs_now;
             // полноэкранное приложение или идёт игра — молчим; сводка подождёт, а не пропадёт молча
-            let quiet = s.session.is_some() || self.fs_now;
-            (quiet, if quiet { Vec::new() } else { std::mem::take(&mut s.events) })
+            let silent = s.session.is_some() || self.fs_now;
+            (silent, if silent { Vec::new() } else { std::mem::take(&mut s.events) })
         };
-        self.game_quiet = quiet;
+        self.game_quiet = silent;
         if let Some(sum) = done.last() {
             self.show_game_summary(sum);
         }
@@ -2703,7 +2716,13 @@ impl App {
             }
         }
 
-        if self.cfg.lyrics {
+        // текст песни — сетевой запрос: в игре откладываем (ключ не меняется, запрос уйдёт после игры),
+        // но текст прошлого трека не показываем
+        if self.cfg.lyrics && !quiet::allowed(quiet::Job::Lyrics, self.fs_now) {
+            if self.media_now.as_ref().is_some_and(|m| format!("{}|{}", m.artist, m.title) != self.lyrics_key) {
+                self.lyrics.clear();
+            }
+        } else if self.cfg.lyrics {
             if let Some(m) = &self.media_now {
                 let key = format!("{}|{}", m.artist, m.title);
                 if key != self.lyrics_key {
@@ -2750,6 +2769,12 @@ impl App {
             }
         }
 
+        // захват звука (cpal) — только пока на экране спектр панели и не идёт игра; проверяем каждый кадр,
+        // чтобы при закрытии панели устройство отпускалось сразу (fs_now — из последней медленной проверки, ≤ 0,4 с)
+        let spectrum = self.mode == Mode::Panel && (self.tab == Tab::Music || (self.tab == Tab::Home && self.media_now.is_none()));
+        self.sound.set_listen(quiet::sound_capture(self.fs_now, spectrum));
+        // эквалайзер — каждый кадр (опрос до 30 раз/с)
+        self.pump_eq(ctx, now);
         if now.duration_since(self.last_slow) < Duration::from_millis(400) {
             return;
         }
@@ -2757,8 +2782,9 @@ impl App {
 
         // самообновление: проверка раз в минуту, установка — когда остров свёрнут и его не трогают
         let upd_on = !self.cfg.no_update && (!test_mode() || std::env::var_os("OSTROVOK_FAKE_VERSION").is_some());
-        if upd_on && now >= self.upd_at {
+        if upd_on && quiet::update_due(now >= self.upd_at, self.fs_now, now.duration_since(self.upd_checked)) {
             self.upd_at = now + Duration::from_secs(60);
+            self.upd_checked = now;
             let c = ctx.clone();
             update::spawn(self.upd.clone(), move || c.request_repaint());
         }
@@ -2800,7 +2826,7 @@ impl App {
         if private.is_none() {
             // буфер с метками занят другой программой — не ждём; сначала часто, потом раз в секунду
             let since = *self.clip_busy.get_or_insert(now);
-            ctx.request_repaint_after(clip_busy_retry(now.saturating_duration_since(since)));
+            ctx.request_repaint_after(quiet::repaint_after(self.fs_now, false, clip_busy_retry(now.saturating_duration_since(since))));
         } else if {
             self.clip_busy = None;
             seq != self.clip_seq && private == Some(true)
@@ -2941,7 +2967,7 @@ impl App {
             _ => {}
         }
 
-        if self.cfg.lat.is_some() && self.weather_at.map_or(true, |t| now.duration_since(t) > weather::retry_after(self.weather_fails)) {
+        if self.cfg.lat.is_some() && quiet::allowed(quiet::Job::Weather, self.fs_now) && self.weather_at.map_or(true, |t| now.duration_since(t) > weather::retry_after(self.weather_fails)) {
             self.refresh_weather(ctx);
         }
 
@@ -2965,7 +2991,7 @@ impl App {
         let (ix, iy) = self.island_px(ctx.pixels_per_point());
         self.fs_now = !test_mode() && sys::fullscreen_app_active_at(ix, iy);
         self.hidden = !self.cfg.over_games && self.fs_now;
-        self.pump_eq(ctx, now);
+        quiet::set_in_game(self.fs_now);
         let fg = sys::foreground_other();
         if fg != 0 {
             self.last_fg = fg;
@@ -2996,36 +3022,12 @@ impl App {
                     self.notify(if action == "sleep" { "Сон через минуту" } else { "Блокировка через минуту" });
                 }
             }
-            self.stats = self.meter.sample();
-            self.cpu_smooth = sys::ema(self.cpu_smooth, self.stats.cpu, 0.4);
-            // для снимков батарейки в пилюле: OSTROVOK_BATTERY=8 (разряжается) или 15c (заряжается)
-            if let Some(v) = std::env::var("OSTROVOK_BATTERY").ok().filter(|_| test_mode()) {
-                let charging = v.ends_with('c');
-                if let Ok(pct) = v.trim_end_matches('c').parse::<u8>() {
-                    self.stats.battery = Some((pct.min(100), charging));
-                }
-            }
-            if let Some((rx, tx)) = sys::net_bytes() {
-                let prev = self.net_prev.map(|(a, b, _)| (a, b));
-                let dt = self.net_prev.map_or(0.0, |(_, _, at)| now.duration_since(at).as_secs_f32());
-                if let Some((d, u)) = sys::net_rate(prev, (rx, tx), dt) {
-                    self.net = (sys::ema(self.net.0, d, 0.4), sys::ema(self.net.1, u, 0.4));
-                }
-                // короткий тик — ждём накопления; иначе (в т. ч. сброс/скачок) перебазируемся
-                if prev.is_none() || dt >= 0.2 {
-                    self.net_prev = Some((rx, tx, now));
-                }
-            }
-            let mem = if self.stats.mem_total > 0.0 { (self.stats.mem_used / self.stats.mem_total) as f32 } else { 0.0 };
-            self.load_hist.push_back((self.stats.cpu, mem));
-            // память забита несколько замеров подряд — предупреждаем, но не чаще раза в четверть часа
-            self.mem_hot = if mem > 0.92 { self.mem_hot.saturating_add(1) } else { 0 };
-            if self.mem_hot == 4 && self.mem_alert_at.map_or(true, |t| now.duration_since(t) > Duration::from_secs(900)) {
-                self.mem_alert_at = Some(now);
-                self.show_toast("\u{E7BA}", [0xFF, 0x6B, 0x6B], "Память почти заполнена", &format!("занято {:.0}% — загляните в «Монитор»", mem * 100.0), 7, false);
-            }
-            while self.load_hist.len() > 120 {
-                self.load_hist.pop_front();
+            if quiet::allowed(quiet::Job::Stats, self.fs_now) {
+                self.sample_stats(now);
+            } else {
+                // в игре монитор системы спит; скорость сети после игры считаем с нуля
+                self.net_prev = None;
+                self.net = (0.0, 0.0);
             }
         }
 
@@ -3065,7 +3067,7 @@ impl App {
         if let Some((pct, charging)) = battery_seg(self.stats.battery) {
             v.push(Seg::Battery(pct, charging));
         }
-        if playing || self.sound.active() {
+        if playing || self.sound_on() {
             v.push(Seg::Eq);
         } else if let Some(w) = &self.weather {
             let (icon, _) = weather::describe(w.code);
@@ -4219,7 +4221,7 @@ impl App {
                 }
             }
             None => {
-                if self.sound.active() {
+                if self.sound_on() {
                     p.text(pos2(x, music_r.top() + 16.0), Align2::LEFT_TOP, "Играет звук", semi(14.0), FG);
                     let strip = Rect::from_min_max(pos2(x, music_r.top() + 38.0), pos2(music_r.right() - 16.0, music_r.bottom() - 14.0));
                     spectrum(&p, strip, &self.bars, accent(), 0.8, 1.0);
@@ -4560,7 +4562,7 @@ impl App {
     fn ui_music(&mut self, ui: &mut egui::Ui) {
         let accent = self.album.map_or(accent(), |c| Color32::from_rgb(c[0], c[1], c[2]));
         let Some(m) = self.media_now.clone() else {
-            if self.sound.active() {
+            if self.sound_on() {
                 // кто звучит — спрашиваем у Windows не чаще раза в полторы секунды
                 if self.sounding.1.elapsed() > Duration::from_millis(1500) {
                     let names: Vec<String> = sys::app_volumes().into_iter().filter(|a| a.active && !a.muted).map(|a| a.name).take(3).collect();
@@ -8211,7 +8213,8 @@ impl eframe::App for App {
         let dripping = !flask && self.mode == Mode::Pill && self.media_now.as_ref().is_some_and(|m| m.playing);
         let glowing_music = self.album.is_some() && self.media_now.as_ref().is_some_and(|m| m.playing);
         let glowing = self.glow.is_some_and(|g| g.1.elapsed().as_secs_f32() < 1.3);
-        let moving = !self.hidden && (!self.reach.settled() || self.reach.v > 0.01 || !self.lean_s.settled() || !self.jelly.settled() || self.ripple > 0.0 || dripping || glowing || glowing_music || self.sound.active() || sloshing || !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || !self.bub_dl.settled() || self.sheen_at.elapsed().as_secs_f32() < 0.75);
+        let moving = !self.hidden && (!self.reach.settled() || self.reach.v > 0.01 || !self.lean_s.settled() || !self.jelly.settled() || self.ripple > 0.0 || dripping || glowing || glowing_music || self.sound_on() || sloshing || !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || !self.bub_dl.settled() || self.sheen_at.elapsed().as_secs_f32() < 0.75);
+        let shape_anim = animating;
         let animating = animating || moving || self.drag.is_some();
         let scaled = rect_v.size() * self.jelly.v;
         let rect_v = Rect::from_min_size(pos2(WIN_W / 2.0 - scaled.x / 2.0 + self.lean_s.v, TOP + self.drop_y), scaled);
@@ -8328,7 +8331,7 @@ impl eframe::App for App {
             }
             self.lens_cap = Some(Rect::from_min_max(pos2(f.cap[0], f.cap[1]), pos2(f.cap[2], f.cap[3])));
         }
-        if self.excluded == Some(true) && !invisible {
+        if self.excluded == Some(true) && !invisible && quiet::allowed(quiet::Job::Lens, self.fs_now) {
             const MARGIN: f32 = 28.0;
             let top = (layout_v.top() - MARGIN).max(0.0);
             let cap = Rect::from_min_max(pos2(layout_v.left() - MARGIN, top), layout_v.max + vec2(MARGIN, MARGIN));
@@ -8658,24 +8661,30 @@ impl eframe::App for App {
 
         // частота перерисовки: быстро только когда есть на что смотреть
         let playing = self.media_now.as_ref().is_some_and(|m| m.playing);
-        // остров висит пилюлей без плашки поверх полноэкранной игры: редкие кадры, видеокарта — игре
-        // (вышли из игры на рабочий стол — обычная частота, хоть сессия ещё не кончилась)
-        let game_calm = self.fs_now && !self.hidden && self.mode == Mode::Pill && self.toast.is_none() && self.shot.is_none() && (target - self.size).length() < 0.4 && self.vel.length() < 3.0;
-        if game_calm {
-            ctx.request_repaint_after(Duration::from_millis(250));
-        } else if self.hidden && self.shot.is_none() && !animating {
+        let want = if self.hidden && self.shot.is_none() && !animating {
             // остров спрятан (полноэкранная игра): кадры не нужны, только изредка проверяем, не пора ли показаться
-            ctx.request_repaint_after(Duration::from_millis(400));
+            quiet::GAME_FRAME
         } else if animating || self.shot.is_some() {
-            ctx.request_repaint();
+            Duration::ZERO
         } else if self.mode != Mode::Pill || dist < 420.0 || playing {
-            ctx.request_repaint_after(Duration::from_millis(16));
+            Duration::from_millis(16)
         } else if self.precipitation() > 0 {
             // дождь и снег идут плавно, но без гонки кадров
-            ctx.request_repaint_after(Duration::from_millis(33));
+            Duration::from_millis(33)
         } else {
-            ctx.request_repaint_after(Duration::from_millis(90));
+            Duration::from_millis(90)
+        };
+        // в игре — не чаще раза в 2 с, пока остров не трогают и он не меняет форму (выход из игры будит поток наблюдения);
+        // постоянные украшения (капли, свечение под музыку) остаются под ограничением
+        let transition = shape_anim || !self.reach.settled() || !self.lean_s.settled() || !self.jelly.settled() || self.toast.is_some() || mode_t < 1.0
+            || !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || !self.bub_dl.settled();
+        let interacting = !self.hidden && (over || transition || self.mode != Mode::Pill || self.drag.is_some() || self.shot.is_some());
+        let mut after = quiet::repaint_after(self.fs_now, interacting, want);
+        if self.fs_now && !self.hidden && cursor.is_some_and(|c| (c - rect_v.center()).length() < 200.0) {
+            // остров виден поверх игры и курсор рядом: замечаем наведение до клика (иначе клик уйдёт в игру)
+            after = after.min(Duration::from_millis(100));
         }
+        ctx.request_repaint_after(after);
         // срок таймера не проспим, даже если кадры редкие
         if let Some(end) = self.timer_end {
             ctx.request_repaint_after(end.saturating_duration_since(now));
@@ -8996,17 +9005,25 @@ impl App {
             self.eq = [0.0; meter::N];
             self.eq_target = self.eq;
             self.vu = None;
+            self.vu_level = 0.0;
+            self.vu_heard = None;
             return;
         }
-        let playing = self.media_now.as_ref().is_some_and(|m| m.playing) || self.sound.active();
+        let media = self.media_now.as_ref().is_some_and(|m| m.playing);
+        let playing = media || self.sound_on();
         // те же условия, при которых segments() кладёт в пилюлю эквалайзер
         let visible = self.mode == Mode::Pill && self.toast.is_none() && self.note.is_none() && self.shot.is_none();
-        if !visible || !playing {
+        // свечение под музыку (аура при обложке) нужно и в панели, когда захват звука выключен
+        let glow = media && self.album.is_some() && !self.sound.active();
+        let since = now.duration_since(self.meter_at);
+        // звук идёт — 30 раз/с; тихо — раз в полсекунды проверяем, не заиграло ли (захват звука выключен)
+        let due = if playing && (visible || glow) { meter::should_poll(true, true, self.fs_now, since) } else { visible && since >= meter::PROBE };
+        if !visible {
             self.eq_target = [0.0; meter::N];
-            if !playing {
-                self.vu = None;
-            }
-        } else if meter::should_poll(visible, playing, self.fs_now, now.duration_since(self.meter_at)) {
+        }
+        if !visible && !glow {
+            self.vu_level = 0.0;
+        } else if due {
             self.meter_at = now;
             // время по кругу в час: синусы покачивания не теряют точность за сутки работы
             let t = (now.duration_since(self.eq_epoch).as_secs_f64() % 3600.0) as f32;
@@ -9028,7 +9045,16 @@ impl App {
                 }
                 p
             };
-            self.eq_target = peaks.map_or([0.0; meter::N], |(pk, [l, r])| meter::spread(meter::level(pk), [meter::level(l), meter::level(r)], t));
+            if let Some((pk, _)) = peaks {
+                self.vu_level = meter::level(pk);
+                if meter::heard(pk) {
+                    self.vu_heard = Some(now);
+                }
+            }
+            self.eq_target = match peaks {
+                Some((pk, [l, r])) if visible && (media || self.sound_on()) => meter::spread(meter::level(pk), [meter::level(l), meter::level(r)], t),
+                _ => [0.0; meter::N],
+            };
         }
         for (v, t) in self.eq.iter_mut().zip(self.eq_target) {
             *v = meter::smooth(*v, t, dt);
@@ -9036,6 +9062,46 @@ impl App {
         if self.eq.iter().zip(self.eq_target).any(|(v, t)| *v > 0.0 || t > 0.0) {
             ctx.request_repaint_after(meter::POLL);
         }
+    }
+
+    /// Монитор системы: процессор, память, батарея, сеть (раз в 1,5 с, в игре не вызывается).
+    fn sample_stats(&mut self, now: Instant) {
+        self.stats = self.meter.sample();
+        self.cpu_smooth = sys::ema(self.cpu_smooth, self.stats.cpu, 0.4);
+        // для снимков батарейки в пилюле: OSTROVOK_BATTERY=8 (разряжается) или 15c (заряжается)
+        if let Some(v) = std::env::var("OSTROVOK_BATTERY").ok().filter(|_| test_mode()) {
+            let charging = v.ends_with('c');
+            if let Ok(pct) = v.trim_end_matches('c').parse::<u8>() {
+                self.stats.battery = Some((pct.min(100), charging));
+            }
+        }
+        if let Some((rx, tx)) = sys::net_bytes() {
+            let prev = self.net_prev.map(|(a, b, _)| (a, b));
+            let dt = self.net_prev.map_or(0.0, |(_, _, at)| now.duration_since(at).as_secs_f32());
+            if let Some((d, u)) = sys::net_rate(prev, (rx, tx), dt) {
+                self.net = (sys::ema(self.net.0, d, 0.4), sys::ema(self.net.1, u, 0.4));
+            }
+            // короткий тик — ждём накопления; иначе (в т. ч. сброс/скачок) перебазируемся
+            if prev.is_none() || dt >= 0.2 {
+                self.net_prev = Some((rx, tx, now));
+            }
+        }
+        let mem = if self.stats.mem_total > 0.0 { (self.stats.mem_used / self.stats.mem_total) as f32 } else { 0.0 };
+        self.load_hist.push_back((self.stats.cpu, mem));
+        // память забита несколько замеров подряд — предупреждаем, но не чаще раза в четверть часа
+        self.mem_hot = if mem > 0.92 { self.mem_hot.saturating_add(1) } else { 0 };
+        if self.mem_hot == 4 && self.mem_alert_at.map_or(true, |t| now.duration_since(t) > Duration::from_secs(900)) {
+            self.mem_alert_at = Some(now);
+            self.show_toast("\u{E7BA}", [0xFF, 0x6B, 0x6B], "Память почти заполнена", &format!("занято {:.0}% — загляните в «Монитор»", mem * 100.0), 7, false);
+        }
+        while self.load_hist.len() > 120 {
+            self.load_hist.pop_front();
+        }
+    }
+
+    /// Слышен ли звук: по захвату (когда он включён) или по пикам устройства за последние 1,2 с.
+    fn sound_on(&self) -> bool {
+        self.sound.active() || self.vu_heard.is_some_and(|t| t.elapsed() < Duration::from_millis(1200))
     }
 
     /// Точка острова на экране (пиксели): середина поля чуть ниже верха.

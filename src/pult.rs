@@ -198,7 +198,8 @@ pub fn start(state: Arc<Mutex<State>>, ctx: eframe::egui::Context) {
                 Err(_) => return,
             };
             let due = last.is_none_or(|t| t.elapsed() >= Duration::from_secs(bt_poll_secs(visible)));
-            if !frozen && due {
+            // в полноэкранной игре PowerShell не запускаем совсем: опросим после игры
+            if !frozen && due && crate::quiet::allowed(crate::quiet::Job::Bluetooth, crate::quiet::in_game()) {
                 last = Some(std::time::Instant::now());
                 if let Some(devs) = bt_devices() {
                     if let Ok(mut s) = state.lock() {

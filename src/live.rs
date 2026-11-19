@@ -87,7 +87,8 @@ pub fn spawn(mirror_on: bool, report: impl Fn(Notice) + Send + 'static) -> Live 
                     }
                 }
             }
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            // в полноэкранной игре — реже: звонок заметим чуть позже, зато игре не мешаем
+            std::thread::sleep(crate::quiet::poll_every(crate::quiet::Src::Live, crate::quiet::in_game()));
         }
     });
     live
