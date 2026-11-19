@@ -848,6 +848,8 @@ pub fn has_clips_module(names: &[String]) -> bool {
 }
 
 /// Путь программы, который можно открыть: локальный диск, .exe, без кавычек, сетевых путей и управляющих символов.
+/// Двоеточие только после буквы диска: «C:\a\b.txt:x.exe» — поток NTFS внутри другого файла, а не программа.
+/// Без «%»: путь проверяется как есть, а оболочка могла бы подставить в него переменные окружения.
 pub fn safe_exe(path: &str) -> bool {
     let b = path.as_bytes();
     b.len() > 7
@@ -855,9 +857,40 @@ pub fn safe_exe(path: &str) -> bool {
         && b[1] == b':'
         && b[2] == b'\\'
         && !path.starts_with(r"\\")
+        && !path[2..].contains(':')
         && !path.contains('"')
+        && !path.contains('%')
         && !path.chars().any(char::is_control)
         && path.to_ascii_lowercase().ends_with(".exe")
+}
+
+/// Что передать оболочке для адреса со страницы: только адреса из ALLOWED_URIS, иначе None.
+/// Диспетчер задач — полным путём из системной папки: по одному имени ShellExecute сначала ищет в текущей
+/// папке острова (скажем, в «Загрузках», если остров запустили оттуда), и подложенный там taskmgr.exe/.com/.bat
+/// запустился бы вместо настоящего. Системную папку не узнали — не открываем ничего.
+pub fn launch_target(u: &str) -> Option<String> {
+    if !ALLOWED_URIS.contains(&u) {
+        return None;
+    }
+    if u == "taskmgr" {
+        return system_dir().map(|d| taskmgr_path(&d)).filter(|p| safe_exe(p));
+    }
+    Some(u.to_string())
+}
+
+/// Путь диспетчера задач в системной папке.
+fn taskmgr_path(system_dir: &str) -> String {
+    format!(r"{}\Taskmgr.exe", system_dir.trim_end_matches('\\'))
+}
+
+/// Системная папка Windows (обычно C:\Windows\System32) — у ядра, а не из переменной окружения.
+fn system_dir() -> Option<String> {
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = [0u16; 260];
+    // SAFETY: буфер жив на время вызова, длину функция берёт из среза
+    let n = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
+    // 0 — ошибка; не меньше длины буфера — не влезло (возвращён нужный размер)
+    (n > 0 && n < buf.len()).then(|| String::from_utf16_lossy(&buf[..n]))
 }
 
 /// Подпись кнопки.
@@ -1049,7 +1082,8 @@ impl Icmp {
     /// Один эхо-запрос: время ответа в мс или None (потеря, ошибка, ответ не от того адреса).
     fn echo(&self, to: Ipv4Addr, timeout_ms: u32) -> Option<u32> {
         use windows::Win32::NetworkManagement::IpHelper::{IcmpSendEcho, ICMP_ECHO_REPLY, IP_SUCCESS};
-        const PAYLOAD: [u8; 32] = *b"Ostrovok ping: game latency 0123";
+        // те же 32 байта, что шлёт ping.exe из Windows: по пакету не видно ни программы, ни того, что идёт игра
+        const PAYLOAD: [u8; 32] = *b"abcdefghijklmnopqrstuvwabcdefghi";
         // ответ + копия данных + 8 байт на ICMP-ошибку; u64 — ради выравнивания структуры
         let words = (std::mem::size_of::<ICMP_ECHO_REPLY>() + PAYLOAD.len() + 8 + 7) / 8;
         let mut buf = vec![0u64; words];
@@ -2142,6 +2176,27 @@ mod tests {
         assert!(!safe_exe(r"C:\x\a.exe.lnk"));
         assert!(!safe_exe(r#"C:\x\"a".exe"#));
         assert!(!safe_exe(""));
+        // поток NTFS внутри другого файла, переменные окружения, длинный путь и путь от текущей папки диска
+        assert!(!safe_exe(r"C:\x\notes.txt:evil.exe"));
+        assert!(!safe_exe(r"C:\%TEMP%\a.exe"));
+        assert!(!safe_exe(r"\\?\C:\x\a.exe"));
+        assert!(!safe_exe(r"C:x\aaaa.exe"));
+    }
+
+    #[test]
+    fn launch_targets_are_fixed() {
+        // диспетчер задач — только полным путём из системной папки, а не по имени (иначе ищется в текущей папке)
+        let t = launch_target("taskmgr").expect("системная папка известна");
+        assert!(safe_exe(&t), "{t}");
+        assert!(t.to_ascii_lowercase().ends_with(r"\system32\taskmgr.exe"), "{t}");
+        assert_eq!(taskmgr_path(r"C:\Windows\System32\"), r"C:\Windows\System32\Taskmgr.exe");
+        assert_eq!(taskmgr_path(r"C:\Windows\System32"), r"C:\Windows\System32\Taskmgr.exe");
+        for u in ALLOWED_URIS.into_iter().filter(|u| *u != "taskmgr") {
+            assert_eq!(launch_target(u).as_deref(), Some(u));
+        }
+        for bad in ["cmd", "calc.exe", "taskmgr.exe", r"C:\Windows\System32\cmd.exe", "ms-settings:", "", "steam://run/570"] {
+            assert_eq!(launch_target(bad), None, "{bad}");
+        }
     }
 
     #[test]

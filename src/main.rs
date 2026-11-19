@@ -5214,9 +5214,13 @@ impl App {
             p.text(r.center(), Align2::CENTER_CENTER, "\u{E7FC}  Сыграйте — после игры здесь будет сводка: пинг, скачки и что мешало", FontId::proportional(12.0), DIM);
         }
 
-        // кнопки открывают только постоянные адреса или проверенный путь найденной программы
+        // кнопки открывают только постоянные адреса (диспетчер задач — полным путём) или проверенный путь найденной программы
         match go {
-            Some(game::Open::Uri(u)) if game::ALLOWED_URIS.contains(&u) => sys::open(u),
+            Some(game::Open::Uri(u)) => {
+                if let Some(t) = game::launch_target(u) {
+                    sys::open(&t);
+                }
+            }
             Some(game::Open::Exe(path)) => {
                 if game::safe_exe(&path) && std::path::Path::new(&path).is_file() {
                     sys::open(&path);
@@ -7524,7 +7528,10 @@ impl App {
             ui.painter().text(pos2(c.x, r.top() + 114.0), Align2::CENTER_CENTER, detail, FontId::proportional(11.5), dc);
             if let Some((cmd, tip)) = target {
                 if resp.on_hover_text(tip).clicked() {
-                    sys::open(cmd);
+                    // диспетчер задач — полным путём из системной папки, а не по имени (по имени ищется сначала в текущей папке)
+                    if let Some(t) = game::launch_target(cmd) {
+                        sys::open(&t);
+                    }
                 }
             }
         }
