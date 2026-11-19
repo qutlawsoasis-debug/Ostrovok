@@ -71,7 +71,7 @@ impl Sound {
         s
     }
 
-    /// Включить или выключить захват. Выключение освобождает устройство (не позже чем через ~¼ с).
+    /// Включить или выключить захват. Выключение освобождает устройство почти сразу.
     pub fn set_listen(&self, on: bool) {
         if self.want.swap(on, Ordering::Relaxed) != on {
             if !on {
@@ -145,10 +145,15 @@ fn listen(state: &Arc<Mutex<State>>, want: &AtomicBool) -> Result<(), String> {
         _ => return Err("неизвестный формат звука".into()),
     }
     .map_err(|e| e.to_string())?;
+    // пока открывали устройство, захват могли выключить — тогда даже не начинаем
+    if !want.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     stream.play().map_err(|e| e.to_string())?;
     let mut tick = 0u32;
     loop {
-        std::thread::sleep(Duration::from_millis(250));
+        // unpark из set_listen прерывает ожидание сразу
+        std::thread::park_timeout(Duration::from_millis(250));
         if !want.load(Ordering::Relaxed) {
             // выключили (игра, панель закрыта): stream уничтожается — устройство и аудиопоток освобождены
             drop(stream);

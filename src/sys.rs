@@ -1515,8 +1515,9 @@ pub struct Watch {
     pub layout: u16,
     /// удалось ли прочитать громкость
     pub ok: bool,
-    /// активное окно: при его смене (выход из игры) интерфейс просыпается сразу
+    /// активное окно и его прямоугольник: при смене (выход из игры, Esc в видео) интерфейс просыпается сразу
     pub fg: isize,
+    pub fg_rect: [i32; 4],
 }
 
 /// Следит за громкостью и раскладкой в стороне от интерфейса; wake зовётся при каждом изменении.
@@ -1548,6 +1549,10 @@ pub fn spawn_watch(wake: impl Fn() + Send + 'static) -> Arc<std::sync::Mutex<Wat
             }
             let fg = GetForegroundWindow();
             w.fg = fg.0 as isize;
+            let mut r = windows::Win32::Foundation::RECT::default();
+            if GetWindowRect(fg, &mut r).is_ok() {
+                w.fg_rect = [r.left, r.top, r.right, r.bottom];
+            }
             let tid = GetWindowThreadProcessId(fg, None);
             w.layout = (GetKeyboardLayout(tid).0 as usize & 0xFFFF) as u16;
             let changed = {

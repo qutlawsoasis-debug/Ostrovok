@@ -1231,6 +1231,7 @@ struct App {
     vu_retry: Instant,
     /// уровень по пикам 0…1 — для свечения, когда захват звука выключен
     vu_level: f32,
+    vu_avg: f32,
     /// когда пики в последний раз были громче шороха
     vu_heard: Option<Instant>,
     /// OSTROVOK_EQ_DEMO в тестовом запуске: столбики пляшут без звука — для снимка
@@ -1308,6 +1309,8 @@ struct App {
     /// самообновление: состояние проверки, время следующей и момент установки
     upd: Arc<Mutex<update::State>>,
     upd_at: Instant,
+    /// когда в последний раз проверяли обновление (в игре проверка ждёт, но не дольше quiet::UPDATE_MAX_DEFER)
+    upd_checked: Instant,
     /// идёт представление обновления: когда началось, какая версия и где её файл (пустой путь — проверочный прогон)
     upd_anim: Option<(Instant, String, std::path::PathBuf)>,
     /// форма острова, которую диктует представление, и его сдвиг по высоте
@@ -1566,6 +1569,7 @@ impl App {
             eq_epoch: Instant::now(),
             vu_retry: Instant::now(),
             vu_level: 0.0,
+            vu_avg: 0.0,
             vu_heard: None,
             eq_demo: test_mode() && std::env::var_os("OSTROVOK_EQ_DEMO").is_some(),
             win_ppp: 0.0,
@@ -1616,6 +1620,7 @@ impl App {
             procs_at: now.checked_sub(Duration::from_secs(60)).unwrap_or(now),
             upd: Default::default(),
             upd_at: now + Duration::from_secs(15),
+            upd_checked: now,
             upd_anim: (test_mode() && std::env::var_os("OSTROVOK_UPD_ANIM").is_some()).then(|| (now + Duration::from_secs(3), "0.1.17".to_string(), std::path::PathBuf::new())),
             upd_shape: None,
             drop_y: 0.0,
@@ -2424,7 +2429,8 @@ impl App {
             *b += (t - *b) * if t > *b { 0.6 } else { 0.25 };
         }
         // «удар» для свечения: из захвата, если он идёт, иначе из пиков устройства (pump_eq)
-        let bass = if self.sound.active() { snd.bass } else { self.vu_level };
+        self.vu_avg += (self.vu_level - self.vu_avg) * 0.05;
+        let bass = if self.sound.active() { snd.bass } else { meter::beat(self.vu_level, self.vu_avg) };
         self.beat += (bass - self.beat) * 0.4;
         // постоянное прослушивание включается и выключается по настройке
         if !test_mode() && self.cfg.jarvis_listen != self.ears.watching() {
@@ -2627,8 +2633,13 @@ impl App {
             }
         }
 
-        // текст песни — сетевой запрос: в игре откладываем (ключ не меняется, запрос уйдёт после игры)
-        if self.cfg.lyrics && quiet::allowed(quiet::Job::Lyrics, self.fs_now) {
+        // текст песни — сетевой запрос: в игре откладываем (ключ не меняется, запрос уйдёт после игры),
+        // но текст прошлого трека не показываем
+        if self.cfg.lyrics && !quiet::allowed(quiet::Job::Lyrics, self.fs_now) {
+            if self.media_now.as_ref().is_some_and(|m| format!("{}|{}", m.artist, m.title) != self.lyrics_key) {
+                self.lyrics.clear();
+            }
+        } else if self.cfg.lyrics {
             if let Some(m) = &self.media_now {
                 let key = format!("{}|{}", m.artist, m.title);
                 if key != self.lyrics_key {
@@ -2675,7 +2686,11 @@ impl App {
             }
         }
 
-        // эквалайзер — каждый кадр (опрос до 30 раз/с); fs_now/hidden берутся из последней медленной проверки (≤ 0,4 с)
+        // захват звука (cpal) — только пока на экране спектр панели и не идёт игра; проверяем каждый кадр,
+        // чтобы при закрытии панели устройство отпускалось сразу (fs_now — из последней медленной проверки, ≤ 0,4 с)
+        let spectrum = self.mode == Mode::Panel && (self.tab == Tab::Music || (self.tab == Tab::Home && self.media_now.is_none()));
+        self.sound.set_listen(quiet::sound_capture(self.fs_now, spectrum));
+        // эквалайзер — каждый кадр (опрос до 30 раз/с)
         self.pump_eq(ctx, now);
         if now.duration_since(self.last_slow) < Duration::from_millis(400) {
             return;
@@ -2684,8 +2699,9 @@ impl App {
 
         // самообновление: проверка раз в минуту, установка — когда остров свёрнут и его не трогают
         let upd_on = !self.cfg.no_update && (!test_mode() || std::env::var_os("OSTROVOK_FAKE_VERSION").is_some());
-        if upd_on && now >= self.upd_at && quiet::allowed(quiet::Job::UpdateCheck, self.fs_now) {
+        if upd_on && quiet::update_due(now >= self.upd_at, self.fs_now, now.duration_since(self.upd_checked)) {
             self.upd_at = now + Duration::from_secs(60);
+            self.upd_checked = now;
             let c = ctx.clone();
             update::spawn(self.upd.clone(), move || c.request_repaint());
         }
@@ -2726,7 +2742,7 @@ impl App {
         if private.is_none() {
             // буфер с метками занят другой программой — не ждём; сначала часто, потом раз в секунду
             let since = *self.clip_busy.get_or_insert(now);
-            ctx.request_repaint_after(clip_busy_retry(now.saturating_duration_since(since)));
+            ctx.request_repaint_after(quiet::repaint_after(self.fs_now, false, clip_busy_retry(now.saturating_duration_since(since))));
         } else if {
             self.clip_busy = None;
             seq != self.clip_seq && private == Some(true)
@@ -2881,8 +2897,6 @@ impl App {
         self.fs_now = !test_mode() && sys::fullscreen_app_active_at(ix, iy);
         self.hidden = !self.cfg.over_games && self.fs_now;
         quiet::set_in_game(self.fs_now);
-        // захват звука (cpal) — только пока на экране спектр панели и не идёт игра
-        self.sound.set_listen(quiet::sound_capture(self.fs_now, self.mode == Mode::Panel && matches!(self.tab, Tab::Home | Tab::Music)));
         let fg = sys::foreground_other();
         if fg != 0 {
             self.last_fg = fg;
@@ -2918,6 +2932,7 @@ impl App {
             } else {
                 // в игре монитор системы спит; скорость сети после игры считаем с нуля
                 self.net_prev = None;
+                self.net = (0.0, 0.0);
             }
         }
 
@@ -4110,7 +4125,7 @@ impl App {
                 }
             }
             None => {
-                if self.sound.active() {
+                if self.sound_on() {
                     p.text(pos2(x, music_r.top() + 16.0), Align2::LEFT_TOP, "Играет звук", semi(14.0), FG);
                     let strip = Rect::from_min_max(pos2(x, music_r.top() + 38.0), pos2(music_r.right() - 16.0, music_r.bottom() - 14.0));
                     spectrum(&p, strip, &self.bars, accent(), 0.8, 1.0);
@@ -4451,7 +4466,7 @@ impl App {
     fn ui_music(&mut self, ui: &mut egui::Ui) {
         let accent = self.album.map_or(accent(), |c| Color32::from_rgb(c[0], c[1], c[2]));
         let Some(m) = self.media_now.clone() else {
-            if self.sound.active() {
+            if self.sound_on() {
                 // кто звучит — спрашиваем у Windows не чаще раза в полторы секунды
                 if self.sounding.1.elapsed() > Duration::from_millis(1500) {
                     let names: Vec<String> = sys::app_volumes().into_iter().filter(|a| a.active && !a.muted).map(|a| a.name).take(3).collect();
@@ -7749,6 +7764,7 @@ impl eframe::App for App {
         let glowing_music = self.album.is_some() && self.media_now.as_ref().is_some_and(|m| m.playing);
         let glowing = self.glow.is_some_and(|g| g.1.elapsed().as_secs_f32() < 1.3);
         let moving = !self.hidden && (!self.reach.settled() || self.reach.v > 0.01 || !self.lean_s.settled() || !self.jelly.settled() || self.ripple > 0.0 || dripping || glowing || glowing_music || self.sound_on() || sloshing || !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || !self.bub_dl.settled() || self.sheen_at.elapsed().as_secs_f32() < 0.75);
+        let shape_anim = animating;
         let animating = animating || moving || self.drag.is_some();
         let scaled = rect_v.size() * self.jelly.v;
         let rect_v = Rect::from_min_size(pos2(WIN_W / 2.0 - scaled.x / 2.0 + self.lean_s.v, TOP + self.drop_y), scaled);
@@ -8208,9 +8224,17 @@ impl eframe::App for App {
         } else {
             Duration::from_millis(90)
         };
-        // в игре — не чаще раза в 2 с, пока остров не трогают (выход из игры будит поток наблюдения)
-        let interacting = !self.hidden && (over || self.mode != Mode::Pill || self.drag.is_some() || self.shot.is_some());
-        ctx.request_repaint_after(quiet::repaint_after(self.fs_now, interacting, want));
+        // в игре — не чаще раза в 2 с, пока остров не трогают и он не меняет форму (выход из игры будит поток наблюдения);
+        // постоянные украшения (капли, свечение под музыку) остаются под ограничением
+        let transition = shape_anim || !self.reach.settled() || !self.lean_s.settled() || !self.jelly.settled() || self.toast.is_some() || mode_t < 1.0
+            || !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || !self.bub_dl.settled();
+        let interacting = !self.hidden && (over || transition || self.mode != Mode::Pill || self.drag.is_some() || self.shot.is_some());
+        let mut after = quiet::repaint_after(self.fs_now, interacting, want);
+        if self.fs_now && !self.hidden && cursor.is_some_and(|c| (c - rect_v.center()).length() < 200.0) {
+            // остров виден поверх игры и курсор рядом: замечаем наведение до клика (иначе клик уйдёт в игру)
+            after = after.min(Duration::from_millis(100));
+        }
+        ctx.request_repaint_after(after);
         // срок таймера не проспим, даже если кадры редкие
         if let Some(end) = self.timer_end {
             ctx.request_repaint_after(end.saturating_duration_since(now));
@@ -8538,11 +8562,15 @@ impl App {
         let playing = media || self.sound_on();
         // те же условия, при которых segments() кладёт в пилюлю эквалайзер
         let visible = self.mode == Mode::Pill && self.toast.is_none() && self.note.is_none() && self.shot.is_none();
+        // свечение под музыку (аура при обложке) нужно и в панели, когда захват звука выключен
+        let glow = media && self.album.is_some() && !self.sound.active();
         let since = now.duration_since(self.meter_at);
         // звук идёт — 30 раз/с; тихо — раз в полсекунды проверяем, не заиграло ли (захват звука выключен)
-        let due = if playing { meter::should_poll(visible, true, self.fs_now, since) } else { visible && since >= meter::PROBE };
+        let due = if playing && (visible || glow) { meter::should_poll(true, true, self.fs_now, since) } else { visible && since >= meter::PROBE };
         if !visible {
             self.eq_target = [0.0; meter::N];
+        }
+        if !visible && !glow {
             self.vu_level = 0.0;
         } else if due {
             self.meter_at = now;
@@ -8573,7 +8601,7 @@ impl App {
                 }
             }
             self.eq_target = match peaks {
-                Some((pk, [l, r])) if media || self.sound_on() => meter::spread(meter::level(pk), [meter::level(l), meter::level(r)], t),
+                Some((pk, [l, r])) if visible && (media || self.sound_on()) => meter::spread(meter::level(pk), [meter::level(l), meter::level(r)], t),
                 _ => [0.0; meter::N],
             };
         }

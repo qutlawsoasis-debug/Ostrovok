@@ -57,6 +57,15 @@ pub fn spread(level: f32, lr: [f32; 2], t: f32) -> [f32; N] {
     out
 }
 
+/// «Удар» для свечения по пикам: насколько уровень выше своего среднего (у громкой музыки
+/// сам пик почти всегда у потолка, а пульс виден в отклонениях). Тишина — ноль.
+pub fn beat(level: f32, avg: f32) -> f32 {
+    if !level.is_finite() || !avg.is_finite() || level <= 0.0 {
+        return 0.0;
+    }
+    ((level - avg) * 4.0 + 0.3).clamp(0.0, 1.0)
+}
+
 /// Левый край столбика `i` от начала эквалайзера.
 pub fn bar_x(i: usize) -> f32 {
     i as f32 * STEP
@@ -156,6 +165,15 @@ mod tests {
         assert!(!should_poll(false, true, false, ok));
         assert!(!should_poll(true, false, false, ok));
         assert!(!should_poll(true, true, true, ok));
+    }
+
+    #[test]
+    fn beat_follows_peaks_above_average() {
+        assert_eq!(beat(0.0, 0.5), 0.0);
+        assert_eq!(beat(f32::NAN, 0.5), 0.0);
+        assert!(beat(0.95, 0.85) > beat(0.85, 0.85));
+        assert!(beat(0.70, 0.85) < beat(0.85, 0.85));
+        assert_eq!(beat(1.0, 0.0), 1.0);
     }
 
     #[test]

@@ -33,23 +33,25 @@ pub enum Job {
     Reindex,
     /// загрузка процессора, памяти, сети
     Stats,
-    /// картинка из буфера обмена (до десятков МБ)
-    ClipImage,
     /// снимок экрана под островом для стекла
     Lens,
     /// опрос Bluetooth через PowerShell
     Bluetooth,
-    /// захват звука для спектров
-    SoundCapture,
-    /// текст из буфера обмена — дёшево, история не должна терять скопированное в игре
-    ClipText,
-    /// напоминания и таймеры — должны срабатывать и в игре
-    Reminders,
 }
 
-/// Можно ли делать это сейчас.
-pub fn allowed(job: Job, in_game: bool) -> bool {
-    !in_game || matches!(job, Job::ClipText | Job::Reminders)
+/// Можно ли делать это сейчас. Всё перечисленное в игре ждёт её конца
+/// (буфер обмена, напоминания и таймеры работают всегда — их здесь нет).
+pub fn allowed(_job: Job, in_game: bool) -> bool {
+    !in_game
+}
+
+/// Дольше этого проверку обновлений не откладываем даже в игре: «режим презентации»
+/// или многочасовое видео не должны оставлять остров без исправлений.
+pub const UPDATE_MAX_DEFER: Duration = Duration::from_secs(6 * 3600);
+
+/// Проверять ли обновление: обычный срок наступил, и либо не игра, либо с прошлой проверки прошло слишком много.
+pub fn update_due(due: bool, in_game: bool, since_last_check: Duration) -> bool {
+    due && (allowed(Job::UpdateCheck, in_game) || since_last_check >= UPDATE_MAX_DEFER)
 }
 
 /// Фоновые опросы с собственным ритмом.
@@ -100,19 +102,7 @@ pub fn sound_capture(in_game: bool, spectrum_on_screen: bool) -> bool {
 mod tests {
     use super::*;
 
-    const ALL: [Job; 11] = [
-        Job::UpdateCheck,
-        Job::Weather,
-        Job::Lyrics,
-        Job::Reindex,
-        Job::Stats,
-        Job::ClipImage,
-        Job::Lens,
-        Job::Bluetooth,
-        Job::SoundCapture,
-        Job::ClipText,
-        Job::Reminders,
-    ];
+    const ALL: [Job; 7] = [Job::UpdateCheck, Job::Weather, Job::Lyrics, Job::Reindex, Job::Stats, Job::Lens, Job::Bluetooth];
 
     #[test]
     fn outside_game_everything_allowed() {
@@ -120,9 +110,18 @@ mod tests {
     }
 
     #[test]
-    fn in_game_only_cheap_and_promised() {
-        let ok: Vec<Job> = ALL.iter().copied().filter(|j| allowed(*j, true)).collect();
-        assert_eq!(ok, vec![Job::ClipText, Job::Reminders]);
+    fn in_game_everything_waits() {
+        assert!(ALL.iter().all(|j| !allowed(*j, true)));
+    }
+
+    #[test]
+    fn update_not_deferred_forever() {
+        let h = Duration::from_secs(3600);
+        assert!(update_due(true, false, Duration::ZERO));
+        assert!(!update_due(false, false, 10 * h));
+        assert!(!update_due(true, true, h));
+        assert!(update_due(true, true, 7 * h));
+        assert!(!update_due(false, true, 7 * h));
     }
 
     #[test]
