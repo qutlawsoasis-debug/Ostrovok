@@ -3,6 +3,7 @@
 
 mod ai;
 mod fx;
+mod game;
 mod convert;
 mod ears;
 mod glass;
@@ -416,6 +417,8 @@ enum Tab {
     Calendar,
     System,
     Sound,
+    /// «Игра»: пинг, джиттер, что мешает играть, сводка игры
+    Game,
     Settings,
 }
 
@@ -1121,6 +1124,14 @@ struct App {
     awake: bool,
     /// состояние «Пульта» (заполняет фоновый поток pult::start)
     pult: Arc<Mutex<pult::State>>,
+    /// «Игра»: замер сети, помехи, игровые сессии (заполняют потоки game::start)
+    game: Arc<Mutex<game::State>>,
+    /// идёт игра: остров сам ничего не показывает и не забирает фокус
+    game_quiet: bool,
+    /// какую страницу открыть щелчком по висящей плашке (сводка игры → «Игра»)
+    toast_tab: Option<Tab>,
+    /// напоминания, сработавшие во время игры: покажем после неё
+    held_reminder: Option<String>,
     /// «Не беспокоить»: уведомления мессенджеров не всплывают, только копятся во «Входящих»
     dnd: bool,
     last_fg: isize,
@@ -1461,6 +1472,10 @@ impl App {
             light_theme: None,
             awake: false,
             pult: Default::default(),
+            game: Default::default(),
+            game_quiet: false,
+            toast_tab: None,
+            held_reminder: None,
             dnd: false,
             last_fg: 0,
             album: None,
@@ -1605,6 +1620,14 @@ impl App {
             if std::env::var_os("OSTROVOK_TOAST").is_some() {
                 app.show_toast("\u{E896}", [0x3A, 0x9B, 0xFF], "Загрузка завершена", "otchet-za-noyabr.pdf", 30, false);
             }
+            // для снимков плашки после игры: OSTROVOK_GAME_TOAST=1 (образец сводки, щелчок открывает «Игру»)
+            if std::env::var_os("OSTROVOK_GAME_TOAST").is_some() {
+                app.show_game_summary(&game::demo_summary());
+                // как у OSTROVOK_TOAST: висит дольше, чтобы успеть снять
+                if let Some(t) = &mut app.toast {
+                    t.until = Instant::now() + Duration::from_secs(30);
+                }
+            }
         }
         // для снимков идущего таймера: OSTROVOK_TIMER=25 — таймер на 25 минут, прошло чуть больше трети
         if let Some(m) = std::env::var("OSTROVOK_TIMER").ok().and_then(|v| v.parse::<f64>().ok()).filter(|m| test_mode() && timer_minutes_ok(*m)) {
@@ -1743,6 +1766,8 @@ impl App {
             app.cfg.save();
         }
         pult::start(app.pult.clone(), cc.egui_ctx.clone());
+        // в тестовом запуске игры не ловятся: остров не замолкает из-за настоящей игры разработчика
+        game::start(app.game.clone(), cc.egui_ctx.clone(), !test_mode());
         if let Ok(demo) = std::env::var("OSTROVOK_DEMO") {
             app.mode = Mode::Panel;
             app.sticky = true;
@@ -1784,6 +1809,14 @@ impl App {
                     ];
                     drop(s);
                     Tab::Pult
+                }
+                "game" => {
+                    // для снимков: образцы замеров, помех и последней игры (потоки их не перезапишут)
+                    let mut s = lock(&app.game);
+                    s.frozen = true;
+                    game::fill_demo(&mut s);
+                    drop(s);
+                    Tab::Game
                 }
                 "inbox" => {
                     // для снимков: выдуманные сообщения (в проверочном запуске уведомления не читаются)
@@ -1922,6 +1955,10 @@ impl App {
     }
 
     fn show_toast(&mut self, glyph: &'static str, color: [u8; 3], title: &str, text: &str, secs: u64, cover: bool) {
+        // идёт игра: остров молчит (напоминания копятся в held_reminder, сводка — после игры)
+        if self.game_quiet {
+            return;
+        }
         let short = |v: &str, n: usize| -> String {
             let mut out: String = v.chars().take(n).collect();
             if v.chars().count() > n {
@@ -1929,6 +1966,7 @@ impl App {
             }
             out
         };
+        self.toast_tab = None;
         self.toast = Some(Toast { glyph, color, title: short(title, 44), text: short(text, 56), until: Instant::now() + Duration::from_secs(secs), cover, level: None, compact: false });
         self.ripple = (self.ripple + 4.0).min(7.0);
         self.jelly.vel += 0.7;
@@ -1939,10 +1977,31 @@ impl App {
 
     /// Маленькая всплывашка в пилюле (громкость, раскладка). Важное уведомление она не перебивает.
     fn show_hud(&mut self, glyph: &'static str, color: [u8; 3], title: String, level: Option<f32>, ms: u64) {
-        if self.toast.as_ref().is_some_and(|t| !t.compact) {
+        if self.game_quiet || self.toast.as_ref().is_some_and(|t| !t.compact) {
             return;
         }
+        self.toast_tab = None;
         self.toast = Some(Toast { glyph, color, title, text: String::new(), until: Instant::now() + Duration::from_millis(ms), cover: false, level, compact: true });
+    }
+
+    /// Плашка после игры; щелчок по ней открывает «Игру».
+    fn show_game_summary(&mut self, s: &game::Summary) {
+        if self.game_quiet {
+            return;
+        }
+        let (title, text) = game::summary_toast(s);
+        self.show_toast("\u{E7FC}", game::level_rgb(s.level), &title, &text, 8, false);
+        self.toast_tab = Some(Tab::Game);
+    }
+
+    /// Щелчок по пилюле: панель, а если висит плашка со своей страницей — сразу на неё.
+    fn open_panel_from_pill(&mut self) {
+        self.mode = Mode::Panel;
+        if let Some(t) = self.toast.as_ref().and(self.toast_tab) {
+            self.tab = t;
+            self.toast = None;
+            self.toast_tab = None;
+        }
     }
 
     fn start_timer(&mut self, minutes: f64) {
@@ -2402,6 +2461,18 @@ impl App {
         if let Some(d) = fresh.last() {
             self.show_toast("\u{E7F6}", [0x7B, 0xE0, 0x9A], &pult::headphones_text(d), &d.name, 4, false);
         }
+        // «Игра»: страница на экране — замер чаще; идёт игра — остров молчит; игра кончилась — сводка
+        let (quiet, done) = {
+            let mut s = lock(&self.game);
+            s.visible = self.mode == Mode::Panel && self.tab == Tab::Game;
+            // сразу началась новая игра — сводка подождёт её конца, а не пропадёт молча
+            let quiet = s.session.is_some();
+            (quiet, if quiet { Vec::new() } else { std::mem::take(&mut s.events) })
+        };
+        self.game_quiet = quiet;
+        if let Some(sum) = done.last() {
+            self.show_game_summary(sum);
+        }
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::Note(t) => self.notify(&t),
@@ -2533,11 +2604,19 @@ impl App {
         } else if !self.icon_pending.is_empty() {
             ctx.request_repaint_after(ICON_STALL_LOCAL);
         }
-        if self.hotkey.swap(false, Ordering::Relaxed) {
+        // в игре Alt+Пробел не раскрывает поиск (флаг всё равно сбрасывается: swap стоит первым)
+        if self.hotkey.swap(false, Ordering::Relaxed) && !self.game_quiet {
             self.toggle_palette(ctx);
         }
         if self.toast.as_ref().is_some_and(|t| now >= t.until) {
             self.toast = None;
+            self.toast_tab = None;
+        }
+        // напоминание, сработавшее во время игры, — когда игра кончилась и остров свободен
+        if !self.game_quiet && self.toast.is_none() && self.mode == Mode::Pill {
+            if let Some(t) = self.held_reminder.take() {
+                self.show_toast("\u{E823}", [0xFF, 0x6B, 0x61], "Напоминание во время игры", &t, 12, false);
+            }
         }
         // новый трек — живое уведомление «сейчас играет»
         if let Some(m) = &self.media_now {
@@ -2661,7 +2740,8 @@ impl App {
                 ("\u{E8B7}", "Перетащите файл на остров", "он останется на полке под рукой"),
                 ("\u{E713}", "Темы, персонаж и прозрачность", "в настройках — значок шестерёнки"),
             ];
-            if now >= at && self.toast.is_none() && self.mode == Mode::Pill {
+            // в игре шаги знакомства ждут, иначе «сгорели» бы молча
+            if now >= at && self.toast.is_none() && self.mode == Mode::Pill && !self.game_quiet {
                 match STEPS.get(step) {
                     Some((glyph, title, text)) => {
                         let a = accent();
@@ -2786,6 +2866,17 @@ impl App {
             self.cfg.reminders.sort_by_key(|r| r.at);
             self.cfg.save();
             sys::beep();
+            // в игре звук вовремя, а текст — после игры
+            if self.game_quiet {
+                let t = due.join("; ");
+                match &mut self.held_reminder {
+                    Some(h) => {
+                        h.push_str("; ");
+                        h.push_str(&t);
+                    }
+                    None => self.held_reminder = Some(t),
+                }
+            }
             self.show_toast("\u{E823}", [0xFF, 0x6B, 0x61], "Напоминание", &due.join("; "), 12, false);
             self.emotion = Emotion::Surprised;
             self.emotion_until = now + Duration::from_secs(4);
@@ -3267,7 +3358,7 @@ impl App {
         // одна строка: слева значки разделов, рядом текстом — страницы выбранного раздела
         const GROUPS: [(&str, &str, &[(Tab, &str)]); 6] = [
             ("\u{E80F}", "Обзор", &[(Tab::Home, "Сводка"), (Tab::Music, "Музыка"), (Tab::Weather, "Погода"), (Tab::Calendar, "Календарь")]),
-            ("\u{E7F4}", "Система", &[(Tab::Pult, "Пульт"), (Tab::Control, "Управление"), (Tab::Sound, "Звук"), (Tab::System, "Монитор")]),
+            ("\u{E7F4}", "Система", &[(Tab::Pult, "Пульт"), (Tab::Control, "Управление"), (Tab::Sound, "Звук"), (Tab::System, "Монитор"), (Tab::Game, "Игра")]),
             ("\u{E90F}", "Инструменты", &[(Tab::Timer, "Таймер"), (Tab::Remind, "Напоминания"), (Tab::Qr, "QR-код")]),
             ("\u{E70B}", "Записи", &[(Tab::Clip, "Буфер"), (Tab::Inbox, "Уведомления"), (Tab::Todo, "Дела"), (Tab::Notes, "Заметки"), (Tab::Shelf, "Полка")]),
             ("\u{E8BD}", "ИИ", &[(Tab::Ai, "ИИ"), (Tab::Jarvis, "Джарвис")]),
@@ -3351,6 +3442,7 @@ impl App {
             Tab::Jarvis => self.ui_jarvis(ui),
             Tab::System => self.ui_system(ui),
             Tab::Sound => self.ui_sound(ui),
+            Tab::Game => self.ui_game(ui),
             Tab::Weather => self.ui_weather(ui),
             Tab::Timer => {
                 self.ui_timer(ui);
@@ -4739,6 +4831,352 @@ impl App {
                 p.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * pct as f32 / 100.0, 5.0)), Rounding::same(2.5), tone);
             }
             ui.add_space(4.0);
+        }
+    }
+
+    /// Высота страницы «Игра»: та же раскладка, что в ui_game.
+    fn game_height(&self) -> f32 {
+        let s = lock(&self.game);
+        let low = game::low_disk(self.stats.disk_free, self.stats.disk_total) as usize;
+        let rows = if s.scanned { s.culprits.len() + low } else { 0 };
+        game::page_height(rows, s.last.is_some() || s.session.is_some())
+    }
+
+    /// Система → Игра: пинг до роутера и интернета, что мешает играть, сводка последней игры.
+    /// Порядок allocate строго как в game::page_height: карточки, график, (2), заголовок, строки, (2), игра.
+    fn ui_game(&mut self, ui: &mut egui::Ui) {
+        // всё нужное — копией под замком; дальше рисуем без него (notify берёт &mut self)
+        let (gw_ip, inet_v, gw_v, target, icmp_failed, culprits, scanned, last, session) = {
+            let s = lock(&self.game);
+            (
+                s.gw,
+                s.inet_ring.iter().copied().collect::<Vec<_>>(),
+                s.gw_ring.iter().copied().collect::<Vec<_>>(),
+                s.target.min(game::INET_TARGETS.len() - 1),
+                s.icmp_failed,
+                s.culprits.clone(),
+                s.scanned,
+                s.last.clone(),
+                s.session.as_ref().map(|l| (l.title.clone(), l.started.elapsed().as_secs())),
+            )
+        };
+        let (disk_free, disk_total) = (self.stats.disk_free, self.stats.disk_total);
+        let inet = game::stats(&inet_v);
+        let gws = game::stats(&gw_v);
+        let level = game::page_level(inet.as_ref());
+        let place = match (&inet, level) {
+            (Some(i), Some(_)) => game::place(gws.as_ref(), i),
+            _ => game::Place::Unknown,
+        };
+        let p = ui.painter().clone();
+        let ctx = ui.ctx().clone();
+        let id = ui.id();
+        let red = Color32::from_rgb(0xFF, 0x6B, 0x6B);
+        let blue = Color32::from_rgb(0x8F, 0xD3, 0xFF);
+        let green = Color32::from_rgb(0x7B, 0xE0, 0x9A);
+        let orange = Color32::from_rgb(0xFF, 0xB3, 0x40);
+        // цвет уровня меняется плавно: каналы догоняют новый цвет за 0,4 с
+        let tone = |key: &str, rgb: [u8; 3]| {
+            let ch = |i: usize| ctx.animate_value_with_time(Id::new(("game-tone", key, i)), rgb[i] as f32, 0.4).round().clamp(0.0, 255.0) as u8;
+            Color32::from_rgb(ch(0), ch(1), ch(2))
+        };
+        // последний пинг тоже не прыгает, а перетекает
+        let shown_ms = |key: &str, v: Option<u32>| v.map(|ms| ctx.animate_value_with_time(Id::new(("game-ms", key)), ms as f32, 0.35).round().max(0.0) as u32);
+        // отрезки подряд идущих ответов: (номер замера, пинг)
+        let runs = |v: &[Option<u32>]| -> Vec<Vec<(usize, u32)>> {
+            let mut out: Vec<Vec<(usize, u32)>> = Vec::new();
+            let mut cur: Vec<(usize, u32)> = Vec::new();
+            for (i, x) in v.iter().enumerate() {
+                match x {
+                    Some(ms) => cur.push((i, *ms)),
+                    None if !cur.is_empty() => out.push(std::mem::take(&mut cur)),
+                    None => {}
+                }
+            }
+            if !cur.is_empty() {
+                out.push(cur);
+            }
+            out
+        };
+
+        // ── три карточки: интернет, роутер, вердикт
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), game::HERO_H), Sense::hover());
+        let w = (row.width() - 16.0) / 3.0;
+        let card = |k: usize| Rect::from_min_size(pos2(row.left() + k as f32 * (w + 8.0), row.top()), vec2(w, row.height()));
+        // карточка замера: название и адрес, крупно последний пинг, внизу джиттер и потери
+        let probe = |r: Rect, key: &str, title: &str, addr: String, vals: &[Option<u32>], st: Option<&game::Stats>, lim: &game::Limits, empty: Option<&str>| {
+            glass_chip(&p, r, 18.0, 0.55);
+            let clip = p.with_clip_rect(r.shrink(2.0));
+            clip.text(pos2(r.left() + 14.0, r.top() + 17.0), Align2::LEFT_CENTER, title, semi(12.5), FG);
+            clip.text(pos2(r.right() - 14.0, r.top() + 17.0), Align2::RIGHT_CENTER, addr, FontId::proportional(11.0), DIM);
+            let lvl = if empty.is_some() { None } else { st.filter(|s| s.sent >= 3).map(|s| game::level_of(s, lim)) };
+            let c = tone(key, game::level_rgb(lvl));
+            let last_ok = vals.iter().rev().flatten().next().copied();
+            let big = if empty.is_some() { "—".to_string() } else { game::fmt_ms(shown_ms(key, last_ok)) };
+            clip.circle_filled(pos2(r.left() + 19.0, r.top() + 48.0), 4.0, c);
+            clip.text(pos2(r.left() + 30.0, r.top() + 48.0), Align2::LEFT_CENTER, big, semi(26.0), c);
+            let foot = match (empty, st) {
+                (Some(e), _) => e.to_string(),
+                (None, Some(s)) if s.ok() > 0 => format!("джиттер {:.0} мс · потери {}", s.jitter, game::fmt_pct(s.loss_pct())),
+                (None, Some(s)) if s.sent >= 3 => format!("нет ответа · потери {}", game::fmt_pct(s.loss_pct())),
+                _ => "замер раз в секунду".to_string(),
+            };
+            clip.text(pos2(r.left() + 14.0, r.bottom() - 15.0), Align2::LEFT_CENTER, fit_text(&p, &foot, FontId::proportional(11.0), r.width() - 28.0), FontId::proportional(11.0), DIM);
+        };
+        let target_ip = game::INET_TARGETS[target];
+        probe(card(0), "inet", "\u{E774}  Интернет", target_ip.to_string(), &inet_v, inet.as_ref(), &game::INET, icmp_failed.then_some("пинг недоступен"));
+        ui.interact(card(0), id.with("game-inet"), Sense::hover()).on_hover_text(format!("Пинг до {target_ip} раз в секунду — так быстро отвечает интернет. Для CS2 хорошо до 60 мс"));
+        let gw_empty = if icmp_failed {
+            Some("пинг недоступен")
+        } else if gw_ip.is_none() && !inet_v.is_empty() {
+            Some("роутер не найден")
+        } else if gws.is_some_and(|g| g.sent >= 3 && g.ok() == 0) {
+            Some("не отвечает на пинг")
+        } else {
+            None
+        };
+        probe(card(1), "gw", "\u{E80F}  Роутер", gw_ip.map(|ip| ip.to_string()).unwrap_or_default(), &gw_v, gws.as_ref(), &game::GATEWAY, gw_empty);
+        ui.interact(card(1), id.with("game-gw"), Sense::hover()).on_hover_text("Пинг до роутера: первый узел по пути к 1.1.1.1 (с VPN — сервер VPN). Дома должно быть до 10 мс");
+        {
+            let r = card(2);
+            glass_chip(&p, r, 18.0, 0.55);
+            let shown = if icmp_failed { None } else { level };
+            let c = tone("verdict", game::level_rgb(shown));
+            // лёгкая заливка цветом уровня сверху вниз
+            gradient_rrect(&p, r.shrink(1.0), 17.0, |q| rgba(c.r(), c.g(), c.b(), (34.0 * (1.0 - ((q.y - r.top()) / r.height()).clamp(0.0, 1.0))) as u8));
+            let (word, l1, l2) = if icmp_failed {
+                ("Пинг недоступен", "Windows не дала отправить".to_string(), "пакет проверки связи".to_string())
+            } else if level.is_none() {
+                (game::level_word(None), "меряю пинг раз в секунду".to_string(), "до роутера и до интернета".to_string())
+            } else {
+                let (a, b) = game::place_lines(place);
+                // плохо за роутером, и запущено то, что качает, — скорее всего, дело в нём
+                let b = match culprits.iter().find(|c| game::hits_network(c.kind)) {
+                    Some(c) if place == game::Place::Beyond => format!("похоже, мешает {}", game::kind_short(c.kind)),
+                    _ => b.to_string(),
+                };
+                (game::level_word(level), a.to_string(), b)
+            };
+            let clip = p.with_clip_rect(r.shrink(2.0));
+            clip.text(pos2(r.left() + 16.0, r.top() + 23.0), Align2::LEFT_CENTER, word, semi(18.0), c);
+            clip.text(pos2(r.left() + 16.0, r.top() + 50.0), Align2::LEFT_CENTER, fit_text(&p, &l1, FontId::proportional(12.0), r.width() - 30.0), FontId::proportional(12.0), FG);
+            clip.text(pos2(r.left() + 16.0, r.top() + 68.0), Align2::LEFT_CENTER, fit_text(&p, &l2, FontId::proportional(11.0), r.width() - 30.0), FontId::proportional(11.0), DIM);
+            ui.interact(r, id.with("game-verdict"), Sense::hover()).on_hover_text("Сравниваю пинг до роутера и до интернета. Плохо уже до роутера — дело дома: Wi‑Fi или кабель. До роутера быстро, а дальше медленно — у провайдера или канал забит загрузками");
+        }
+
+        // ── пинг за минуту: интернет синим с заливкой, роутер — тонкой линией, потери — красными точками
+        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), game::GRAPH_H), Sense::hover());
+        glass_chip(&p, r, 18.0, 0.45);
+        let hy = r.top() + 16.0;
+        let head = p.text(pos2(r.left() + 14.0, hy), Align2::LEFT_CENTER, "Пинг за минуту", semi(12.5), FG);
+        let small = FontId::proportional(11.0);
+        let range = inet.filter(|s| s.ok() > 0).map(|s| format!("мин {} · сред {:.0} · макс {} мс", s.min, s.avg, s.max));
+        let range_w = range.as_ref().map_or(0.0, |t| p.layout_no_wrap(t.clone(), small.clone(), DIM).size().x);
+        let legend_w = p.layout_no_wrap("интернет".into(), small.clone(), DIM).size().x + p.layout_no_wrap("роутер".into(), small.clone(), DIM).size().x + 38.0;
+        // легенда по центру, а если тесно — сразу за заголовком
+        let lx = (r.center().x - legend_w / 2.0).min(r.right() - 14.0 - range_w - 16.0 - legend_w).max(head.right() + 16.0);
+        p.circle_filled(pos2(lx + 4.0, hy), 3.5, blue);
+        let t = p.text(pos2(lx + 12.0, hy), Align2::LEFT_CENTER, "интернет", small.clone(), DIM);
+        p.circle_filled(pos2(t.right() + 18.0, hy), 3.5, accent());
+        p.text(pos2(t.right() + 26.0, hy), Align2::LEFT_CENTER, "роутер", small.clone(), DIM);
+        if let Some(t) = range {
+            p.text(pos2(r.right() - 14.0, hy), Align2::RIGHT_CENTER, t, small.clone(), DIM);
+        }
+        let plot = Rect::from_min_max(r.min + vec2(14.0, 30.0), r.max - vec2(14.0, 12.0));
+        let top = inet_v.iter().chain(gw_v.iter()).flatten().max().copied().unwrap_or(0);
+        // шкала растягивается плавно, когда приходит скачок
+        let scale = ctx.animate_value_with_time(id.with("game-scale"), game::graph_scale(top) as f32, 0.4).max(1.0);
+        let y_of = |ms: u32| plot.bottom() - plot.height() * (ms as f32).min(scale) / scale;
+        // прижато вправо по полной минуте: новое появляется справа
+        let x_of = |i: usize, n: usize| plot.right() - plot.width() * n.saturating_sub(1 + i) as f32 / (game::RING - 1) as f32;
+        p.line_segment([plot.left_bottom(), plot.right_bottom()], Stroke::new(1.0_f32, rgba(255, 255, 255, 18)));
+        for g in [60u32, 100] {
+            if (g as f32) < scale {
+                let y = y_of(g);
+                p.line_segment([pos2(plot.left(), y), pos2(plot.right() - 18.0, y)], Stroke::new(1.0_f32, rgba(255, 255, 255, 14)));
+                p.text(pos2(plot.right(), y), Align2::RIGHT_CENTER, g.to_string(), FontId::proportional(9.5), DIM);
+            }
+        }
+        let (n, m) = (inet_v.len(), gw_v.len());
+        if n >= 2 || m >= 2 {
+            let gp = p.with_clip_rect(plot.expand2(vec2(3.0, 4.0)));
+            for run in runs(&gw_v) {
+                let pts: Vec<Pos2> = run.iter().map(|&(i, ms)| pos2(x_of(i, m), y_of(ms))).collect();
+                if pts.len() >= 2 {
+                    gp.add(egui::Shape::line(pts, Stroke::new(1.4_f32, accent())));
+                } else {
+                    gp.circle_filled(pts[0], 1.4, accent());
+                }
+            }
+            for run in runs(&inet_v) {
+                let pts: Vec<Pos2> = run.iter().map(|&(i, ms)| pos2(x_of(i, n), y_of(ms))).collect();
+                if pts.len() >= 2 {
+                    let mut mesh = egui::Mesh::default();
+                    for (k, pt) in pts.iter().enumerate() {
+                        mesh.colored_vertex(*pt, Color32::from_rgba_unmultiplied(blue.r(), blue.g(), blue.b(), 40));
+                        mesh.colored_vertex(pos2(pt.x, plot.bottom()), Color32::from_rgba_unmultiplied(blue.r(), blue.g(), blue.b(), 0));
+                        if k > 0 {
+                            let i = (k * 2) as u32;
+                            mesh.add_triangle(i - 2, i - 1, i);
+                            mesh.add_triangle(i - 1, i, i + 1);
+                        }
+                    }
+                    gp.add(egui::Shape::mesh(mesh));
+                    gp.add(egui::Shape::line(pts, Stroke::new(1.8_f32, blue)));
+                } else {
+                    gp.circle_filled(pts[0], 1.8, blue);
+                }
+            }
+            for (i, x) in inet_v.iter().enumerate() {
+                if x.is_none() {
+                    gp.circle_filled(pos2(x_of(i, n), plot.bottom() - 2.0), 2.5, red);
+                }
+            }
+        } else {
+            p.text(plot.center(), Align2::CENTER_CENTER, if icmp_failed { "Пинг недоступен" } else { "Собираю данные…" }, FontId::proportional(12.0), DIM);
+        }
+
+        // ── что может мешать игре
+        ui.add_space(2.0);
+        let rows = if scanned { game::rows(&culprits, disk_free, disk_total) } else { Vec::new() };
+        let (h, _) = ui.allocate_exact_size(vec2(ui.available_width(), game::LIST_HEAD_H), Sense::hover());
+        p.text(pos2(h.left() + 4.0, h.center().y), Align2::LEFT_CENTER, "\u{E7BA}  Что может мешать игре", semi(12.5), DIM);
+        let mut right_x = h.right() - 4.0;
+        if disk_total > 0.0 {
+            let low = game::low_disk(disk_free, disk_total);
+            let t = p.text(pos2(right_x, h.center().y), Align2::RIGHT_CENTER, format!("Диск C: свободно {disk_free:.0} ГБ"), small.clone(), if low { orange } else { DIM });
+            right_x = t.left() - 14.0;
+        }
+        if rows.len() > game::MAX_ROWS {
+            let more: Vec<String> = rows[game::MAX_ROWS..].iter().map(|r| r.title.clone()).collect();
+            let t = p.text(pos2(right_x, h.center().y), Align2::RIGHT_CENTER, format!("и ещё {}", more.len()), semi(11.0), accent());
+            ui.interact(t.expand(3.0), id.with("game-more"), Sense::hover()).on_hover_text(more.join("\n"));
+        }
+        let mut go: Option<game::Open> = None;
+        if rows.is_empty() {
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), game::EMPTY_ROW_H), Sense::hover());
+            if scanned {
+                let g = p.text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, "\u{E73E}", FontId::proportional(13.0), green);
+                p.text(pos2(g.right() + 8.0, r.center().y), Align2::LEFT_CENTER, "Ничего подозрительного не запущено", FontId::proportional(12.0), FG);
+            } else {
+                p.text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, "Проверяю, что запущено…", FontId::proportional(12.0), DIM);
+            }
+        }
+        for (k, row) in rows.iter().take(game::MAX_ROWS).enumerate() {
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), game::ROW_H), Sense::hover());
+            glass_chip(&p, r, 14.0, 0.35);
+            p.text(pos2(r.left() + 18.0, r.center().y), Align2::CENTER_CENTER, row.glyph, FontId::proportional(15.0), if row.network { orange } else { accent() });
+            let text_right = if row.open.is_some() { r.right() - 120.0 } else { r.right() - 14.0 };
+            let x0 = r.left() + 38.0;
+            let clip = p.with_clip_rect(Rect::from_min_max(pos2(r.left() + 30.0, r.top()), pos2(text_right, r.bottom())));
+            let title = fit_text(&p, &row.title, semi(12.5), text_right - x0);
+            let t = clip.text(pos2(x0, r.top() + 12.5), Align2::LEFT_CENTER, title, semi(12.5), FG);
+            if t.right() + 8.0 < text_right - 20.0 {
+                clip.text(pos2(t.right() + 8.0, r.top() + 13.0), Align2::LEFT_CENTER, fit_text(&p, &row.detail, FontId::proportional(11.0), text_right - t.right() - 8.0), FontId::proportional(11.0), DIM);
+            }
+            clip.text(pos2(x0, r.top() + 27.5), Align2::LEFT_CENTER, fit_text(&p, row.hint, FontId::proportional(10.5), text_right - x0), FontId::proportional(10.5), DIM);
+            // полный текст — в подсказке над строкой
+            ui.interact(Rect::from_min_max(r.min, pos2(text_right, r.bottom())), id.with(("game-row", k)), Sense::hover()).on_hover_text(format!("{} — {}\n{}", row.title, row.detail, row.hint));
+            if let Some(o) = &row.open {
+                let b = Rect::from_min_size(pos2(r.right() - 8.0 - 104.0, r.center().y - 12.0), vec2(104.0, 24.0));
+                let resp = ui.interact(b, id.with(("game-open", k)), Sense::click()).on_hover_text(game::open_tip(o)).on_hover_cursor(egui::CursorIcon::PointingHand);
+                let hov = ctx.animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+                glass_chip(&p, b, 12.0, 0.45 + 0.4 * hov);
+                p.text(b.center(), Align2::CENTER_CENTER, format!("{} \u{E8A7}", game::open_label(o)), semi(11.5), mix(DIM, FG, 0.55 + 0.45 * hov));
+                if resp.clicked() {
+                    go = Some(o.clone());
+                }
+            }
+        }
+
+        // ── последняя игра (или идущая)
+        ui.add_space(2.0);
+        let has_game = last.is_some() || session.is_some();
+        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), if has_game { game::LAST_H } else { game::LAST_EMPTY_H }), Sense::hover());
+        // спарклайн пинга: линия цветом уровня, лёгкая заливка, потери точками
+        let spark = |rect: Rect, v: &[Option<u32>], c: Color32| {
+            let n = v.len();
+            if n < 2 {
+                return;
+            }
+            let scale = game::graph_scale(v.iter().flatten().max().copied().unwrap_or(0)) as f32;
+            p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0_f32, rgba(255, 255, 255, 16)));
+            let at = |i: usize, ms: u32| pos2(rect.left() + rect.width() * i as f32 / (n - 1) as f32, rect.bottom() - rect.height() * (ms as f32).min(scale) / scale);
+            for run in runs(v) {
+                let pts: Vec<Pos2> = run.iter().map(|&(i, ms)| at(i, ms)).collect();
+                if pts.len() < 2 {
+                    p.circle_filled(pts[0], 1.4, c);
+                    continue;
+                }
+                let mut mesh = egui::Mesh::default();
+                for (k, pt) in pts.iter().enumerate() {
+                    mesh.colored_vertex(*pt, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 34));
+                    mesh.colored_vertex(pos2(pt.x, rect.bottom()), Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 0));
+                    if k > 0 {
+                        let i = (k * 2) as u32;
+                        mesh.add_triangle(i - 2, i - 1, i);
+                        mesh.add_triangle(i - 1, i, i + 1);
+                    }
+                }
+                p.add(egui::Shape::mesh(mesh));
+                p.add(egui::Shape::line(pts, Stroke::new(1.6_f32, c)));
+            }
+            for (i, x) in v.iter().enumerate() {
+                if x.is_none() {
+                    p.circle_filled(pos2(at(i, 0).x, rect.bottom() - 1.5), 1.8, red);
+                }
+            }
+        };
+        let sp = Rect::from_min_size(pos2(r.right() - 14.0 - 150.0, r.center().y - 14.0), vec2(150.0, 28.0));
+        let x0 = r.left() + 58.0;
+        let right = sp.left() - 16.0;
+        if let Some((title, secs)) = &session {
+            glass_chip(&p, r, 18.0, 0.45);
+            let c = tone("session", game::level_rgb(level));
+            // мягко пульсирующая точка: замер идёт
+            let pulse = 0.5 + 0.5 * (ctx.input(|i| i.time) as f32 * 2.6).sin();
+            let dot = pos2(r.left() + 30.0, r.center().y);
+            p.circle_filled(dot, 9.0 + 4.0 * pulse, rgba(c.r(), c.g(), c.b(), (26.0 + 30.0 * (1.0 - pulse)) as u8));
+            p.circle_filled(dot, 5.0, c);
+            let line = format!("Идёт игра: {title} · {}", pult::fmt_duration((*secs).min(u32::MAX as u64) as u32));
+            p.text(pos2(x0, r.top() + 21.0), Align2::LEFT_CENTER, fit_text(&p, &line, semi(12.5), right - x0), semi(12.5), FG);
+            p.text(pos2(x0, r.top() + 40.0), Align2::LEFT_CENTER, fit_text(&p, "замер идёт в фоне — сводка появится после игры", small.clone(), right - x0), small.clone(), DIM);
+            spark(sp, &inet_v, c);
+        } else if let Some(s) = &last {
+            glass_chip(&p, r, 18.0, 0.45);
+            let rgb = game::level_rgb(s.level);
+            let c = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+            icon_disc(&p, pos2(r.left() + 30.0, r.center().y), 16.0, rgb, [rgb[0] / 3 * 2, rgb[1] / 3 * 2, rgb[2] / 3 * 2], "\u{E7FC}", 14.0);
+            let nums = match s.inet.filter(|i| i.ok() > 0) {
+                Some(i) => format!("пинг {} · джиттер {:.0} · потери {}", i.median, i.jitter, game::fmt_pct(i.loss_pct())),
+                None => "пинг не измерен".to_string(),
+            };
+            let nums_r = p.text(pos2(right, r.top() + 21.0), Align2::RIGHT_CENTER, &nums, semi(12.0), FG);
+            let head = fit_text(&p, &format!("Последняя игра · {}", s.title), semi(12.5), (nums_r.left() - 16.0 - x0).max(40.0));
+            p.text(pos2(x0, r.top() + 21.0), Align2::LEFT_CENTER, head, semi(12.5), FG);
+            let when = p.text(pos2(x0, r.top() + 40.0), Align2::LEFT_CENTER, format!("в {} · {}", s.ended_at, pult::fmt_duration(s.secs.min(u32::MAX as u64) as u32)), small.clone(), DIM);
+            p.circle_filled(pos2(when.right() + 8.0, r.top() + 40.0), 1.5, DIM);
+            let line = fit_text(&p, &game::summary_line(s), small.clone(), (right - when.right() - 16.0).max(20.0));
+            p.text(pos2(when.right() + 16.0, r.top() + 40.0), Align2::LEFT_CENTER, line, small.clone(), c);
+            spark(sp, &s.hist, c);
+            let gw_line = s.gw.filter(|g| g.ok() > 0).map(|g| format!("\nдо роутера: пинг {} мс, потери {}", g.median, game::fmt_pct(g.loss_pct()))).unwrap_or_default();
+            ui.interact(r, id.with("game-last"), Sense::hover()).on_hover_text(format!("{}{gw_line}\nскачков пинга: {}", game::summary_line(s), s.spikes));
+        } else {
+            glass_chip(&p, r, 16.0, 0.25);
+            p.text(r.center(), Align2::CENTER_CENTER, "\u{E7FC}  Сыграйте — после игры здесь будет сводка: пинг, скачки и что мешало", FontId::proportional(12.0), DIM);
+        }
+
+        // кнопки открывают только постоянные адреса или проверенный путь найденной программы
+        match go {
+            Some(game::Open::Uri(u)) if game::ALLOWED_URIS.contains(&u) => sys::open(u),
+            Some(game::Open::Exe(path)) => {
+                if game::safe_exe(&path) && std::path::Path::new(&path).is_file() {
+                    sys::open(&path);
+                } else {
+                    self.notify("Программа уже закрыта");
+                }
+            }
+            _ => {}
         }
     }
 
@@ -7607,7 +8045,7 @@ impl eframe::App for App {
         self.reach.step(dt);
         self.lean_s.step(dt);
         self.jelly.step(dt);
-        let side = self.fx.is_some() && self.mode == Mode::Pill && self.toast.is_none() && !self.hidden && self.upd_anim.is_none() && self.arrive_at.is_none();
+        let side = self.fx.is_some() && self.mode == Mode::Pill && self.toast.is_none() && !self.hidden && self.upd_anim.is_none() && self.arrive_at.is_none() && !self.game_quiet;
         self.bub_timer.target = if side && self.timer_end.is_some() { 1.0 } else { 0.0 };
         self.bub_call.target = if side && self.call_since.is_some() { 1.0 } else { 0.0 };
         self.bub_timer.step(dt);
@@ -7982,7 +8420,7 @@ impl eframe::App for App {
                         self.jelly.vel += 1.4;
                         self.ripple = (self.ripple + 2.5).min(7.0);
                     } else if island.clicked() {
-                        self.mode = Mode::Panel;
+                        self.open_panel_from_pill();
                     }
                     match &self.toast {
                         Some(t) if t.compact => {
@@ -8100,7 +8538,11 @@ impl eframe::App for App {
 
         // частота перерисовки: быстро только когда есть на что смотреть
         let playing = self.media_now.as_ref().is_some_and(|m| m.playing);
-        if self.hidden && self.shot.is_none() && !animating {
+        // идёт игра, остров висит пилюлей без плашки: редкие кадры, видеокарта — игре
+        let game_calm = self.game_quiet && !self.hidden && self.mode == Mode::Pill && self.toast.is_none() && self.shot.is_none() && (target - self.size).length() < 0.4 && self.vel.length() < 3.0;
+        if game_calm {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        } else if self.hidden && self.shot.is_none() && !animating {
             // остров спрятан (полноэкранная игра): кадры не нужны, только изредка проверяем, не пора ли показаться
             ctx.request_repaint_after(Duration::from_millis(400));
         } else if animating || self.shot.is_some() {
@@ -8368,6 +8810,7 @@ impl App {
             // дела: страница растёт по числу дел (до шести видно без прокрутки)
             Tab::Todo => 190.0 + self.cfg.todos.len().clamp(3, 6) as f32 * 44.0,
             Tab::System => if self.stats.battery.is_some() { 416.0 } else { 394.0 },
+            Tab::Game => self.game_height(),
             Tab::Settings => 528.0,
         }
     }
@@ -10326,6 +10769,20 @@ fn fmt_num(v: f64) -> String {
 /// Полужирный Segoe UI — заголовки, вкладки, кнопки, часы.
 fn semi(size: f32) -> FontId {
     FontId::new(size, egui::FontFamily::Name("semi".into()))
+}
+
+/// Строка в одну линию, обрезанная многоточием по ширине (короткая возвращается как есть).
+fn fit_text(p: &egui::Painter, text: &str, font: FontId, max_w: f32) -> String {
+    let g = p.layout_no_wrap(text.to_string(), font.clone(), FG);
+    if g.size().x <= max_w {
+        return text.to_string();
+    }
+    let ell = p.layout_no_wrap("…".to_string(), font, FG).size().x;
+    // в egui один символ — один глиф, поэтому число глифов равно числу символов
+    let keep = g.rows.first().map_or(0, |row| row.glyphs.iter().take_while(|gl| gl.pos.x + gl.advance_width <= max_w - ell).count());
+    let mut s: String = text.chars().take(keep).collect::<String>().trim_end().to_string();
+    s.push('…');
+    s
 }
 
 /// Светлый Segoe UI — крупные цифры.
