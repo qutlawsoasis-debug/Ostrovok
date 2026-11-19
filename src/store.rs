@@ -63,6 +63,9 @@ pub struct Settings {
     /// показывать остров и поверх полноэкранных игр и видео
     #[serde(default)]
     pub over_games: bool,
+    /// «Не беспокоить» из «Пульта»: уведомления копятся тихо, переживает перезапуск
+    #[serde(default)]
+    pub dnd: bool,
     /// не рисовать в пилюле дождь и снег по погоде
     #[serde(default)]
     pub no_wx: bool,
@@ -455,6 +458,16 @@ mod tests {
 #[cfg(test)]
 mod data_tests {
     use super::*;
+
+    #[test]
+    fn dnd_survives_restart() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!s.dnd);
+        let s: Settings = serde_json::from_str(r#"{"dnd":true}"#).unwrap();
+        assert!(s.dnd);
+        let again: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(again.dnd);
+    }
     use std::sync::atomic::Ordering;
 
     /// общий замок: каталог данных и флаги — глобальные

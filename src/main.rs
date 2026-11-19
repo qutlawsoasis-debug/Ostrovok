@@ -9,6 +9,7 @@ mod glass;
 mod install;
 mod jarvis;
 mod jarvis_ui;
+mod meter;
 mod place;
 mod setup;
 mod sound;
@@ -1122,8 +1123,6 @@ struct App {
     awake: bool,
     /// состояние «Пульта» (заполняет фоновый поток pult::start)
     pult: Arc<Mutex<pult::State>>,
-    /// «Не беспокоить»: уведомления мессенджеров не всплывают, только копятся во «Входящих»
-    dnd: bool,
     last_fg: isize,
     album: Option<[u8; 3]>,
     live: live::Live,
@@ -1218,6 +1217,17 @@ struct App {
     /// перетаскивание только что кончилось — щелчок в этом кадре не считается
     drag_eat: bool,
     drag_eat_until: Option<Instant>,
+    /// на мониторе острова сейчас полноэкранное приложение (считается раз за кадр)
+    fs_now: bool,
+    /// эквалайзер в пилюле: уровень устройства вывода, когда опрашивали, текущие и целевые высоты
+    vu: Option<sys::Meter>,
+    meter_at: Instant,
+    eq: [f32; meter::N],
+    eq_target: [f32; meter::N],
+    eq_last: Instant,
+    eq_epoch: Instant,
+    /// OSTROVOK_EQ_DEMO в тестовом запуске: столбики пляшут без звука — для снимка
+    eq_demo: bool,
     /// масштаб, при котором ставили окно
     win_ppp: f32,
 
@@ -1472,7 +1482,6 @@ impl App {
             light_theme: None,
             awake: false,
             pult: Default::default(),
-            dnd: false,
             last_fg: 0,
             album: None,
             live,
@@ -1541,6 +1550,14 @@ impl App {
             drag: None,
             drag_eat: false,
             drag_eat_until: None,
+            fs_now: false,
+            vu: None,
+            meter_at: Instant::now(),
+            eq: [0.0; meter::N],
+            eq_target: [0.0; meter::N],
+            eq_last: Instant::now(),
+            eq_epoch: Instant::now(),
+            eq_demo: test_mode() && std::env::var_os("OSTROVOK_EQ_DEMO").is_some(),
             win_ppp: 0.0,
             web: None,
             web_ctx: None,
@@ -2397,6 +2414,7 @@ impl App {
             *b += (t - *b) * if t > *b { 0.6 } else { 0.25 };
         }
         self.beat += (snd.bass - self.beat) * 0.4;
+        self.pump_eq(ctx, now);
         // постоянное прослушивание включается и выключается по настройке
         if !test_mode() && self.cfg.jarvis_listen != self.ears.watching() {
             if self.cfg.jarvis_listen {
@@ -2456,7 +2474,7 @@ impl App {
                         [0x3A, 0x9B, 0xFF]
                     };
                     let body = if n.body.is_empty() { n.app.clone() } else { n.body.clone() };
-                    if pult::should_toast(self.dnd) {
+                    if pult::should_toast(self.cfg.dnd) {
                         self.show_toast("\u{E8BD}", color, &n.title, &body, 5, false);
                     }
                     self.push_inbox(n, color);
@@ -2844,7 +2862,10 @@ impl App {
             store::Flush::Idle => {}
         }
 
-        self.hidden = !test_mode() && !self.cfg.over_games && sys::fullscreen_app_active();
+        // полноэкранное приложение смотрим на мониторе, где стоит остров (его могли перетащить)
+        let (ix, iy) = self.island_px(ctx.pixels_per_point());
+        self.fs_now = !test_mode() && sys::fullscreen_app_active_at(ix, iy);
+        self.hidden = !self.cfg.over_games && self.fs_now;
         let fg = sys::foreground_other();
         if fg != 0 {
             self.last_fg = fg;
@@ -2958,7 +2979,7 @@ impl App {
         for s in segs {
             w += match s {
                 Seg::Thumb => 20.0,
-                Seg::Eq => 24.0,
+                Seg::Eq => meter::EQ_W,
                 Seg::Track(t) => ctx.fonts(|f| f.layout_no_wrap(t.clone(), semi(13.0), FG).size().x).clamp(96.0, 170.0),
                 Seg::Text(t, _) => ctx.fonts(|f| f.layout_no_wrap(t.clone(), semi(13.5), FG).size().x),
                 Seg::Badge(n, _) => badge_w(ctx, *n),
@@ -3181,20 +3202,20 @@ impl App {
                     x += 30.0;
                 }
                 Seg::Eq => {
-                    let color = self.album.map_or(accent(), |c| Color32::from_rgb(c[0], c[1], c[2]));
-                    let live = self.sound.active();
-                    for i in 0..5 {
-                        // пять столбиков: каждый — среднее по трём соседним полосам настоящего звука
-                        let h = if live {
-                            let k = i * 3;
-                            3.0 + 13.0 * ((self.bars[k] + self.bars[k + 1] + self.bars[k + 2]) / 3.0).powf(1.4)
+                    // живой эквалайзер: высоты — по пиковому уровню устройства вывода (meter.rs), цвет — акцент темы
+                    let color = accent();
+                    let measured = self.eq_demo || self.vu.is_some() || self.fs_now;
+                    for i in 0..meter::N {
+                        let h = if measured {
+                            meter::height(self.eq[i])
                         } else {
+                            // уровень недоступен (нет устройства) — спокойное покачивание, как раньше
                             4.0 + 9.0 * (0.5 + 0.5 * ((time * (5.0 + i as f64 * 1.7) + i as f64 * 1.3).sin() as f32))
                         };
-                        let bx = x + i as f32 * 4.5;
-                        p.rect_filled(Rect::from_min_max(pos2(bx, cy + 8.0 - h), pos2(bx + 3.0, cy + 8.0)), Rounding::same(1.5), color);
+                        let bx = x + meter::bar_x(i);
+                        p.rect_filled(Rect::from_min_max(pos2(bx, cy + 8.0 - h), pos2(bx + meter::BAR_W, cy + 8.0)), Rounding::same(1.5), color);
                     }
-                    x += 34.0;
+                    x += meter::EQ_W + 10.0;
                 }
                 Seg::Track(t) => {
                     // название трека; под курсором на его месте — кнопки управления
@@ -4627,7 +4648,7 @@ impl App {
         // ── плитки: нажатие «вдавливает» плитку, включённые залиты своим цветом
         let tiles: [(&str, &str, &str, &str, bool, Color32); 4] = [
             ("mute", if muted { "\u{E74F}" } else { "\u{E767}" }, "Звук", if muted { "выключен" } else { "включён" }, !muted, accent()),
-            ("dnd", "\u{E708}", "Не беспокоить", if self.dnd { "тихо" } else { "выключено" }, self.dnd, moon),
+            ("dnd", "\u{E708}", "Не беспокоить", if self.cfg.dnd { "тихо" } else { "выключено" }, self.cfg.dnd, moon),
             ("night", "\u{E793}", "Ночной свет", "настройки", false, sun),
             ("awake", "\u{E7E8}", "Не засыпать", if self.awake { "включено" } else { "выключено" }, self.awake, Color32::from_rgb(0x7B, 0xE0, 0x9A)),
         ];
@@ -4663,8 +4684,9 @@ impl App {
                 self.vol = Some((level, !muted));
             }
             "dnd" => {
-                self.dnd = !self.dnd;
-                let (t, s) = if self.dnd { ("Не беспокоить", "уведомления копятся тихо") } else { ("Не беспокоить выключено", "уведомления снова всплывают") };
+                self.cfg.dnd = !self.cfg.dnd;
+                self.cfg.save();
+                let (t, s) = if self.cfg.dnd { ("Не беспокоить", "уведомления копятся тихо") } else { ("Не беспокоить выключено", "уведомления снова всплывают") };
                 self.show_toast("\u{E708}", [0xB4, 0x9C, 0xFF], t, s, 3, false);
             }
             "night" => sys::open("ms-settings:nightlight"),
@@ -8495,12 +8517,55 @@ impl App {
     /// Нажали на пустое место острова или на ручку: запоминаем, откуда пошли.
     fn drag_begin(&mut self, ppp: f32) {
         // спрятанный остров (полноэкранная игра) и снимок экрана не тянутся: клики уходят игре
-        if self.drag.is_some() || test_mode() || self.hidden || self.shot.is_some() || sys::fullscreen_app_active() {
+        if self.drag.is_some() || test_mode() || self.hidden || self.shot.is_some() || self.fs_now {
             return;
         }
         let Some((x, y)) = sys::cursor() else { return };
         let from = self.spot.unwrap_or([base_x(ppp) * ppp, 0.0]);
         self.drag = Some(([x as f32, y as f32], from, false));
+    }
+
+    /// Эквалайзер пилюли: опрос уровня не чаще 30 раз/с и только когда пилюля видна и звук идёт;
+    /// поверх полноэкранного приложения не опрашиваем совсем и отпускаем устройство.
+    fn pump_eq(&mut self, ctx: &egui::Context, now: Instant) {
+        let dt = now.duration_since(self.eq_last).as_secs_f32();
+        self.eq_last = now;
+        let playing = self.media_now.as_ref().is_some_and(|m| m.playing) || self.sound.active();
+        let visible = self.mode == Mode::Pill && self.toast.is_none() && !self.hidden && self.shot.is_none();
+        if self.fs_now || !visible || !playing {
+            self.eq_target = [0.0; meter::N];
+            if self.fs_now || !playing {
+                self.vu = None;
+            }
+        } else if meter::should_poll(visible, playing, self.fs_now, now.duration_since(self.meter_at)) {
+            self.meter_at = now;
+            let t = now.duration_since(self.eq_epoch).as_secs_f32();
+            let peaks = if self.eq_demo {
+                Some(meter::demo_peak(t))
+            } else {
+                if self.vu.as_ref().is_none_or(|m| m.stale()) {
+                    self.vu = sys::Meter::open();
+                }
+                let p = self.vu.as_ref().and_then(|m| m.peaks());
+                if p.is_none() {
+                    self.vu = None;
+                }
+                p
+            };
+            self.eq_target = peaks.map_or([0.0; meter::N], |(pk, [l, r])| meter::spread(meter::level(pk), [meter::level(l), meter::level(r)], t));
+        }
+        for (v, t) in self.eq.iter_mut().zip(self.eq_target) {
+            *v = meter::smooth(*v, t, dt);
+        }
+        if self.eq.iter().zip(self.eq_target).any(|(v, t)| *v > 0.0 || t > 0.0) {
+            ctx.request_repaint_after(meter::POLL);
+        }
+    }
+
+    /// Точка острова на экране (пиксели): середина поля чуть ниже верха.
+    fn island_px(&self, ppp: f32) -> (i32, i32) {
+        let s = self.spot.unwrap_or([base_x(ppp) * ppp, 0.0]);
+        ((s[0] + WIN_W / 2.0 * ppp) as i32, (s[1] + (TOP + PILL_H / 2.0) * ppp) as i32)
     }
 
     /// Каждый кадр: тянем за курсором (координаты экрана, не окна — окно само едет), при отпускании — магнит и сохранение.

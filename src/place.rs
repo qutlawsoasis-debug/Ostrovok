@@ -59,6 +59,12 @@ pub fn home(field_w: f32, ppp: f32, mon: [i32; 4]) -> [f32; 2] {
     [((mon[0] + mon[2]) as f32 / 2.0 - field_w * ppp / 2.0).round(), mon[1] as f32]
 }
 
+/// Прятать ли остров: активное окно `win` стоит на мониторе `win_mon`, остров — на `island_mon`.
+/// Прячемся, только если это тот же монитор и окно заняло его целиком (или система говорит, что идёт игра).
+pub fn hides_island(win: [i32; 4], win_mon: [i32; 4], island_mon: [i32; 4], game: bool) -> bool {
+    win_mon == island_mon && (win == win_mon || game)
+}
+
 /// Ключ монитора для настроек.
 pub fn mon_key(mon: [i32; 4]) -> String {
     format!("{},{},{},{}", mon[0], mon[1], mon[2], mon[3])
@@ -128,6 +134,22 @@ mod tests {
         assert_eq!(b, [1920.0 - 650.0, 1080.0 - 406.0]);
         assert_eq!(clamp_into([-500.0, -50.0], panel, 1.0, mon), [-130.0, -6.0]);
         assert_eq!(clamp_into([100.0, 50.0], panel, 1.0, mon), [100.0, 50.0]);
+    }
+
+    #[test]
+    fn hides_only_on_island_monitor() {
+        let a = [0, 0, 1920, 1080];
+        let b = [1920, 0, 4480, 1440];
+        // окно на весь экран острова
+        assert!(hides_island(a, a, a, false));
+        // на весь второй монитор, остров на первом
+        assert!(!hides_island(b, b, a, false));
+        assert!(!hides_island(b, b, a, true));
+        // игра на мониторе острова, окно не на весь экран (оконный режим без рамки с панелью задач)
+        assert!(hides_island([0, 0, 1920, 1040], a, a, true));
+        assert!(!hides_island([0, 0, 1920, 1040], a, a, false));
+        // остров перетащили на второй монитор, игра там
+        assert!(hides_island(b, b, b, false));
     }
 
     #[test]
