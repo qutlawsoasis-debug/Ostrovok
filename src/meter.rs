@@ -12,6 +12,13 @@ pub const STEP: f32 = 4.0;
 pub const EQ_W: f32 = STEP * (N as f32 - 1.0) + BAR_W;
 /// Опрос уровня не чаще 30 раз в секунду.
 pub const POLL: Duration = Duration::from_millis(33);
+/// Пока тихо — проверка «не заиграло ли что-нибудь» раз в полсекунды.
+pub const PROBE: Duration = Duration::from_millis(500);
+
+/// Слышно ли что-то громче шороха (около −56 дБ).
+pub fn heard(peak: f32) -> bool {
+    peak.is_finite() && peak > 0.0015
+}
 
 /// Пик 0…1 (линейный) → высота 0…1: от −48 дБ до 0 дБ, тишина и мусор — ноль.
 pub fn level(peak: f32) -> f32 {
@@ -149,6 +156,15 @@ mod tests {
         assert!(!should_poll(false, true, false, ok));
         assert!(!should_poll(true, false, false, ok));
         assert!(!should_poll(true, true, true, ok));
+    }
+
+    #[test]
+    fn heard_threshold() {
+        assert!(!heard(0.0));
+        assert!(!heard(0.001));
+        assert!(!heard(f32::NAN));
+        assert!(heard(0.01));
+        assert!(PROBE > POLL);
     }
 
     #[test]

@@ -27,11 +27,15 @@ struct State {
 #[derive(Clone)]
 pub struct Sound {
     state: Arc<Mutex<State>>,
+    /// слушать ли сейчас: выключено — поток спит, устройство освобождено
+    want: Arc<AtomicBool>,
+    thread: Option<std::thread::Thread>,
 }
 
 impl Sound {
+    /// Поток захвата стартует спящим; слушать начинает после `set_listen(true)`.
     pub fn spawn() -> Self {
-        let s = Sound { state: Arc::new(Mutex::new(State { frame: Frame::default(), loud: None })) };
+        let mut s = Sound { state: Arc::new(Mutex::new(State { frame: Frame::default(), loud: None })), want: Arc::new(AtomicBool::new(false)), thread: None };
         let state = s.state.clone();
         if std::env::var_os("OSTROVOK_SOUND_DEMO").is_some() {
             // для снимков: нарисованный звук, чтобы эквалайзер было видно без музыки
@@ -51,12 +55,34 @@ impl Sound {
             });
             return s;
         }
-        std::thread::spawn(move || loop {
+        let want = s.want.clone();
+        let th = std::thread::spawn(move || loop {
+            if !want.load(Ordering::Relaxed) {
+                std::thread::park_timeout(Duration::from_secs(5));
+                continue;
+            }
             // устройство могли отключить или сменить — тогда открываем заново
-            let _ = listen(&state);
-            std::thread::sleep(Duration::from_secs(3));
+            let _ = listen(&state, &want);
+            if want.load(Ordering::Relaxed) {
+                std::thread::park_timeout(Duration::from_secs(3));
+            }
         });
+        s.thread = Some(th.thread().clone());
         s
+    }
+
+    /// Включить или выключить захват. Выключение освобождает устройство (не позже чем через ~¼ с).
+    pub fn set_listen(&self, on: bool) {
+        if self.want.swap(on, Ordering::Relaxed) != on {
+            if !on {
+                let mut st = self.state.lock().unwrap();
+                st.loud = None;
+                st.frame = Frame::default();
+            }
+            if let Some(t) = &self.thread {
+                t.unpark();
+            }
+        }
     }
 
     /// Играет ли что-нибудь прямо сейчас.
@@ -74,8 +100,8 @@ impl Sound {
     }
 }
 
-/// Слушает устройство вывода, пока оно не сменится или не сломается.
-fn listen(state: &Arc<Mutex<State>>) -> Result<(), String> {
+/// Слушает устройство вывода, пока оно не сменится, не сломается или захват не выключат.
+fn listen(state: &Arc<Mutex<State>>, want: &AtomicBool) -> Result<(), String> {
     let host = cpal::default_host();
     let device = host.default_output_device().ok_or("нет устройства вывода")?;
     let name = device.id().map(|i| i.to_string()).unwrap_or_default();
@@ -120,8 +146,21 @@ fn listen(state: &Arc<Mutex<State>>) -> Result<(), String> {
     }
     .map_err(|e| e.to_string())?;
     stream.play().map_err(|e| e.to_string())?;
+    let mut tick = 0u32;
     loop {
-        std::thread::sleep(Duration::from_secs(4));
+        std::thread::sleep(Duration::from_millis(250));
+        if !want.load(Ordering::Relaxed) {
+            // выключили (игра, панель закрыта): stream уничтожается — устройство и аудиопоток освобождены
+            drop(stream);
+            let mut st = state.lock().unwrap();
+            st.loud = None;
+            st.frame = Frame::default();
+            return Ok(());
+        }
+        tick = tick.wrapping_add(1);
+        if tick % 16 != 0 {
+            continue;
+        }
         if broken.load(Ordering::Relaxed) {
             return Err("поток звука оборвался".into());
         }

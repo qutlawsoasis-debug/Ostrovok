@@ -100,7 +100,7 @@ pub fn spawn() -> (Arc<Mutex<State>>, mpsc::Sender<Cmd>) {
         let mut last_dur = 0.0f64;
         let mut switched_at = Instant::now();
         loop {
-            let cmd = match rx.recv_timeout(Duration::from_millis(1000)) {
+            let cmd = match rx.recv_timeout(crate::quiet::poll_every(crate::quiet::Src::Media, crate::quiet::in_game())) {
                 Ok(c) => Some(c),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,

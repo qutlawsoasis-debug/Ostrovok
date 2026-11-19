@@ -787,9 +787,11 @@ pub fn spawn_downloads(report: impl Fn(String) + Send + 'static, progress: Arc<s
         loop {
             // пока ничего не качается, папку смотрим раз в три секунды, а не каждую — меньше работы диску во время игр
             let busy = last > 0;
-            std::thread::sleep(std::time::Duration::from_secs(if busy { 1 } else { 3 }));
+            // в полноэкранной игре — раз в 15 с
+            let pause = crate::quiet::poll_every(crate::quiet::Src::Downloads { busy }, crate::quiet::in_game());
+            std::thread::sleep(pause);
             let size = partial();
-            let dt = if busy { 1.0 } else { 3.0 };
+            let dt = pause.as_secs_f32();
             let speed = size.saturating_sub(last) as f32 / dt;
             last = size;
             // загрузка считается идущей, пока файл растёт; три секунды без роста — пауза или конец
@@ -1513,6 +1515,8 @@ pub struct Watch {
     pub layout: u16,
     /// удалось ли прочитать громкость
     pub ok: bool,
+    /// активное окно: при его смене (выход из игры) интерфейс просыпается сразу
+    pub fg: isize,
 }
 
 /// Следит за громкостью и раскладкой в стороне от интерфейса; wake зовётся при каждом изменении.
@@ -1542,7 +1546,9 @@ pub fn spawn_watch(wake: impl Fn() + Send + 'static) -> Arc<std::sync::Mutex<Wat
             if !w.ok {
                 endpoint = None;
             }
-            let tid = GetWindowThreadProcessId(GetForegroundWindow(), None);
+            let fg = GetForegroundWindow();
+            w.fg = fg.0 as isize;
+            let tid = GetWindowThreadProcessId(fg, None);
             w.layout = (GetKeyboardLayout(tid).0 as usize & 0xFFFF) as u16;
             let changed = {
                 let mut s = shared.lock().unwrap();
@@ -1553,7 +1559,7 @@ pub fn spawn_watch(wake: impl Fn() + Send + 'static) -> Arc<std::sync::Mutex<Wat
             if changed {
                 wake();
             }
-            std::thread::sleep(std::time::Duration::from_millis(120));
+            std::thread::sleep(crate::quiet::poll_every(crate::quiet::Src::Watch, crate::quiet::in_game()));
         }
     });
     out
