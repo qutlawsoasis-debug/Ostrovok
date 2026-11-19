@@ -991,7 +991,6 @@ fn endpoint_volume(capture: bool) -> Option<windows::Win32::Media::Audio::Endpoi
 /// и пересоздаётся раз в 3 секунды, чтобы переживать смену устройства вывода.
 pub struct Meter {
     meter: windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation,
-    volume: Option<windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume>,
     born: std::time::Instant,
 }
 
@@ -1003,8 +1002,7 @@ impl Meter {
             let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
             let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
             let meter = device.Activate(CLSCTX_ALL, None).ok()?;
-            let volume = device.Activate(CLSCTX_ALL, None).ok();
-            Some(Self { meter, volume, born: std::time::Instant::now() })
+            Some(Self { meter, born: std::time::Instant::now() })
         }
     }
 
@@ -1013,15 +1011,12 @@ impl Meter {
         self.born.elapsed() > std::time::Duration::from_secs(3)
     }
 
-    /// Общий пик и пики левого/правого каналов, 0…1. При выключенном звуке — тишина.
+    /// Общий пик и пики левого/правого каналов, 0…1 (выключенный звук учитывает вызывающий).
     pub fn peaks(&self) -> Option<(f32, [f32; 2])> {
         unsafe {
-            if self.volume.as_ref().is_some_and(|v| v.GetMute().is_ok_and(|m| m.as_bool())) {
-                return Some((0.0, [0.0, 0.0]));
-            }
             let peak = sane_level(self.meter.GetPeakValue().ok()?).unwrap_or(0.0);
-            let n = (self.meter.GetMeteringChannelCount().unwrap_or(0) as usize).min(8);
-            let mut ch = [0.0f32; 8];
+            let n = (self.meter.GetMeteringChannelCount().unwrap_or(0) as usize).min(32);
+            let mut ch = [0.0f32; 32];
             let lr = if n >= 1 && self.meter.GetChannelsPeakValues(&mut ch[..n]).is_ok() {
                 let l = sane_level(ch[0]).unwrap_or(0.0);
                 let r = if n >= 2 { sane_level(ch[1]).unwrap_or(0.0) } else { l };

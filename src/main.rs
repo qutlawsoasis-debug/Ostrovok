@@ -1226,6 +1226,8 @@ struct App {
     eq_target: [f32; meter::N],
     eq_last: Instant,
     eq_epoch: Instant,
+    /// после неудачного открытия устройства не пробуем снова до этого момента
+    vu_retry: Instant,
     /// OSTROVOK_EQ_DEMO в тестовом запуске: столбики пляшут без звука — для снимка
     eq_demo: bool,
     /// масштаб, при котором ставили окно
@@ -1557,6 +1559,7 @@ impl App {
             eq_target: [0.0; meter::N],
             eq_last: Instant::now(),
             eq_epoch: Instant::now(),
+            vu_retry: Instant::now(),
             eq_demo: test_mode() && std::env::var_os("OSTROVOK_EQ_DEMO").is_some(),
             win_ppp: 0.0,
             web: None,
@@ -2414,7 +2417,6 @@ impl App {
             *b += (t - *b) * if t > *b { 0.6 } else { 0.25 };
         }
         self.beat += (snd.bass - self.beat) * 0.4;
-        self.pump_eq(ctx, now);
         // постоянное прослушивание включается и выключается по настройке
         if !test_mode() && self.cfg.jarvis_listen != self.ears.watching() {
             if self.cfg.jarvis_listen {
@@ -2866,6 +2868,7 @@ impl App {
         let (ix, iy) = self.island_px(ctx.pixels_per_point());
         self.fs_now = !test_mode() && sys::fullscreen_app_active_at(ix, iy);
         self.hidden = !self.cfg.over_games && self.fs_now;
+        self.pump_eq(ctx, now);
         let fg = sys::foreground_other();
         if fg != 0 {
             self.last_fg = fg;
@@ -7756,7 +7759,7 @@ impl eframe::App for App {
         let dripping = !flask && self.mode == Mode::Pill && self.media_now.as_ref().is_some_and(|m| m.playing);
         let glowing_music = self.album.is_some() && self.media_now.as_ref().is_some_and(|m| m.playing);
         let glowing = self.glow.is_some_and(|g| g.1.elapsed().as_secs_f32() < 1.3);
-        let moving = !self.reach.settled() || self.reach.v > 0.01 || !self.lean_s.settled() || !self.jelly.settled() || self.ripple > 0.0 || dripping || glowing || glowing_music || self.sound.active() || sloshing || !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || !self.bub_dl.settled() || self.sheen_at.elapsed().as_secs_f32() < 0.75;
+        let moving = !self.hidden && (!self.reach.settled() || self.reach.v > 0.01 || !self.lean_s.settled() || !self.jelly.settled() || self.ripple > 0.0 || dripping || glowing || glowing_music || self.sound.active() || sloshing || !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || !self.bub_dl.settled() || self.sheen_at.elapsed().as_secs_f32() < 0.75);
         let animating = animating || moving || self.drag.is_some();
         let scaled = rect_v.size() * self.jelly.v;
         let rect_v = Rect::from_min_size(pos2(WIN_W / 2.0 - scaled.x / 2.0 + self.lean_s.v, TOP + self.drop_y), scaled);
@@ -8530,25 +8533,40 @@ impl App {
     fn pump_eq(&mut self, ctx: &egui::Context, now: Instant) {
         let dt = now.duration_since(self.eq_last).as_secs_f32();
         self.eq_last = now;
+        if self.fs_now || self.hidden {
+            // полноэкранная игра или остров спрятан: ни опроса, ни устройства, ни перерисовки
+            self.eq = [0.0; meter::N];
+            self.eq_target = self.eq;
+            self.vu = None;
+            return;
+        }
         let playing = self.media_now.as_ref().is_some_and(|m| m.playing) || self.sound.active();
-        let visible = self.mode == Mode::Pill && self.toast.is_none() && !self.hidden && self.shot.is_none();
-        if self.fs_now || !visible || !playing {
+        // те же условия, при которых segments() кладёт в пилюлю эквалайзер
+        let visible = self.mode == Mode::Pill && self.toast.is_none() && self.note.is_none() && self.shot.is_none();
+        if !visible || !playing {
             self.eq_target = [0.0; meter::N];
-            if self.fs_now || !playing {
+            if !playing {
                 self.vu = None;
             }
         } else if meter::should_poll(visible, playing, self.fs_now, now.duration_since(self.meter_at)) {
             self.meter_at = now;
-            let t = now.duration_since(self.eq_epoch).as_secs_f32();
+            // время по кругу в час: синусы покачивания не теряют точность за сутки работы
+            let t = (now.duration_since(self.eq_epoch).as_secs_f64() % 3600.0) as f32;
+            let muted = self.watch.lock().map(|w| w.ok && w.muted).unwrap_or(false);
             let peaks = if self.eq_demo {
                 Some(meter::demo_peak(t))
+            } else if muted {
+                Some((0.0, [0.0, 0.0]))
             } else {
-                if self.vu.as_ref().is_none_or(|m| m.stale()) {
+                if self.vu.as_ref().is_none_or(|m| m.stale()) && now >= self.vu_retry {
                     self.vu = sys::Meter::open();
+                    if self.vu.is_none() {
+                        self.vu_retry = now + Duration::from_secs(3);
+                    }
                 }
                 let p = self.vu.as_ref().and_then(|m| m.peaks());
-                if p.is_none() {
-                    self.vu = None;
+                if p.is_none() && self.vu.take().is_some() {
+                    self.vu_retry = now + Duration::from_secs(3);
                 }
                 p
             };
