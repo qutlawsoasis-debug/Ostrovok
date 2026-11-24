@@ -143,10 +143,17 @@ pub fn should_toast(dnd: bool) -> bool {
 
 // ───────────── опрос Windows ─────────────
 
-/// Как часто опрашивать Bluetooth (секунды): страница открыта — часто, иначе редко,
-/// только чтобы заметить подключённые наушники.
+/// Как часто опрашивать Bluetooth (секунды): страница открыта — часто, иначе редко.
+/// Наушники в фоне замечаются по смене звуковых устройств (bt_due), этот срок — запасной
+/// (заряд мыши и геймпада). Раньше фоновый опрос шёл раз в 90 с — ~960 запусков PowerShell в сутки.
 pub fn bt_poll_secs(visible: bool) -> u64 {
-    if visible { 10 } else { 90 }
+    if visible { 10 } else { 900 }
+}
+
+/// Пора ли опросить Bluetooth: первый раз, по сроку bt_poll_secs, или через 3 с после смены
+/// звуковых устройств (наушники подключились — PnP успевает отметить их подключёнными).
+pub fn bt_due(first: bool, since_poll: Duration, visible: bool, devices_changed_ago: Option<Duration>) -> bool {
+    first || since_poll >= Duration::from_secs(bt_poll_secs(visible)) || devices_changed_ago.is_some_and(|d| d >= Duration::from_secs(3))
 }
 
 pub fn start(state: Arc<Mutex<State>>, ctx: eframe::egui::Context) {
@@ -191,16 +198,35 @@ pub fn start(state: Arc<Mutex<State>>, ctx: eframe::egui::Context) {
     }
     // Bluetooth: внешний процесс, поэтому отдельный поток и редкий опрос
     std::thread::spawn(move || {
+        // звуковые устройства спрашиваются через COM
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+        }
         let mut last: Option<std::time::Instant> = None;
+        // отпечаток звуковых устройств и когда он сменился (раз в 5 с — дешёвый вызов внутри процесса)
+        let (mut sig, mut sig_at, mut changed_at) = (crate::sys::audio_devices_sig(), std::time::Instant::now(), None::<std::time::Instant>);
+        let mut retry: Option<std::time::Instant> = None;
         loop {
             let (visible, frozen) = match state.lock() {
                 Ok(s) => (s.visible, s.frozen),
                 Err(_) => return,
             };
-            let due = last.is_none_or(|t| t.elapsed() >= Duration::from_secs(bt_poll_secs(visible)));
+            if sig_at.elapsed() >= Duration::from_secs(5) {
+                sig_at = std::time::Instant::now();
+                let now_sig = crate::sys::audio_devices_sig();
+                if now_sig.is_some() && now_sig != sig {
+                    sig = now_sig;
+                    changed_at = Some(std::time::Instant::now());
+                }
+            }
+            let due = bt_due(last.is_none(), last.map_or(Duration::ZERO, |t| t.elapsed()), visible, changed_at.map(|t| t.elapsed()))
+                || retry.is_some_and(|t| std::time::Instant::now() >= t);
             // в полноэкранной игре PowerShell не запускаем совсем: опросим после игры
             if !frozen && due && crate::quiet::allowed(crate::quiet::Job::Bluetooth, crate::quiet::in_game()) {
                 last = Some(std::time::Instant::now());
+                // после опроса по смене устройств — ещё один через 20 с: «подключено» и заряд
+                // наушники отдают Windows с задержкой
+                retry = changed_at.take().map(|_| std::time::Instant::now() + Duration::from_secs(20));
                 if let Some(devs) = bt_devices() {
                     if let Ok(mut s) = state.lock() {
                         if s.primed {
@@ -382,6 +408,22 @@ mod tests {
         assert_eq!(device_glyph("Logitech Mouse"), "\u{E962}");
         assert_eq!(device_glyph("Galaxy Buds"), "\u{E7F6}");
         assert_eq!(device_glyph("Что-то"), "\u{E702}");
+    }
+
+    #[test]
+    fn bt_polls_on_device_change_not_by_clock() {
+        let s = Duration::from_secs;
+        // первый раз — сразу
+        assert!(bt_due(true, s(0), false, None));
+        // в фоне без изменений — не раньше чем через 15 минут
+        assert!(!bt_due(false, s(120), false, None));
+        assert!(!bt_due(false, s(899), false, None));
+        assert!(bt_due(false, s(900), false, None));
+        // звуковые устройства сменились — через 3 с, не мгновенно
+        assert!(!bt_due(false, s(30), false, Some(s(1))));
+        assert!(bt_due(false, s(30), false, Some(s(3))));
+        // страница открыта — раз в 10 с
+        assert!(bt_due(false, s(10), true, None));
     }
 
     #[test]

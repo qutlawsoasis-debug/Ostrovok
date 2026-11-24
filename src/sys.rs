@@ -1200,6 +1200,32 @@ pub fn set_light_theme(light: bool) {
     });
 }
 
+/// Отпечаток набора активных звуковых устройств (вывод и ввод). Подключили Bluetooth-наушники —
+/// появилось новое устройство, отпечаток сменился. Дёшево: спрашивает Windows в своём процессе,
+/// без внешних программ. В потоке должен быть включён COM. None — Windows не ответила.
+pub fn audio_devices_sig() -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    use windows::Win32::Media::Audio::{eAll, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE};
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
+    unsafe {
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let list = enumerator.EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE).ok()?;
+        let mut ids: Vec<String> = Vec::new();
+        for i in 0..list.GetCount().ok()? {
+            if let Ok(dev) = list.Item(i) {
+                if let Ok(id) = dev.GetId() {
+                    ids.push(id.to_string().unwrap_or_default());
+                    CoTaskMemFree(Some(id.0 as *const _));
+                }
+            }
+        }
+        ids.sort();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        ids.hash(&mut h);
+        Some(h.finish())
+    }
+}
+
 /// Сколько в корзине: число объектов и размер в байтах.
 pub fn recycle_bin() -> (i64, i64) {
     use windows::Win32::UI::Shell::{SHQueryRecycleBinW, SHQUERYRBINFO};
@@ -2078,4 +2104,20 @@ pub fn left_button_down() -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
     let vk = if unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0 { VK_RBUTTON } else { VK_LBUTTON };
     unsafe { GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000 != 0 }
+}
+
+#[cfg(test)]
+mod audio_sig_live {
+    /// Живая проверка на настоящей Windows: `cargo test -- --ignored audio_sig`
+    #[test]
+    #[ignore]
+    fn audio_sig_answers() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+        }
+        let a = super::audio_devices_sig();
+        let b = super::audio_devices_sig();
+        assert!(a.is_some(), "Windows не ответила");
+        assert_eq!(a, b, "без изменений отпечаток стабилен");
+    }
 }
