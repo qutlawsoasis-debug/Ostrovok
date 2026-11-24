@@ -1247,6 +1247,9 @@ struct App {
     size_settled: bool,
     /// когда был прошлый кадр (свой шаг времени, см. update)
     frame_at: Instant,
+    /// где был курсор в прошлом кадре (в координатах поля) — стоящий курсор не требует кадров
+    cursor_seen: Option<Pos2>,
+    cursor_moved_at: Option<Instant>,
     /// подсказки острова (tick_hints): когда проверяли и когда говорили про дождь
     hints_at: Option<Instant>,
     rain_told: Option<Instant>,
@@ -1618,6 +1621,8 @@ impl App {
             note_trash: None,
             bin_probe: Probe::new(),
             frame_at: Instant::now(),
+            cursor_seen: None,
+            cursor_moved_at: None,
             // первая проверка — через минуту после запуска: погода к тому времени обычно уже пришла
             hints_at: Some(Instant::now()),
             rain_told: None,
@@ -8470,6 +8475,13 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let now = Instant::now();
+        // общий предел кадров (вертикальная синхронизация выключена): egui и потоки просят перерисовку
+        // «сразу», и без предела анимация наведения крутила бы тысячи кадров в секунду
+        let since = now.duration_since(self.frame_at);
+        if since < MIN_FRAME_GAP {
+            std::thread::sleep(MIN_FRAME_GAP - since);
+        }
+        let now = Instant::now();
         // шаг времени — по настоящим часам: при редких кадрах (украшения, 30 Гц) egui подставляет
         // предсказанные 1/60 с, и капли, рябь и плеск шли бы вдвое медленнее
         let dt = frame_dt(now.duration_since(self.frame_at).as_secs_f32());
@@ -9276,16 +9288,37 @@ impl eframe::App for App {
         // только фоновые украшения: пилюля «дышит» под звук, эквалайзер, капли, отблеск — никто её не трогает
         // и форма не меняется. Им хватает 30 кадров: раньше они шли с частотой монитора (144+ на игровом),
         // и пилюля под голос в Discord ела ~22 % ядра и 10 % видеокарты
-        let ambient = ambient_frames(animating, transition, self.drag.is_some(), over, self.mode == Mode::Pill, self.shot.is_some());
+        let ambient = ambient_frames(animating, transition, self.drag.is_some(), self.shot.is_some());
+        // двигался ли курсор с прошлого кадра (больше полпикселя)
+        let cursor_moved = match (cursor, self.cursor_seen) {
+            (Some(a), Some(b)) => (a - b).length() > 0.5,
+            (a, b) => a.is_some() != b.is_some(),
+        };
+        self.cursor_seen = cursor;
+        // «двигался недавно» — с удержанием 250 мс: медленное движение даёт за кадр меньше полпикселя,
+        // и без удержания частота прыгала бы между 16 и 50 мс, а блик дёргался
+        if cursor_moved {
+            self.cursor_moved_at = Some(now);
+        }
+        let cursor_recent = self.cursor_moved_at.is_some_and(|t| now.duration_since(t) < Duration::from_millis(250));
         let want = if self.hidden && self.shot.is_none() && !animating {
             // остров спрятан (полноэкранная игра): кадры не нужны, только изредка проверяем, не пора ли показаться
             quiet::GAME_FRAME
         } else if ambient {
             AMBIENT_FRAME
         } else if animating || self.shot.is_some() {
-            Duration::ZERO
-        } else if self.mode != Mode::Pill || dist < 420.0 || playing {
+            // переходы — до ~120 кадров (без вертикальной синхронизации ZERO означало бы «без предела»)
+            FAST_FRAME
+        } else if self.mode != Mode::Pill || playing {
+            // открытая панель без анимаций: наведение и щелчки egui перерисует сам по событиям мыши,
+            // а живому содержимому (ход трека, часы, графики) хватает 30 кадров
+            AMBIENT_FRAME
+        } else if dist < 420.0 && cursor_recent {
+            // курсор рядом и двигается — блик на стекле и тяга к курсору идут плавно
             Duration::from_millis(16)
+        } else if dist < 420.0 {
+            // курсор рядом, но стоит — рисовать нечего, только ловим начало движения
+            Duration::from_millis(50)
         } else if self.precipitation() > 0 {
             // дождь и снег идут плавно, но без гонки кадров
             Duration::from_millis(33)
@@ -10281,30 +10314,35 @@ mod morning_brief_tests {
     }
 }
 
+/// Кадр для переходов (раскрытие, наведение, перетаскивание): ≈120 в секунду.
+const FAST_FRAME: Duration = Duration::from_millis(8);
+
+/// Самый короткий промежуток между кадрами (≈140 в секунду) — предел для «сразу».
+const MIN_FRAME_GAP: Duration = Duration::from_millis(7);
+
 /// Кадр для фоновых украшений пилюли (≈30 в секунду).
 const AMBIENT_FRAME: Duration = Duration::from_millis(33);
 
-/// Идут ли только фоновые украшения: что-то анимируется, но форма не меняется, остров не трогают,
-/// это пилюля (не панель) и не снимок экрана. Тогда хватает AMBIENT_FRAME вместо частоты монитора.
-fn ambient_frames(animating: bool, transition: bool, dragging: bool, over: bool, pill: bool, shot: bool) -> bool {
-    animating && !transition && !dragging && !over && pill && !shot
+/// Идут ли только фоновые украшения (звук, музыка, капли, отблеск): что-то анимируется, но форма
+/// не меняется, остров не тянут и это не снимок экрана. Хватает AMBIENT_FRAME — и в пилюле, и в панели
+/// (наведение и щелчки в панели egui перерисовывает сам по событиям мыши).
+fn ambient_frames(animating: bool, transition: bool, dragging: bool, shot: bool) -> bool {
+    animating && !transition && !dragging && !shot
 }
 
 #[cfg(test)]
 mod ambient_tests {
     #[test]
-    fn only_untouched_decorations_are_capped() {
+    fn only_decorations_are_capped() {
         use super::ambient_frames as a;
-        // пилюля дышит под звук, никто не трогает — 30 кадров
-        assert!(a(true, false, false, false, true, false));
-        // раскрывается, тянут, наводят, панель, снимок — полная частота
-        assert!(!a(true, true, false, false, true, false));
-        assert!(!a(true, false, true, false, true, false));
-        assert!(!a(true, false, false, true, true, false));
-        assert!(!a(true, false, false, false, false, false));
-        assert!(!a(true, false, false, false, true, true));
+        // украшения (звук, музыка, капли) — 30 кадров и в пилюле, и в открытой панели
+        assert!(a(true, false, false, false));
+        // переход формы, перетаскивание, снимок — полная частота
+        assert!(!a(true, true, false, false));
+        assert!(!a(true, false, true, false));
+        assert!(!a(true, false, false, true));
         // ничего не анимируется — это не про украшения
-        assert!(!a(false, false, false, false, true, false));
+        assert!(!a(false, false, false, false));
     }
 }
 
@@ -12491,7 +12529,9 @@ fn main() -> eframe::Result<()> {
     if !test || test_x.is_some() {
         viewport = viewport.with_always_on_top();
     }
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    // без вертикальной синхронизации: частоту кадров остров задаёт сам (request_repaint_after),
+    // а драйвер, ожидая синхронизацию, крутил процессор вхолостую. Окно составляет DWM — разрывов нет
+    let options = eframe::NativeOptions { viewport, vsync: false, ..Default::default() };
     eframe::run_native("Островок", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
