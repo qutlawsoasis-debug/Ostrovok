@@ -54,6 +54,9 @@ pub fn spawn(mirror_on: bool, report: impl Fn(Notice) + Send + 'static) -> Live 
 
             if !mirror.load(Ordering::Relaxed) {
                 asked = false; // выключили и включили снова — спросим разрешение ещё раз
+                // и не вываливаем пачкой всё, что пришло, пока зеркало было выключено
+                primed = false;
+                seen.clear();
             } else {
                 if listener.is_none() && !asked {
                     asked = true;

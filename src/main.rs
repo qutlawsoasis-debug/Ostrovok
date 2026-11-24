@@ -523,14 +523,20 @@ fn parse_quick(q: &str, now: chrono::NaiveDateTime) -> Option<Quick> {
             None
         }
     };
-    let text_of = |skip: std::ops::Range<usize>| words.iter().enumerate().filter(|(i, _)| !skip.contains(i)).map(|(_, w)| *w).collect::<Vec<_>>().join(" ");
+    // «завтра» и «послезавтра» сдвигают день; само слово в текст напоминания не попадает
+    let shift = words.iter().position(|w| matches!(w.to_lowercase().as_str(), "завтра" | "послезавтра")).map(|i| (i, if words[i].to_lowercase() == "завтра" { 1 } else { 2 }));
+    let text_of = |skip: std::ops::Range<usize>| words.iter().enumerate().filter(|(i, _)| !skip.contains(i) && shift.map_or(true, |s| s.0 != *i)).map(|(_, w)| *w).collect::<Vec<_>>().join(" ");
     for i in 0..words.len() {
         let w = words[i].to_lowercase();
         // «в 18:30» или «18:30»
         let (start, t) = if w == "в" && i + 1 < words.len() { (i, clock(words[i + 1]).map(|t| (t, i + 2))) } else { (i, clock(&w).map(|t| (t, i + 1))) };
         if let Some((t, end)) = t {
             let text = text_of(start..end);
-            return (!text.is_empty()).then(|| Quick::Remind(text, at_clock(t)));
+            let at = match shift {
+                Some((_, days)) => now.date().and_time(t) + chrono::Duration::days(days),
+                None => at_clock(t),
+            };
+            return (!text.is_empty()).then(|| Quick::Remind(text, at));
         }
         // «через 15 мин», «через час», «через 2 часа»
         if w == "через" && i + 1 < words.len() {
@@ -975,6 +981,9 @@ mod quick_tests {
         assert_eq!(parse_quick("напомни выключить духовку через 2 часа", now), Some(Quick::Remind("выключить духовку".into(), at(17, 0))));
         // время уже прошло — завтра
         assert_eq!(parse_quick("напомни 9:00 зарядка", now), Some(Quick::Remind("зарядка".into(), at(9, 0) + chrono::Duration::days(1))));
+        // «завтра» сдвигает день, даже если время сегодня ещё не прошло, и в текст не попадает
+        assert_eq!(parse_quick("напомни завтра в 18:30 позвонить", now), Some(Quick::Remind("позвонить".into(), at(18, 30) + chrono::Duration::days(1))));
+        assert_eq!(parse_quick("напомни послезавтра 9:00 врач", now), Some(Quick::Remind("врач".into(), at(9, 0) + chrono::Duration::days(2))));
         assert_eq!(parse_quick("напомни 18:30", now), None);
         assert_eq!(parse_quick("дело", now), None);
         assert_eq!(parse_quick("делать нечего", now), None);
@@ -1222,6 +1231,16 @@ struct App {
     acrylic: Option<bool>,
     /// последнее заданное положение и размер настоящего окна
     win_last: Option<[i32; 4]>,
+    /// размер окна, пока идёт анимация: только растёт, уменьшается через WIN_SHRINK_AFTER после её конца
+    win_span: Option<Rect>,
+    win_busy_at: Instant,
+    /// подсказки для строк буфера (см. cached_hint)
+    hint_cache: std::collections::HashMap<String, Option<Hint>>,
+    /// окно ставим сами через SetWindowPos — тогда рисуем от запрошенного места, а не от устаревшего inner_rect
+    win_by_hwnd: bool,
+    /// сырое «полноэкранное приложение» и с какого момента оно не меняется (задержка против мигания)
+    fs_raw: bool,
+    fs_since: Instant,
     /// начало поля острова в пикселях экрана, если остров перетащили (None — по центру сверху)
     spot: Option<[f32; 2]>,
     /// идёт нажатие на остров: где нажали, откуда поле, тронулось ли
@@ -1571,6 +1590,12 @@ impl App {
             lyrics_key: String::new(),
             acrylic: None,
             win_last: None,
+            win_span: None,
+            win_busy_at: Instant::now(),
+            hint_cache: Default::default(),
+            win_by_hwnd: false,
+            fs_raw: false,
+            fs_since: Instant::now(),
             spot: spot0,
             drag: None,
             drag_eat: false,
@@ -2014,6 +2039,14 @@ impl App {
             }
             out
         };
+        // карточку напоминания ничто, кроме другого напоминания, не перебивает, пока она не истекла:
+        // раньше сообщение из мессенджера или смена трека стирали её текст через секунду
+        const REMIND: &str = "\u{E823}";
+        // таймер и «Фокус» пользователь запускал сам — их карточки проходят всегда
+        const TIMER: &str = "\u{E916}";
+        if glyph != REMIND && glyph != TIMER && self.toast.as_ref().is_some_and(|t| t.glyph == REMIND && t.until > Instant::now()) {
+            return;
+        }
         self.toast_tab = None;
         self.toast = Some(Toast { glyph, color, title: short(title, 44), text: short(text, 56), until: Instant::now() + Duration::from_secs(secs), cover, level: None, compact: false });
         self.ripple = (self.ripple + 4.0).min(7.0);
@@ -2428,7 +2461,14 @@ impl App {
                 self.set_clipboard(&s);
                 self.notify(&format!("Скопировано: {s}"));
             }
-            Action::Timer(m) => self.start_timer(m),
+            Action::Timer(m) => {
+                // таймер из поиска заменяет «Фокус»: без сброса его минуты засчитывались как рабочий круг
+                if timer_minutes_ok(m) && self.focus.is_some() {
+                    self.credit_focus();
+                    self.focus = None;
+                }
+                self.start_timer(m)
+            }
             Action::Ask(q) if self.api_key().is_empty() => self.open_ai_site(&q),
             Action::Ask(q) => {
                 self.mode = Mode::Panel;
@@ -2946,6 +2986,10 @@ impl App {
                 }
             }
             self.show_toast("\u{E823}", [0xFF, 0x6B, 0x61], "Напоминание", &due.join("; "), 12, false);
+            // карточка живёт 12 с и режет текст — полный текст остаётся в «Уведомлениях»
+            for text in &due {
+                self.push_inbox(live::Notice { app: "Островок".into(), title: "Напоминание".into(), body: text.clone() }, [0xFF, 0x6B, 0x61]);
+            }
             self.emotion = Emotion::Surprised;
             self.emotion_until = now + Duration::from_secs(4);
         }
@@ -2989,7 +3033,18 @@ impl App {
 
         // полноэкранное приложение смотрим на мониторе, где стоит остров (его могли перетащить)
         let (ix, iy) = self.island_px(ctx.pixels_per_point());
-        self.fs_now = !test_mode() && sys::fullscreen_app_active_at(ix, iy);
+        // с задержкой: системные окна на весь экран (переключение окон, блокировка) бывают активными
+        // долю секунды, и без задержки остров на это мгновение пропадал — выглядело как мигание
+        let raw = !test_mode() && sys::fullscreen_app_active_at(ix, iy);
+        if raw != self.fs_raw {
+            self.fs_raw = raw;
+            self.fs_since = now;
+        }
+        if self.fs_now != raw && now.duration_since(self.fs_since) >= fs_settle(raw) {
+            self.fs_now = raw;
+        } else if self.fs_now != raw {
+            ctx.request_repaint_after(fs_settle(raw).saturating_sub(now.duration_since(self.fs_since)));
+        }
         self.hidden = !self.cfg.over_games && self.fs_now;
         quiet::set_in_game(self.fs_now);
         let fg = sys::foreground_other();
@@ -3283,13 +3338,13 @@ impl App {
                 let seed = i as f32 * 12.9898 + 4.1;
                 let fx = frac(seed.sin() * 43758.547);
                 let speed = if wet == 1 { 46.0 } else { 9.0 } * (0.7 + 0.6 * frac(seed * 1.7));
-                let y = rect.top() - 5.0 + (time as f32 * speed + frac(seed * 3.1) * (h + 10.0)) % (h + 10.0);
+                let y = rect.top() - 5.0 + (anim_t(time) * speed + frac(seed * 3.1) * (h + 10.0)) % (h + 10.0);
                 let fade = (1.0 - ((y - rect.center().y).abs() / (h / 2.0)).powi(4)).clamp(0.0, 1.0);
                 if wet == 1 {
                     let x = rect.left() + inset + fx * span - (y - rect.top()) * 0.25;
                     p.line_segment([pos2(x, y), pos2(x - 1.4, y + 5.5)], Stroke::new(1.1_f32, rgba(150, 195, 255, (70.0 * fade) as u8)));
                 } else {
-                    let x = rect.left() + inset + fx * span + (time as f32 * 0.9 + seed).sin() * 3.0;
+                    let x = rect.left() + inset + fx * span + (anim_t(time) * 0.9 + seed).sin() * 3.0;
                     p.circle_filled(pos2(x, y), 1.0 + 0.6 * frac(seed * 5.3), rgba(255, 255, 255, (100.0 * fade) as u8));
                 }
             }
@@ -3348,7 +3403,7 @@ impl App {
                         let shift = if over > 0.0 {
                             let travel = over / 22.0;
                             let period = travel + 3.0;
-                            let ph = time as f32 % (2.0 * period);
+                            let ph = anim_t(time) % (2.0 * period);
                             let u = if ph < period { ph } else { 2.0 * period - ph };
                             (u - 1.5).clamp(0.0, travel) / travel * over
                         } else {
@@ -3761,7 +3816,7 @@ impl App {
         let at = if let Ok(time) = NaiveTime::parse_from_str(&spec, "%H:%M") {
             let today = now.date_naive().and_time(time);
             let day = if today <= now.naive_local() { today + chrono::Duration::days(1) } else { today };
-            resolve_here(day).map(|d| d.timestamp())
+            resolve_here(weekday_first(day, self.remind_repeat)).map(|d| d.timestamp())
         } else {
             spec.trim_start_matches('+').parse::<f64>().ok().filter(|m| *m > 0.0 && *m < 60.0 * 24.0 * 30.0).map(|m| now.timestamp() + (m * 60.0) as i64)
         };
@@ -4696,7 +4751,7 @@ impl App {
             }
         } else if self.lyrics.is_empty() {
             // текста нет — вместо пустой рамки крупный зеркальный эквалайзер в цвет обложки
-            let t = ui.input(|i| i.time) as f32;
+            let t = anim_t(ui.input(|i| i.time));
             spectrum_mirror(&p.with_clip_rect(area), area.shrink2(vec2(18.0, 26.0)).translate(vec2(0.0, 8.0)), &self.bars, accent, t, m.playing);
             lines.text(pos2(area.center().x, area.top() + 16.0), Align2::CENTER_CENTER, "Текста для этого трека не нашлось — только звук", FontId::proportional(11.5), DIM);
         } else {
@@ -5184,7 +5239,7 @@ impl App {
             glass_chip(&p, r, 18.0, 0.45);
             let c = tone("session", game::level_rgb(level));
             // мягко пульсирующая точка: замер идёт
-            let pulse = 0.5 + 0.5 * (ctx.input(|i| i.time) as f32 * 2.6).sin();
+            let pulse = 0.5 + 0.5 * (anim_t(ctx.input(|i| i.time)) * 2.6).sin();
             let dot = pos2(r.left() + 30.0, r.center().y);
             p.circle_filled(dot, 9.0 + 4.0 * pulse, rgba(c.r(), c.g(), c.b(), (26.0 + 30.0 * (1.0 - pulse)) as u8));
             p.circle_filled(dot, 5.0, c);
@@ -6225,16 +6280,25 @@ impl App {
                 let ok = self.clipboard.as_mut().is_some_and(|cb| cb.set_image(data).is_ok());
                 self.notify(if ok { "Снимок снова в буфере" } else { "Не удалось положить снимок в буфер" });
             } else if let Some(i) = ocr {
-                let im = &self.clip_imgs[i];
-                match sys::ocr(im.w, im.h, &im.px) {
-                    Ok(t) if !t.trim().is_empty() => {
-                        let n = t.chars().count();
-                        self.set_clipboard(&t);
-                        self.notify(&format!("Текст с картинки скопирован: {n} симв."));
-                    }
-                    Ok(_) => self.notify("Текст на картинке не найден"),
-                    Err(e) => self.notify(&e),
-                }
+                // в своём потоке, как в карточке снимка: распознавание идёт секунды, и остров замирал
+                let (w, h, px) = { let im = &self.clip_imgs[i]; (im.w, im.h, im.px.clone()) };
+                self.notify("Распознаю текст…");
+                let (tx, ctx) = (self.tx.clone(), ui.ctx().clone());
+                std::thread::spawn(move || {
+                    let res = sys::ocr(w, h, &px).and_then(|text| {
+                        if text.trim().is_empty() {
+                            return Err("Текст на картинке не найден".to_string());
+                        }
+                        let n = text.chars().count();
+                        arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)).map_err(|e| e.to_string())?;
+                        Ok(n)
+                    });
+                    let _ = tx.send(Msg::Note(match res {
+                        Ok(n) => format!("Текст с картинки скопирован: {n} симв."),
+                        Err(e) => e,
+                    }));
+                    ctx.request_repaint();
+                });
             }
         }
         let q = self.clip_query.trim().to_lowercase();
@@ -6254,7 +6318,9 @@ impl App {
                 ui.vertical_centered(|ui| ui.label(RichText::new("Ничего не найдено").color(DIM)));
             }
             for (i, (pinned, c)) in rows.iter().enumerate() {
-                let hint = smart_hint(c);
+                // из кэша: smart_hint проверяет пути на диске, а путь на отключённый сетевой диск
+                // подвешивал страницу на каждой перерисовке
+                let hint = cached_hint(&mut self.hint_cache, c);
                 let preview: String = c.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(110).collect();
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
@@ -8258,7 +8324,10 @@ impl eframe::App for App {
             }
         }
 
-        let over = cursor.is_some_and(|c| rect_v.expand(8.0).contains(c) || bubbles_v.iter().any(|b| b.0.contains(c)));
+        // с запасом: вошли в 8 точках от края, выходим только дальше 16 — иначе у края (где пилюля ещё и
+        // тянется к курсору) «над островом» переключалось почти каждый кадр
+        let reach_out = if self.passthrough == Some(false) { 16.0 } else { 8.0 };
+        let over = cursor.is_some_and(|c| rect_v.expand(reach_out).contains(c) || bubbles_v.iter().any(|b| b.0.expand(reach_out - 8.0).contains(c)));
         let invisible = self.hidden || self.shot.is_some();
 
         // стекло: фон под окном размывает сама Windows (экран программа не снимает)
@@ -8273,9 +8342,32 @@ impl eframe::App for App {
         }
 
         // настоящее окно: по размеру острова; на время анимации — по большему из двух размеров
-        let mut span = if animating { rect_v.union(layout_v) } else { layout_v };
+        // Меняется сама форма (раскрытие, перетаскивание, выезжают капли) — окно только растёт и ужимается
+        // одним шагом через WIN_SHRINK_AFTER покоя. «Дыхание» под музыку, рябь и наклон укладываются
+        // в запас 46 точек, поэтому окно от них не меняется вовсе. Раньше размер менялся каждый кадр,
+        // а при музыке — постоянно: прозрачное OpenGL-окно на смене размера показывает растянутый
+        // или пустой кадр, и остров мигал.
+        let bubbles_moving = !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || !self.bub_dl.settled();
+        let shape_busy = shape_anim || self.drag.is_some() || bubbles_moving;
+        let mut span = if shape_busy { rect_v.union(layout_v) } else { layout_v };
         for b in &bubbles_v {
             span = span.union(b.0);
+        }
+        if shape_busy {
+            self.win_busy_at = now;
+        }
+        if let Some(prev) = self.win_span {
+            if now.duration_since(self.win_busy_at) < WIN_SHRINK_AFTER {
+                span = span.union(prev);
+            } else if span != prev {
+                ctx.request_repaint();
+            }
+        }
+        if !invisible {
+            self.win_span = Some(span);
+        }
+        if now.duration_since(self.win_busy_at) < WIN_SHRINK_AFTER {
+            ctx.request_repaint_after(WIN_SHRINK_AFTER);
         }
         let grown = span.expand(46.0);
         let win_v = Rect::from_min_max(grown.min.floor(), grown.max.ceil());
@@ -8286,19 +8378,27 @@ impl eframe::App for App {
             want[0] = -9000;
             want[1] = 0;
         }
+        let hwnd = hwnd_of(frame);
         if self.win_last != Some(want) {
-            match hwnd_of(frame) {
-                Some(hwnd) => sys::place_window(hwnd, want),
+            match hwnd {
+                Some(hwnd) => {
+                    sys::place_window(hwnd, want);
+                    self.win_by_hwnd = true;
+                }
                 None => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(win_v.size()));
                     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos2(want[0] as f32 / ppp, want[1] as f32 / ppp)));
+                    self.win_by_hwnd = false;
                 }
             }
             self.win_last = Some(want);
         }
         let pass = !over || invisible;
         if self.passthrough != Some(pass) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(pass));
+            match hwnd {
+                Some(hwnd) => sys::set_click_through(hwnd, pass),
+                None => ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(pass)),
+            }
             self.passthrough = Some(pass);
         }
         // при завершении сеанса Windows несохранённое пишется прямо из оконной процедуры
@@ -8339,7 +8439,9 @@ impl eframe::App for App {
             let radius = if self.mode == Mode::Pill { PILL_H / 2.0 } else { 22.0 }.min(layout_v.height() / 2.0);
             let key = [px(base.x + cap.left()), px(base.y + cap.top()), px(cap.width()), px(cap.height()), px(radius)];
             let due = key != self.lens_key || now.duration_since(self.lens_at) >= Duration::from_millis(700);
-            if due && !self.lens_busy {
+            // поток стекла молча пропускает неудачный снимок экрана — без таймаута стекло замерзало навсегда
+            let stuck = self.lens_busy && now.duration_since(self.lens_at) >= Duration::from_secs(3);
+            if due && (!self.lens_busy || stuck) {
                 self.lens_key = key;
                 self.lens_at = now;
                 self.lens_busy = true;
@@ -8360,7 +8462,12 @@ impl eframe::App for App {
         }
 
         // рисуем относительно того места, где окно находится на самом деле в этом кадре
+        // Если окно ставили сами через SetWindowPos, оно уже стоит в запрошенном месте, а inner_rect
+        // от winit узнает об этом только в следующем кадре — рисование от него давало сдвиг на кадр.
+        // Начало — из тех целых пикселей, куда окно поставлено на самом деле (want), иначе при масштабе
+        // 125–150 % остров съезжал на полпикселя и дрожал на 1 px при каждой смене размера.
         let origin = match ctx.input(|i| i.viewport().inner_rect) {
+            _ if self.win_by_hwnd && !invisible => pos2(want[0] as f32 / ppp - base.x, want[1] as f32 / ppp - base.y),
             Some(actual) if !invisible => actual.min - base.to_vec2(),
             _ => win_v.min,
         };
@@ -8454,7 +8561,7 @@ impl eframe::App for App {
                         radius: radii,
                         count: count as i32,
                         merge: 14.0,
-                        time: time as f32,
+                        time: anim_t(time),
                         ripple: self.ripple,
                         light: [light_at.x, light_at.y],
                         cap: self.lens_draw.map_or([0.0; 4], |c| [c.left(), c.top(), c.right(), c.bottom()]),
@@ -9407,6 +9514,22 @@ fn icon_limit(remote: bool) -> Duration {
 }
 
 /// Дополнительная пауза перед повтором записи заметок после `fails` неудач подряд (сверх 1,5 с), не больше 30 с в сумме.
+/// Время для анимаций в f32. Секунды с запуска переводить в f32 напрямую нельзя: через сутки-двое
+/// работы точности уже не хватает, и волны, дождь и «дыхание» пилюли начинают дёргаться.
+/// Раз в час фаза перескакивает — это незаметно, в отличие от постоянной дрожи.
+fn anim_t(time: f64) -> f32 {
+    (time % 3600.0) as f32
+}
+
+/// Сколько «полноэкранное приложение» должно держаться, прежде чем остров спрячется (или вернётся).
+fn fs_settle(raw: bool) -> Duration {
+    Duration::from_millis(if raw { 400 } else { 250 })
+}
+
+/// Через сколько после конца анимации окно ужимается до размера острова. Пока анимация идёт,
+/// окно только растёт: смена размера прозрачного OpenGL-окна на каждом кадре давала мигание.
+const WIN_SHRINK_AFTER: Duration = Duration::from_millis(350);
+
 fn notes_retry_delay(fails: u32) -> Duration {
     let total = store::FLUSH_AFTER.saturating_mul(1u32 << fails.min(5)).min(Duration::from_secs(30));
     total.saturating_sub(store::FLUSH_AFTER)
@@ -9711,6 +9834,17 @@ fn repeat_name(repeat: u8) -> &'static str {
 }
 
 /// Следующий срок повторяющегося напоминания — первый позже `now`, по местному времени.
+/// Первый срок напоминания «по будням» (repeat 2): выпал на субботу или воскресенье — переносим на понедельник.
+/// Раньше выходные пропускались только при переносе, и в пятницу вечером «18:30, по будням» звенело в субботу.
+fn weekday_first(day: chrono::NaiveDateTime, repeat: u8) -> chrono::NaiveDateTime {
+    use chrono::{Datelike, Weekday};
+    match (repeat, day.weekday()) {
+        (2, Weekday::Sat) => day + chrono::Duration::days(2),
+        (2, Weekday::Sun) => day + chrono::Duration::days(1),
+        _ => day,
+    }
+}
+
 fn next_due(at: chrono::NaiveDateTime, repeat: u8, now: chrono::NaiveDateTime) -> Option<chrono::NaiveDateTime> {
     use chrono::Datelike;
     let step = match repeat {
@@ -10739,6 +10873,19 @@ struct Hint {
 
 /// «Умный буфер»: узнаёт в скопированном ссылку, почту, цвет, путь к файлу или пример и подбирает действие.
 /// Ничего не открывает сам — только по щелчку.
+/// smart_hint с запоминанием: для списка буфера, который перерисовывается каждый кадр.
+fn cached_hint(cache: &mut std::collections::HashMap<String, Option<Hint>>, text: &str) -> Option<Hint> {
+    if let Some(h) = cache.get(text) {
+        return h.clone();
+    }
+    if cache.len() > 300 {
+        cache.clear();
+    }
+    let h = smart_hint(text);
+    cache.insert(text.to_string(), h.clone());
+    h
+}
+
 fn smart_hint(text: &str) -> Option<Hint> {
     let t = text.trim().trim_matches('"');
     if t.is_empty() || t.len() > 600 || t.contains('\n') {

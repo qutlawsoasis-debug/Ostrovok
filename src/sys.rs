@@ -166,6 +166,25 @@ fn fullscreen_on(island_mon: Option<[i32; 4]>) -> bool {
         if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") {
             return false;
         }
+        let game = matches!(SHQueryUserNotificationState(), Ok(st) if st == QUNS_RUNNING_D3D_FULL_SCREEN || st == QUNS_PRESENTATION_MODE);
+        // системные окна Windows 11 размером с экран, которые становятся активными на мгновение:
+        // переключение окон, Alt+Tab и «Представление задач», «Пуск», поиск, центр уведомлений.
+        // Из-за них остров пропадал на долю секунды. Но если Windows говорит, что идёт полноэкранная
+        // игра (у Store-игр активным бывает CoreWindow), остров всё равно прячется.
+        if !game
+            && matches!(
+                class.as_str(),
+                "Shell_SecondaryTrayWnd"
+                    | "ForegroundStaging"
+                    | "XamlExplorerHostIslandWindow"
+                    | "MultitaskingViewFrame"
+                    | "TaskSwitcherWnd"
+                    | "Windows.UI.Core.CoreWindow"
+                    | "LockScreenControllerProxyWindow"
+            )
+        {
+            return false;
+        }
         let mut r = windows::Win32::Foundation::RECT::default();
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         if GetWindowRect(fg, &mut r).is_err() || !GetMonitorInfoW(MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
@@ -173,7 +192,6 @@ fn fullscreen_on(island_mon: Option<[i32; 4]>) -> bool {
         }
         let m = mi.rcMonitor;
         let win_mon = [m.left, m.top, m.right, m.bottom];
-        let game = matches!(SHQueryUserNotificationState(), Ok(st) if st == QUNS_RUNNING_D3D_FULL_SCREEN || st == QUNS_PRESENTATION_MODE);
         crate::place::hides_island([r.left, r.top, r.right, r.bottom], win_mon, island_mon.unwrap_or(win_mon), game)
     }
 }
@@ -224,8 +242,8 @@ pub fn capture_screen() -> Result<(usize, usize, Vec<u8>), String> {
 }
 
 pub fn save_png(w: usize, h: usize, rgba: &[u8]) -> Result<String, String> {
-    let home = std::env::var("USERPROFILE").map_err(|e| e.to_string())?;
-    let dir = Path::new(&home).join("Pictures").join("Островок");
+    // настоящая папка «Изображения» (её часто переносят в OneDrive или на другой диск)
+    let dir = pictures_dir().join("Островок");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("Снимок {}.png", chrono::Local::now().format("%Y-%m-%d %H-%M-%S")));
     image::save_buffer(&path, rgba, w as u32, h as u32, image::ExtendedColorType::Rgba8).map_err(|e| e.to_string())?;
@@ -823,9 +841,18 @@ pub fn press_key(vk: u8) {
 
 /// Блокировка, сон, перезагрузка и выключение — штатными командами Windows.
 pub fn power(action: &str) {
+    if action == "sleep" {
+        // напрямую, а не через rundll32: rundll32 передаёт SetSuspendState чужие аргументы, первым
+        // приходит ненулевое «гибернация» — и при включённой гибернации ПК уходил в неё вместо сна.
+        // В своём потоке: функция возвращается только после пробуждения.
+        std::thread::spawn(|| unsafe {
+            use windows::Win32::Foundation::BOOLEAN;
+            let _ = windows::Win32::System::Power::SetSuspendState(BOOLEAN::from(false), BOOLEAN::from(false), BOOLEAN::from(false));
+        });
+        return;
+    }
     let (exe, args): (&str, &[&str]) = match action {
         "lock" => ("rundll32.exe", &["user32.dll,LockWorkStation"]),
-        "sleep" => ("rundll32.exe", &["powrprof.dll,SetSuspendState", "0,1,0"]),
         "restart" => ("shutdown.exe", &["/r", "/t", "0"]),
         "off" => ("shutdown.exe", &["/s", "/t", "0"]),
         _ => return,
@@ -1939,8 +1966,33 @@ pub fn place_window(hwnd: isize, r: [i32; 4]) {
             r[1],
             r[2],
             r[3],
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            // NOCOPYBITS: Windows не переносит старую картинку окна на новое место — без него
+            // на кадр сдвига виден прежний кадр в другом месте (мигание при раскрытии)
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOCOPYBITS,
         );
+    }
+}
+
+/// Пропускать ли мышь сквозь окно. Переключает только WS_EX_TRANSPARENT, а WS_EX_LAYERED держит
+/// всегда включённым. Команда winit `MousePassthrough` снимала и ставила LAYERED вместе с перерисовкой
+/// рамки — прозрачное OpenGL-окно при этом на кадр пропадало, и остров мигал при каждом наведении.
+pub fn set_click_through(hwnd: isize, pass: bool) {
+    unsafe {
+        let h = HWND(hwnd as *mut core::ffi::c_void);
+        let old = GetWindowLongW(h, GWL_EXSTYLE) as u32;
+        let mut ex = old | WS_EX_LAYERED.0;
+        if pass {
+            ex |= WS_EX_TRANSPARENT.0;
+        } else {
+            ex &= !WS_EX_TRANSPARENT.0;
+        }
+        if old & WS_EX_LAYERED.0 == 0 {
+            // слой без атрибутов Windows может не показать — непрозрачность 255, картинку даёт OpenGL
+            SetWindowLongW(h, GWL_EXSTYLE, ex as i32);
+            let _ = SetLayeredWindowAttributes(h, windows::Win32::Foundation::COLORREF(0), 255, LWA_ALPHA);
+        } else if ex != old {
+            SetWindowLongW(h, GWL_EXSTYLE, ex as i32);
+        }
     }
 }
 

@@ -91,11 +91,11 @@ fn unit(word: &str) -> Option<Unit> {
         u(Kind::Length, 0.3048, "фут.", "м")
     } else if starts("ярд") || starts("yard") {
         u(Kind::Length, 0.9144, "ярд.", "м")
-    } else if starts("мил") || starts("mile") {
+    } else if (starts("мил") && !starts("милли")) || starts("mile") {
         u(Kind::Length, 1609.344, "миль", "км")
     } else if starts("миллиграмм") {
         u(Kind::Mass, 1e-6, "мг", "г")
-    } else if starts("килограмм") || starts("кило") {
+    } else if starts("килограмм") || (starts("кило") && !starts("килобайт") && !starts("килобит")) {
         u(Kind::Mass, 1.0, "кг", "фунт")
     } else if starts("грамм") {
         u(Kind::Mass, 0.001, "г", "унция")
@@ -296,6 +296,7 @@ pub fn convert(q: &str, rates: Option<&HashMap<String, f64>>) -> Vec<(String, St
 /// Курсы валют к доллару: в памяти и в файле рядом с настройками, чтобы работать без сети.
 #[derive(Clone, Default)]
 pub struct Rates {
+    /// курсы, когда обновлять в следующий раз, идёт ли запрос
     state: Arc<Mutex<(Option<HashMap<String, f64>>, Option<Instant>, bool)>>,
     /// последняя попытка не удалась, а сохранённых курсов нет — показываем «нет связи», а не вечное «загружается»
     failed: Arc<std::sync::atomic::AtomicBool>,
@@ -303,7 +304,7 @@ pub struct Rates {
 
 impl Rates {
     pub fn get(&self) -> Option<HashMap<String, f64>> {
-        self.state.lock().unwrap().0.clone()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).0.clone()
     }
 
     pub fn failed(&self) -> bool {
@@ -313,8 +314,8 @@ impl Rates {
     /// Подгружает курсы, если их нет или они старше полусуток. done вызывается, когда пришли новые.
     pub fn refresh(&self, cache: std::path::PathBuf, done: impl Fn() + Send + 'static) {
         {
-            let mut st = self.state.lock().unwrap();
-            let fresh = st.1.is_some_and(|t| t.elapsed() < Duration::from_secs(12 * 3600));
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let fresh = st.1.is_some_and(|next| Instant::now() < next);
             if st.2 || fresh {
                 return;
             }
@@ -330,21 +331,21 @@ impl Rates {
             // пока идёт запрос — показываем то, что сохранили в прошлый раз
             if me.get().is_none() {
                 if let Some(old) = std::fs::read_to_string(&cache).ok().and_then(|t| parse(&t)) {
-                    me.state.lock().unwrap().0 = Some(old);
+                    me.state.lock().unwrap_or_else(|e| e.into_inner()).0 = Some(old);
                     done();
                 }
             }
             let fetched = ureq::get("https://open.er-api.com/v6/latest/USD").timeout(Duration::from_secs(12)).call().ok().and_then(|r| r.into_string().ok());
-            let mut st = me.state.lock().unwrap();
+            let mut st = me.state.lock().unwrap_or_else(|e| e.into_inner());
             st.2 = false;
             if let Some((text, map)) = fetched.and_then(|t| parse(&t).map(|m| (t, m))) {
                 let _ = crate::store::write_atomic(&cache, text.as_bytes());
                 st.0 = Some(map);
-                st.1 = Some(Instant::now());
+                st.1 = Some(Instant::now() + Duration::from_secs(12 * 3600));
                 me.failed.store(false, std::sync::atomic::Ordering::Relaxed);
             } else {
                 // не вышло — повторим не раньше чем через пять минут
-                st.1 = Some(Instant::now() - Duration::from_secs(12 * 3600 - 300));
+                st.1 = Some(Instant::now() + Duration::from_secs(300)); // раньше тут было вычитание из Instant — в первые 12 ч после включения ПК оно роняло остров
                 me.failed.store(st.0.is_none(), std::sync::atomic::Ordering::Relaxed);
             }
             drop(st);

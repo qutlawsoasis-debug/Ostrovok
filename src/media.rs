@@ -115,7 +115,18 @@ pub fn spawn() -> (Arc<Mutex<State>>, mpsc::Sender<Cmd>) {
                 }
             }
             let Some(m) = &mgr else { continue };
-            let session = m.GetCurrentSession().ok();
+            let session = match m.GetCurrentSession() {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    // «нет сеанса» приходит пустой ошибкой; настоящая (перезапустился explorer, RPC отвалился)
+                    // означает, что менеджер мёртв — без сброса музыка пропадала до перезапуска острова
+                    if e.code().is_err() {
+                        mgr = None;
+                        mgr_next = Instant::now() + Duration::from_secs(2);
+                    }
+                    None
+                }
+            };
 
             if let (Some(c), Some(s)) = (&cmd, &session) {
                 let _ = match c {

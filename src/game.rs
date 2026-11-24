@@ -1415,9 +1415,11 @@ fn ping_loop(state: &Mutex<State>, ctx: &eframe::egui::Context) {
                     while s.inet_ring.back() == Some(&None) {
                         s.inet_ring.pop_back();
                     }
-                } else {
+                } else if ever_ok || r.is_some() {
                     push_ring(&mut s.inet_ring, r, RING);
                 }
+                // ни один адрес ни разу не ответил (сеть режет ICMP, интернет при этом работает) —
+                // потери не пишем, иначе страница показывала красное «Плохо, потери 100%»
                 // в сводку игры — только замеры адреса, который хоть раз ответил
                 if ever_ok {
                     if let Some(l) = s.session.as_mut() {
