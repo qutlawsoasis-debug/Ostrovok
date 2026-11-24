@@ -1245,6 +1245,17 @@ struct App {
     page_grow: std::collections::HashMap<u8, f32>,
     /// пружина размера острова пришла к цели (в этом кадре)
     size_settled: bool,
+    /// интернет: 1 есть, 2 нет, 0 неизвестно (sys::spawn_net_watch) и с какого момента его нет
+    inet: Arc<std::sync::atomic::AtomicU8>,
+    net_down: Option<Instant>,
+    /// интернет хоть раз был с запуска (иначе «нет сети» не поднимаем)
+    inet_seen: bool,
+    /// последний «матч найден»: окно и когда — повторное мигание того же окна не бипает заново
+    match_last: Option<(isize, Instant)>,
+    /// «матч найден»: название игры, её окно, когда замигала (MATCH_ACCEPT)
+    match_found: Option<(String, isize, Instant)>,
+    /// итог последней игры: короткая строка, цвет уровня сети, когда закончилась (GAME_RECAP)
+    last_game: Option<(String, [u8; 3], Instant)>,
     /// когда был прошлый кадр (свой шаг времени, см. update)
     frame_at: Instant,
     /// где был курсор в прошлом кадре (в координатах поля) — стоящий курсор не требует кадров
@@ -1259,8 +1270,6 @@ struct App {
     /// только что удалённая заметка: текст, место, когда — её можно вернуть NOTE_UNDO
     note_trash: Option<(String, usize, Instant)>,
     /// подсказки для строк буфера (см. cached_hint)
-    /// когда на главной последний раз была музыка или звук (удержание карточки плеера)
-    music_seen: Option<Instant>,
     hint_cache: std::collections::HashMap<String, Option<Hint>>,
     /// окно ставим сами через SetWindowPos — тогда рисуем от запрошенного места, а не от устаревшего inner_rect
     win_by_hwnd: bool,
@@ -1621,13 +1630,18 @@ impl App {
             note_trash: None,
             bin_probe: Probe::new(),
             frame_at: Instant::now(),
+            last_game: None,
+            match_found: None,
+            inet: Default::default(),
+            net_down: None,
+            inet_seen: false,
+            match_last: None,
             cursor_seen: None,
             cursor_moved_at: None,
             // первая проверка — через минуту после запуска: погода к тому времени обычно уже пришла
             hints_at: Some(Instant::now()),
             rain_told: None,
             mixer_probe: Probe::new(),
-            music_seen: None,
             page_grow: Default::default(),
             size_settled: false,
             win_by_hwnd: false,
@@ -1730,6 +1744,15 @@ impl App {
                 app.show_toast("\u{E896}", [0x3A, 0x9B, 0xFF], "Загрузка завершена", "otchet-za-noyabr.pdf", 30, false);
             }
             // для снимков плашки после игры: OSTROVOK_GAME_TOAST=1 (образец сводки, щелчок открывает «Игру»)
+            // для снимков: «матч найден» (OSTROVOK_MATCH=1) и «нет сети» 42 с (OSTROVOK_NETDOWN=1)
+            if std::env::var_os("OSTROVOK_MATCH").is_some() {
+                app.match_found = Some(("CS2".into(), 0, Instant::now()));
+            }
+            if std::env::var_os("OSTROVOK_NETDOWN").is_some() {
+                app.net_down = Instant::now().checked_sub(Duration::from_secs(42));
+                app.inet.store(2, Ordering::Relaxed);
+                app.inet_seen = true;
+            }
             if std::env::var_os("OSTROVOK_GAME_TOAST").is_some() {
                 app.show_game_summary(&game::demo_summary());
                 // как у OSTROVOK_TOAST: висит дольше, чтобы успеть снять
@@ -1875,6 +1898,10 @@ impl App {
             app.cfg.save();
         }
         pult::start(app.pult.clone(), cc.egui_ctx.clone());
+        // интернет: «нет сети» в пилюле (в проверочном запуске не следим — у разработчика сеть своя)
+        if !test_mode() || std::env::var_os("OSTROVOK_NET").is_some() {
+            sys::spawn_net_watch(app.inet.clone(), cc.egui_ctx.clone());
+        }
         // в тестовом запуске игры не ловятся: остров не замолкает из-за настоящей игры разработчика
         game::start(app.game.clone(), cc.egui_ctx.clone(), !test_mode());
         if let Ok(demo) = std::env::var("OSTROVOK_DEMO") {
@@ -2109,6 +2136,8 @@ impl App {
 
     /// Плашка после игры; щелчок по ней открывает «Игру».
     fn show_game_summary(&mut self, s: &game::Summary) {
+        // итог помним 10 минут: короткая строка в пилюле и карточка в «Сейчас» (game_pill_text)
+        self.last_game = Some((game_pill_text(&s.title, s.secs, s.inet.map(|i| i.median)), game::level_rgb(s.level), Instant::now()));
         if self.game_quiet {
             return;
         }
@@ -2120,6 +2149,11 @@ impl App {
     /// Щелчок по пилюле: панель, а если висит плашка со своей страницей — сразу на неё.
     /// Маленькая всплывашка (громкость, шкала обновления) плашку не заменяет: её ставят и в обход show_toast.
     fn open_panel_from_pill(&mut self) {
+        // идёт «матч найден» — щелчок разворачивает игру, а не открывает панель
+        if let Some((_, h, _)) = self.match_found.take() {
+            sys::focus_window(h);
+            return;
+        }
         self.mode = Mode::Panel;
         if let Some(t) = self.toast.as_ref().filter(|t| !t.compact).and(self.toast_tab) {
             self.tab = t;
@@ -2865,6 +2899,50 @@ impl App {
         self.sound.set_listen(quiet::sound_capture(self.fs_now, spectrum));
         // эквалайзер — каждый кадр (опрос до 30 раз/с)
         self.pump_eq(ctx, now);
+        // «матч найден»: замигало окно знакомой игры (она свёрнута, а поиск нашёл матч)
+        if let Some(h) = sys::take_flash() {
+            let exe = sys::window_exe(h);
+            // то же окно в течение минуты — не новый матч: игры мигают долго (FLASHW_TIMERNOFG),
+            // и без этого бип повторялся бы каждые 20 секунд
+            let repeat = self.match_last.is_some_and(|(w, t)| w == h && now.duration_since(t) < Duration::from_secs(60));
+            if game::is_matchmaking_game(&exe) && !repeat {
+                self.match_found = Some((game::game_title(&exe), h, now));
+                self.match_last = Some((h, now));
+                sys::beep();
+                self.jelly.vel += 1.2;
+                self.ripple = (self.ripple + 4.0).min(7.0);
+            }
+        }
+        // интернет пропал / вернулся (поток sys::spawn_net_watch; 0 — неизвестно, ничего не меняем)
+        match self.inet.load(Ordering::Relaxed) {
+            // тревога — только если интернет был и пропал: компьютер без сети с самого запуска
+            // не должен вечно гореть красным
+            2 if self.inet_seen => {
+                let since = *self.net_down.get_or_insert(now);
+                if now.duration_since(since) >= NET_ALARM {
+                    ctx.request_repaint_after(Duration::from_secs(1));
+                }
+            }
+            1 => {
+                self.inet_seen = true;
+                if let Some(since) = self.net_down.take() {
+                    let secs = now.duration_since(since).as_secs();
+                    if secs >= NET_ALARM.as_secs() {
+                        self.show_toast("\u{E701}", [0x7B, 0xE0, 0x9A], "Сеть вернулась", &format!("её не было {}", fmt_gone(secs)), 5, false);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(m) = &self.match_found {
+            // время на принятие вышло или игру уже развернули сами
+            if now.duration_since(m.2) > MATCH_ACCEPT || (m.1 != 0 && sys::foreground_other() == m.1) {
+                self.match_found = None;
+            } else {
+                // отсчёт секунд в пилюле
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+        }
         if now.duration_since(self.last_slow) < Duration::from_millis(400) {
             return;
         }
@@ -3146,6 +3224,19 @@ impl App {
             v.push(Seg::Text(t.clone(), accent()));
             return v;
         }
+        // «матч найден» важнее всего: только он, крупно и красным, с отсчётом до конца принятия
+        if let Some((title, _, at)) = &self.match_found {
+            let left = MATCH_ACCEPT.saturating_sub(at.elapsed()).as_secs();
+            v.push(Seg::Text(format!("\u{E7FC} {title} · матч найден · 0:{left:02}"), Color32::from_rgb(0xFF, 0x6B, 0x61)));
+            return v;
+        }
+        // нет интернета дольше NET_ALARM — красным и со временем, это важнее трека
+        if let Some(since) = self.net_down.filter(|s| s.elapsed() >= NET_ALARM) {
+            v.push(Seg::Text(format!("\u{E701} нет сети · {}", fmt_gone(since.elapsed().as_secs())), Color32::from_rgb(0xFF, 0x6B, 0x61)));
+            // только тревога и часы — рядом с треком пилюля переполнилась бы
+            v.push(Seg::Text(chrono::Local::now().format("%H:%M").to_string(), FG));
+            return v;
+        }
         let playing = self.media_now.as_ref().is_some_and(|m| m.playing);
         if self.media_now.is_some() && self.thumb.is_some() {
             v.push(Seg::Thumb);
@@ -3162,6 +3253,10 @@ impl App {
             let label = short_label(&r.text, 14);
             let text = if label.is_empty() { format!("\u{E823} {mins} мин") } else { format!("\u{E823} {mins} мин · {label}") };
             v.push(Seg::Text(text, Color32::from_rgb(0xFF, 0x8A, 0x7A)));
+        }
+        // итог последней игры — 10 минут после неё, если не играет музыка (иначе пилюля переполнится)
+        if let Some((text, c, _)) = self.last_game.as_ref().filter(|g| g.2.elapsed() < GAME_RECAP && !playing) {
+            v.push(Seg::Text(format!("\u{E7FC} {text}"), Color32::from_rgb(c[0], c[1], c[2])));
         }
         if self.inbox_unread > 0 {
             let c = self.inbox.first().map_or([0x3A, 0x9B, 0xFF], |i| i.color);
@@ -4383,6 +4478,8 @@ impl App {
             ("\u{E916}", Color32::from_rgb(0xFF, 0xB3, 0x40), format!("{what} · {}", fmt_left(end)), "открыть таймер".into(), Tab::Timer)
         } else if self.timer_paused.is_some() {
             ("\u{E769}", Color32::from_rgb(0xFF, 0xB3, 0x40), "Таймер на паузе".into(), "открыть таймер".into(), Tab::Timer)
+        } else if let Some((text, c, _)) = self.last_game.clone().filter(|g| g.2.elapsed() < GAME_RECAP) {
+            ("\u{E7FC}", Color32::from_rgb(c[0], c[1], c[2]), text, "итог игры · пинг, потери и что мешало".into(), Tab::Game)
         } else if let Some(m) = self.inbox.first().filter(|_| self.inbox_unread > 0) {
             let c = Color32::from_rgb(m.color[0], m.color[1], m.color[2]);
             let more = if self.inbox_unread > 1 { format!(" · ещё {}", self.inbox_unread - 1) } else { String::new() };
@@ -4469,8 +4566,10 @@ impl App {
             let stamp = t.timestamp();
             let next = self.cfg.reminders.iter().filter(|r| r.at > stamp).min_by_key(|r| r.at);
             let todo_left = self.cfg.todos.iter().filter(|t| !t.done).count();
-            let (line, color) = if let Some(end) = self.timer_end {
-                (format!("\u{E916}  таймер {}", fmt_left(end)), Color32::from_rgb(0xFF, 0xB3, 0x40))
+            // строка «что дальше» — только когда карточку «Дальше» заменил плеер; таймер здесь не повторяем,
+            // он и так в живой карточке и в капле пилюли
+            let (line, color) = if self.media_now.is_none() {
+                (String::new(), DIM)
             } else if let Some(r) = next {
                 let mins = (r.at - stamp) / 60;
                 let when = if mins < 60 { format!("через {} мин", mins.max(1)) } else if mins < 1440 { format!("через {} ч", mins / 60) } else { format!("через {} д", mins / 1440) };
@@ -4486,13 +4585,10 @@ impl App {
             }
         }
 
-        // средняя карточка по ситуации: играет музыка — плеер, тишина — «Дальше» (что впереди сегодня).
-        // Раньше в тишине здесь висела бесполезная карточка «Ничего не играет».
-        // звук в тихих местах трека пропадает на секунды — плеер держится ещё 6 с, а не мигает с «Дальше»
-        if self.media_now.is_some() || self.sound_on() {
-            self.music_seen = Some(Instant::now());
-        }
-        if self.music_seen.is_none_or(|t| t.elapsed() > Duration::from_secs(6)) {
+        // средняя карточка по ситуации: есть плеер (Spotify, браузер…) — плеер, иначе «Дальше».
+        // Просто звук (голос в Discord, игра) плеер не включает: раньше карточка показывала пустую
+        // нотку или «Играет звук», а «Дальше» было полезнее. Плеер стабилен — мигать нечему.
+        if self.media_now.is_none() {
             self.home_agenda(ui, &p, music_r);
         } else {
         glass_chip(&p, music_r, 20.0, 0.6);
@@ -4685,12 +4781,12 @@ impl App {
         }
 
         // ── быстрые действия одной ровной строкой
-        const ACTIONS: [(&str, &str, &str, [u8; 3]); 8] = [
+        // QR-код и пипетка живут в «Инструментах» (раньше были и тут — двойной ряд одного и того же);
+        // в конце ряда — «Все»: переход к остальным инструментам
+        const ACTIONS: [(&str, &str, &str, [u8; 3]); 6] = [
             ("region", "\u{E7A8}", "Область", [0x5A, 0xAB, 0xFF]),
             ("full", "\u{E740}", "Весь экран", [0x9B, 0x99, 0xFF]),
             ("ocr", "\u{E8D2}", "Текст с экрана", [0xFF, 0xB3, 0x40]),
-            ("qr", "\u{ED14}", "QR-код", [0x4A, 0xE0, 0x6F]),
-            ("picker", "\u{EF3C}", "Пипетка", [0xFF, 0x5C, 0x7F]),
             ("cleantext", "\u{E75C}", "Чистый текст", [0x6F, 0xDB, 0xFF]),
             ("remind", "\u{E823}", "Напомнить", [0xFF, 0x8B, 0x61]),
             ("command", "\u{E756}", "Команда", [0xB8, 0xB8, 0xC4]),
@@ -4701,7 +4797,8 @@ impl App {
         let shown = visible_actions(&ids, &self.cfg.hidden_actions);
         let has_hidden = shown.len() < ACTIONS.len();
         let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 60.0), Sense::hover());
-        let step = row.width() / (shown.len() + has_hidden as usize) as f32;
+        // +1 — место под «Все»
+        let step = row.width() / (shown.len() + has_hidden as usize + 1) as f32;
         for (slot, &i) in shown.iter().enumerate() {
             let (id, glyph, label, col) = &ACTIONS[i];
             let r = Rect::from_min_size(pos2(row.left() + step * slot as f32, row.top()), vec2(step, row.height()));
@@ -4739,6 +4836,22 @@ impl App {
             p.text(at, Align2::CENTER_CENTER, "\u{E710}", FontId::proportional(14.0), mix(DIM, FG, hov));
             p.text(pos2(r.center().x, r.bottom() - 8.0), Align2::CENTER_CENTER, format!("ещё {}", names.len()), FontId::proportional(11.0), mix(DIM, FG, hov));
             restore = resp.clicked();
+        }
+        let all;
+        {
+            // «Все» — к остальным инструментам (QR, пипетка, заметки, полка…)
+            let slot = shown.len() + has_hidden as usize;
+            let r = Rect::from_min_size(pos2(row.left() + step * slot as f32, row.top()), vec2(step, row.height()));
+            let resp = ui.interact(r, ui.id().with("act-all"), Sense::click()).on_hover_text("Все инструменты: QR-код, пипетка, заметки, полка…");
+            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+            let at = pos2(r.center().x, r.top() + 21.0 - 2.0 * hov);
+            p.circle_filled(at, 18.0 + 1.5 * hov, rgba(255, 255, 255, (22.0 + 26.0 * hov) as u8));
+            p.text(at, Align2::CENTER_CENTER, "\u{E712}", FontId::proportional(16.0), mix(DIM, FG, 0.4 + 0.6 * hov));
+            p.text(pos2(r.center().x, r.bottom() - 8.0), Align2::CENTER_CENTER, "Все", FontId::proportional(11.0), mix(DIM, FG, hov));
+            all = resp.clicked();
+        }
+        if all {
+            self.tab = Tab::Tools;
         }
         if let Some(id) = hide {
             let next = hide_action(&ids, &self.cfg.hidden_actions, id);
@@ -6208,7 +6321,13 @@ impl App {
         p.text(pos2(card.left() + 68.0, card.top() + 15.0), Align2::LEFT_TOP, name, semi(13.0), FG);
         let sub = match to_full {
             0 => format!("освещена {:.0}% · сегодня полнолуние", illum * 100.0),
-            n => format!("освещена {:.0}% · полнолуние через {}", illum * 100.0, count_ru(n as usize, ["день", "дня", "дней"])),
+            // фаза уже называется «Полнолуние» — не повторяем слово: «следующее через 29 дней»
+            n => format!(
+                "освещена {:.0}% · {} через {}",
+                illum * 100.0,
+                if name.to_lowercase().contains("полнолуние") { "следующее" } else { "полнолуние" },
+                count_ru(n as usize, ["день", "дня", "дней"])
+            ),
         };
         p.text(pos2(card.left() + 68.0, card.top() + 35.0), Align2::LEFT_TOP, sub, FontId::proportional(11.5), DIM);
         // ── солнце: дуга от восхода к закату и точка «сейчас»
@@ -7971,7 +8090,7 @@ impl App {
             if sel >= today {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let w = (ui.available_width() - 52.0).max(80.0);
+                    let w = (ui.available_width() - 64.0).max(80.0);
                     let a = ui.add(
                         egui::TextEdit::singleline(&mut self.cal_text)
                             .margin(egui::Margin::symmetric(9.0, 7.0))
@@ -8917,6 +9036,7 @@ impl eframe::App for App {
         // при завершении сеанса Windows несохранённое пишется прямо из оконной процедуры
         if let Some(hwnd) = hwnd_of(frame) {
             sys::watch_end_session(hwnd);
+            sys::watch_flash(hwnd, ctx);
         }
         // жидкое стекло: раз в ~0,7 с (и сразу при смене размера) берём снимок экрана под островом
         // Стекло видит фон, только пока остров скрыт от захвата экрана. Если остров должен быть виден
@@ -10311,6 +10431,59 @@ mod morning_brief_tests {
         assert_eq!(morning_brief(&[], &[], &[h(7, 0.0), h(8, 0.0), h(12, 70.0)], now, 8).as_deref(), Some("дождь около 12:00"));
         // устаревший (вчерашний) прогноз — про дождь молчим
         assert_eq!(morning_brief(&[], &[], &[h(22, 90.0), h(23, 90.0)], now, 8), None);
+    }
+}
+
+/// Сколько интернета не должно быть, чтобы пилюля сказала «нет сети» (короткие сбои Windows бывают).
+const NET_ALARM: Duration = Duration::from_secs(10);
+
+/// «42 с», «3:05», «1 ч 05 м» — сколько длилось.
+fn fmt_gone(s: u64) -> String {
+    if s < 60 {
+        format!("{s} с")
+    } else if s < 3600 {
+        format!("{}:{:02}", s / 60, s % 60)
+    } else {
+        format!("{} ч {:02} м", s / 3600, s % 3600 / 60)
+    }
+}
+
+#[cfg(test)]
+mod fmt_gone_tests {
+    #[test]
+    fn readable_durations() {
+        use super::fmt_gone as f;
+        assert_eq!(f(42), "42 с");
+        assert_eq!(f(185), "3:05");
+        assert_eq!(f(3900), "1 ч 05 м");
+    }
+}
+
+/// Сколько показывать «матч найден»: в CS2 на принятие матча 20 секунд.
+const MATCH_ACCEPT: Duration = Duration::from_secs(20);
+
+/// Сколько итог последней игры висит в пилюле и «Сейчас».
+const GAME_RECAP: Duration = Duration::from_secs(10 * 60);
+
+/// Короткий итог игры для пилюли: «CS2 · 2 ч 14 м · 28 мс» (без пинга — без хвоста).
+fn game_pill_text(title: &str, secs: u64, ping: Option<u32>) -> String {
+    let (h, m) = (secs / 3600, secs % 3600 / 60);
+    let dur = if h > 0 { format!("{h} ч {m} м") } else { format!("{} м", m.max(1)) };
+    let name = short_label(if title.trim().is_empty() { "Игра" } else { title.trim() }, 14);
+    match ping {
+        Some(p) => format!("{name} · {dur} · {p} мс"),
+        None => format!("{name} · {dur}"),
+    }
+}
+
+#[cfg(test)]
+mod game_pill_tests {
+    #[test]
+    fn short_recap() {
+        use super::game_pill_text as g;
+        assert_eq!(g("CS2", 2 * 3600 + 14 * 60 + 5, Some(28)), "CS2 · 2 ч 14 м · 28 мс");
+        assert_eq!(g("Counter-Strike 2", 40 * 60, None), "Counter-Strike… · 40 м");
+        assert_eq!(g("", 10, Some(5)), "Игра · 1 м · 5 мс");
     }
 }
 

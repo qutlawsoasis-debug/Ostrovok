@@ -1200,6 +1200,54 @@ pub fn set_light_theme(light: bool) {
     });
 }
 
+/// Есть ли интернет — по мнению самой Windows (тот же источник, что значок сети на панели задач).
+/// None — Windows не ответила (тогда тревогу не поднимаем).
+pub fn internet_ok() -> Option<bool> {
+    use windows::Networking::Connectivity::{NetworkConnectivityLevel, NetworkInformation};
+    match NetworkInformation::GetInternetConnectionProfile() {
+        // нет ни одного подключения к интернету
+        Err(e) if e.code().is_ok() => Some(false),
+        Err(_) => None,
+        Ok(p) => {
+            let level = p.GetNetworkConnectivityLevel().ok()?;
+            // «ограниченный доступ» — это обычно страница входа в Wi‑Fi: интернет почти есть, не пугаем
+            if level == NetworkConnectivityLevel::InternetAccess || level == NetworkConnectivityLevel::ConstrainedInternetAccess {
+                return Some(true);
+            }
+            // Подключение есть, но Windows говорит «без интернета». За VPN, прокси или блокировщиком рекламы
+            // её проверка (msftconnecttest) часто не проходит, хотя интернет работает, — проверяем сами
+            Some(tcp_reachable())
+        }
+    }
+}
+
+/// Открывается ли соединение с публичными DNS (Cloudflare, Google) — за 2 с.
+fn tcp_reachable() -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    ["1.1.1.1:443", "8.8.8.8:443"].iter().filter_map(|a| a.parse::<SocketAddr>().ok()).any(|a| TcpStream::connect_timeout(&a, std::time::Duration::from_secs(2)).is_ok())
+}
+
+/// Следит за интернетом раз в 3 с в своём потоке: 1 — есть, 2 — нет, 0 — неизвестно.
+pub fn spawn_net_watch(state: Arc<std::sync::atomic::AtomicU8>, ctx: eframe::egui::Context) {
+    std::thread::spawn(move || {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+        }
+        loop {
+            let v = match internet_ok() {
+                Some(true) => 1,
+                Some(false) => 2,
+                None => 0,
+            };
+            if state.swap(v, Ordering::Relaxed) != v {
+                ctx.request_repaint();
+            }
+            // в полноэкранной игре — реже
+            std::thread::sleep(std::time::Duration::from_secs(if crate::quiet::in_game() { 10 } else { 3 }));
+        }
+    });
+}
+
 /// Отпечаток набора активных звуковых устройств (вывод и ввод). Подключили Bluetooth-наушники —
 /// появилось новое устройство, отпечаток сменился. Дёшево: спрашивает Windows в своём процессе,
 /// без внешних программ. В потоке должен быть включён COM. None — Windows не ответила.
@@ -2031,7 +2079,77 @@ unsafe extern "system" fn end_session_proc(
     if msg == WM_ENDSESSION && wparam.0 != 0 {
         let _ = std::panic::catch_unwind(crate::store::write_snapshot);
     }
+    // сообщение оболочки: какое-то окно замигало на панели задач (так игры зовут «матч найден»)
+    let shell = SHELL_MSG.load(Ordering::Relaxed);
+    if shell != 0 && msg == shell && wparam.0 as u32 == HSHELL_FLASH_CODE {
+        if let Ok(mut f) = FLASHED.lock() {
+            *f = Some(lparam.0);
+        }
+        if let Some(ctx) = WAKE.get() {
+            ctx.request_repaint();
+        }
+    }
     DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
+/// HSHELL_FLASH = HSHELL_REDRAW (6) | HSHELL_HIGHBIT (0x8000): окно мигает на панели задач.
+const HSHELL_FLASH_CODE: u32 = 0x8006;
+/// номер сообщения «SHELLHOOK» (0 — подписка не удалась)
+static SHELL_MSG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// последнее замигавшее окно (забирает take_flash)
+static FLASHED: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
+/// разбудить окно острова из оконной процедуры
+static WAKE: std::sync::OnceLock<eframe::egui::Context> = std::sync::OnceLock::new();
+
+/// Подписывает окно острова на сообщения оболочки (мигание окон на панели задач).
+/// Обычный документированный способ: без хуков клавиатуры и чужих процессов.
+pub fn watch_flash(hwnd: isize, ctx: &eframe::egui::Context) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if hwnd == 0 || DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let _ = WAKE.set(ctx.clone());
+    unsafe {
+        let id = RegisterWindowMessageW(w!("SHELLHOOK"));
+        if id != 0 && RegisterShellHookWindow(HWND(hwnd as *mut core::ffi::c_void)).as_bool() {
+            SHELL_MSG.store(id, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Окно, которое замигало с прошлого раза (если было).
+pub fn take_flash() -> Option<isize> {
+    FLASHED.lock().ok()?.take()
+}
+
+/// Имя exe, которому принадлежит окно ("" — не узнали).
+pub fn window_exe(hwnd: isize) -> String {
+    use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(HWND(hwnd as *mut core::ffi::c_void), Some(&mut pid));
+        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return String::new() };
+        let mut buf = [0u16; 520];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+        let _ = windows::Win32::Foundation::CloseHandle(h);
+        if !ok {
+            return String::new();
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        path.rsplit('\\').next().unwrap_or("").to_string()
+    }
+}
+
+/// Развернуть окно и вывести его вперёд (по щелчку пользователя по острову — право на это у нас есть).
+pub fn focus_window(hwnd: isize) {
+    unsafe {
+        let h = HWND(hwnd as *mut core::ffi::c_void);
+        if IsIconic(h).as_bool() {
+            let _ = ShowWindow(h, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(h);
+    }
 }
 
 // ---------------------------------------------------------------- место окна острова
@@ -2119,5 +2237,18 @@ mod audio_sig_live {
         let b = super::audio_devices_sig();
         assert!(a.is_some(), "Windows не ответила");
         assert_eq!(a, b, "без изменений отпечаток стабилен");
+    }
+}
+
+#[cfg(test)]
+mod internet_live {
+    /// Живая проверка: `cargo test -- --ignored internet_live`
+    #[test]
+    #[ignore]
+    fn internet_answers() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+        }
+        assert_eq!(super::internet_ok(), Some(true), "на машине с интернетом должно быть Some(true)");
     }
 }

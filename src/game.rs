@@ -530,6 +530,29 @@ pub fn not_a_game(exe: &str) -> bool {
     !s.is_empty() && NOT_GAMES.contains(&s.as_str())
 }
 
+/// Знакомая сетевая игра с поиском матча (её мигание на панели задач — «матч найден»).
+/// Чужие мигания (мессенджеры, загрузки) сюда не попадают.
+pub fn is_matchmaking_game(exe: &str) -> bool {
+    matches!(
+        stem(exe).to_lowercase().as_str(),
+        "cs2" | "csgo" | "dota2" | "valorant-win64-shipping" | "r5apex" | "r5apex_dx12" | "fortniteclient-win64-shipping" | "overwatch" | "tslgame" | "deadlock" | "leagueclientux"
+    )
+}
+
+#[cfg(test)]
+mod matchmaking_tests {
+    #[test]
+    fn only_known_games_flash_as_match() {
+        use super::is_matchmaking_game as g;
+        assert!(g("cs2.exe"));
+        assert!(g("CS2.EXE"));
+        assert!(g("dota2.exe"));
+        assert!(!g("Discord.exe"));
+        assert!(!g("Telegram.exe"));
+        assert!(!g(""));
+    }
+}
+
 /// Название игры для сводки: знакомые — красиво, остальные — по имени файла.
 pub fn game_title(exe: &str) -> String {
     let s = stem(exe);

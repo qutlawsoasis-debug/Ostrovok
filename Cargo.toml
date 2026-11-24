@@ -1,6 +1,6 @@
 [package]
 name = "ostrovok"
-version = "0.1.86"
+version = "0.1.87"
 edition = "2021"
 description = "Островок — живая панель в верхней части экрана Windows"
 
@@ -29,6 +29,7 @@ features = [
     "Media",
     "Media_Control",
     "Media_Ocr",
+    "Networking_Connectivity",
     "Graphics_Imaging",
     "Storage_Streams",
     "ApplicationModel",
