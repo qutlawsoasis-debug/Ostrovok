@@ -1245,6 +1245,8 @@ struct App {
     page_grow: std::collections::HashMap<u8, f32>,
     /// пружина размера острова пришла к цели (в этом кадре)
     size_settled: bool,
+    /// когда был прошлый кадр (свой шаг времени, см. update)
+    frame_at: Instant,
     /// подсказки острова (tick_hints): когда проверяли и когда говорили про дождь
     hints_at: Option<Instant>,
     rain_told: Option<Instant>,
@@ -1615,6 +1617,7 @@ impl App {
             hint_cache: Default::default(),
             note_trash: None,
             bin_probe: Probe::new(),
+            frame_at: Instant::now(),
             // первая проверка — через минуту после запуска: погода к тому времени обычно уже пришла
             hints_at: Some(Instant::now()),
             rain_told: None,
@@ -8467,7 +8470,10 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let now = Instant::now();
-        let dt = frame_dt(ctx.input(|i| i.stable_dt));
+        // шаг времени — по настоящим часам: при редких кадрах (украшения, 30 Гц) egui подставляет
+        // предсказанные 1/60 с, и капли, рябь и плеск шли бы вдвое медленнее
+        let dt = frame_dt(now.duration_since(self.frame_at).as_secs_f32());
+        self.frame_at = now;
         let time = ctx.input(|i| i.time);
         // предупреждение о повреждённых настройках — один раз при старте
         let warn = store::LOAD_WARN.lock().ok().and_then(|mut w| w.take());
@@ -8683,7 +8689,7 @@ impl eframe::App for App {
                     if dx != 0.0 {
                         lean_t = dx.signum() * 4.0 * k;
                     }
-                    self.reach_cursor += (c - self.reach_cursor) * 0.35;
+                    self.reach_cursor += (c - self.reach_cursor) * (1.0 - (-dt * 26.0).exp()); // ≈0,35 за кадр при 60 Гц, но не зависит от частоты кадров
                 }
             }
         }
@@ -9265,9 +9271,17 @@ impl eframe::App for App {
 
         // частота перерисовки: быстро только когда есть на что смотреть
         let playing = self.media_now.as_ref().is_some_and(|m| m.playing);
+        let transition = shape_anim || !self.reach.settled() || !self.lean_s.settled() || !self.jelly.settled() || self.toast.is_some() || mode_t < 1.0
+            || !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || !self.bub_dl.settled();
+        // только фоновые украшения: пилюля «дышит» под звук, эквалайзер, капли, отблеск — никто её не трогает
+        // и форма не меняется. Им хватает 30 кадров: раньше они шли с частотой монитора (144+ на игровом),
+        // и пилюля под голос в Discord ела ~22 % ядра и 10 % видеокарты
+        let ambient = ambient_frames(animating, transition, self.drag.is_some(), over, self.mode == Mode::Pill, self.shot.is_some());
         let want = if self.hidden && self.shot.is_none() && !animating {
             // остров спрятан (полноэкранная игра): кадры не нужны, только изредка проверяем, не пора ли показаться
             quiet::GAME_FRAME
+        } else if ambient {
+            AMBIENT_FRAME
         } else if animating || self.shot.is_some() {
             Duration::ZERO
         } else if self.mode != Mode::Pill || dist < 420.0 || playing {
@@ -9280,8 +9294,6 @@ impl eframe::App for App {
         };
         // в игре — не чаще раза в 2 с, пока остров не трогают и он не меняет форму (выход из игры будит поток наблюдения);
         // постоянные украшения (капли, свечение под музыку) остаются под ограничением
-        let transition = shape_anim || !self.reach.settled() || !self.lean_s.settled() || !self.jelly.settled() || self.toast.is_some() || mode_t < 1.0
-            || !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || !self.bub_dl.settled();
         let interacting = !self.hidden && (over || transition || self.mode != Mode::Pill || self.drag.is_some() || self.shot.is_some());
         let mut after = quiet::repaint_after(self.fs_now, interacting, want);
         if self.fs_now && !self.hidden && cursor.is_some_and(|c| (c - rect_v.center()).length() < 200.0) {
@@ -10266,6 +10278,33 @@ mod morning_brief_tests {
         assert_eq!(morning_brief(&[], &[], &[h(7, 0.0), h(8, 0.0), h(12, 70.0)], now, 8).as_deref(), Some("дождь около 12:00"));
         // устаревший (вчерашний) прогноз — про дождь молчим
         assert_eq!(morning_brief(&[], &[], &[h(22, 90.0), h(23, 90.0)], now, 8), None);
+    }
+}
+
+/// Кадр для фоновых украшений пилюли (≈30 в секунду).
+const AMBIENT_FRAME: Duration = Duration::from_millis(33);
+
+/// Идут ли только фоновые украшения: что-то анимируется, но форма не меняется, остров не трогают,
+/// это пилюля (не панель) и не снимок экрана. Тогда хватает AMBIENT_FRAME вместо частоты монитора.
+fn ambient_frames(animating: bool, transition: bool, dragging: bool, over: bool, pill: bool, shot: bool) -> bool {
+    animating && !transition && !dragging && !over && pill && !shot
+}
+
+#[cfg(test)]
+mod ambient_tests {
+    #[test]
+    fn only_untouched_decorations_are_capped() {
+        use super::ambient_frames as a;
+        // пилюля дышит под звук, никто не трогает — 30 кадров
+        assert!(a(true, false, false, false, true, false));
+        // раскрывается, тянут, наводят, панель, снимок — полная частота
+        assert!(!a(true, true, false, false, true, false));
+        assert!(!a(true, false, true, false, true, false));
+        assert!(!a(true, false, false, true, true, false));
+        assert!(!a(true, false, false, false, false, false));
+        assert!(!a(true, false, false, false, true, true));
+        // ничего не анимируется — это не про украшения
+        assert!(!a(false, false, false, false, true, false));
     }
 }
 
