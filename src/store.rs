@@ -15,6 +15,9 @@ pub struct Settings {
     /// минуты «Фокуса» по дням: («2026-11-17», 75), последние 60 дней
     #[serde(default)]
     pub focus_log: Vec<(String, u32)>,
+    /// день последней утренней сводки «ГГГГ-ММ-ДД» — показывается раз в день
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub brief_day: String,
     /// города для мировых часов под календарём
     #[serde(default)]
     pub world: Vec<String>,

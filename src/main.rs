@@ -1245,6 +1245,9 @@ struct App {
     page_grow: std::collections::HashMap<u8, f32>,
     /// пружина размера острова пришла к цели (в этом кадре)
     size_settled: bool,
+    /// подсказки острова (tick_hints): когда проверяли и когда говорили про дождь
+    hints_at: Option<Instant>,
+    rain_told: Option<Instant>,
     /// фоновые опросы корзины и звуковых программ (см. Probe)
     bin_probe: Probe<(i64, i64)>,
     mixer_probe: Probe<Vec<sys::AppVol>>,
@@ -1612,6 +1615,9 @@ impl App {
             hint_cache: Default::default(),
             note_trash: None,
             bin_probe: Probe::new(),
+            // первая проверка — через минуту после запуска: погода к тому времени обычно уже пришла
+            hints_at: Some(Instant::now()),
+            rain_told: None,
             mixer_probe: Probe::new(),
             music_seen: None,
             page_grow: Default::default(),
@@ -2989,6 +2995,8 @@ impl App {
                 self.note = Some((format!("Пипетка: наведите курсор… {left}"), now + Duration::from_secs(1)));
             }
         }
+
+        self.tick_hints(now);
 
         let stamp = chrono::Local::now().timestamp();
         if self.cfg.reminders.iter().any(|r| r.at <= stamp) {
@@ -6823,6 +6831,42 @@ impl App {
         }
     }
 
+    /// Подсказки острова сам по себе: утренняя сводка раз в день и «скоро дождь» (не чаще раза в 3 часа).
+    /// Молчат в «Не беспокоить», в игре (show_toast) и пока остров спрятан. Раз в минуту, не каждый кадр.
+    fn tick_hints(&mut self, now: Instant) {
+        if self.hints_at.is_some_and(|t| now.duration_since(t) < Duration::from_secs(60)) || self.hidden || self.fs_now || self.cfg.dnd || test_mode() {
+            return;
+        }
+        self.hints_at = Some(now);
+        let local = chrono::Local::now().naive_local();
+        use chrono::Timelike;
+        let city_hour = self.weather.as_ref().map_or(local.hour(), |w| (chrono::Utc::now().naive_utc() + chrono::Duration::seconds(w.utc_offset as i64)).hour());
+        // утро: с 6 до 12, один раз за день
+        let today = local.date().format("%Y-%m-%d").to_string();
+        // ждём погоду (если город задан) до 11:00 — иначе в сводке не будет дождя; и не тратим сводку,
+        // когда карточку всё равно не покажут (игра в окне, висит карточка напоминания) — отложим на минуту
+        let weather_wait = self.cfg.lat.is_some() && self.weather.is_none() && local.hour() < 11;
+        let busy = self.game_quiet || self.toast.as_ref().is_some_and(|t| t.glyph == "\u{E823}" && t.until > Instant::now());
+        if (6..12).contains(&local.hour()) && self.cfg.brief_day != today && !weather_wait && !busy {
+            let hours = self.weather.as_ref().map(|w| w.hours.clone()).unwrap_or_default();
+            if let Some(text) = morning_brief(&self.cfg.reminders, &self.cfg.todos, &hours, local, city_hour) {
+                self.show_toast("\u{E706}", [0xFF, 0xC8, 0x5A], "Доброе утро", &text, 10, false);
+            }
+            self.cfg.brief_day = today;
+            self.cfg.save();
+            return;
+        }
+        // дождь: вероятность стала высокой — один раз, пока не пройдёт 3 часа
+        let rain = self.weather.as_ref().and_then(|w| rain_soon(&w.hours, city_hour)).filter(|(pct, _)| *pct >= 60);
+        if let Some((pct, snow)) = rain {
+            if !busy && self.rain_told.is_none_or(|t| now.duration_since(t) > Duration::from_secs(3 * 3600)) {
+                self.rain_told = Some(now);
+                let (title, text) = if snow { ("Скоро снег", format!("~{pct}% в ближайший час")) } else { ("Скоро дождь", format!("~{pct}% в ближайший час — возьмите зонт")) };
+                self.show_toast(if snow { "❄" } else { "☂" }, [0x8F, 0xCB, 0xFF], title, &text, 8, false);
+            }
+        }
+    }
+
     /// Пишет снимок в PNG в фоновом потоке; карточка покажется, когда файл готов (Msg::ShotSaved).
     fn save_shot_bg(&mut self, ctx: &egui::Context, w: usize, h: usize, px: Vec<u8>) {
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
@@ -10161,6 +10205,67 @@ impl<T: Send + 'static> Probe<T> {
     fn reset(&mut self) {
         self.rx = None;
         self.at = Some(Instant::now());
+    }
+}
+
+/// Утренняя сводка: «3 дела · созвон в 18:30 · дождь около 15:00». None — если сказать нечего.
+/// `hours` — почасовой прогноз, `city_hour` — текущий час в городе погоды.
+fn morning_brief(reminders: &[store::Reminder], todos: &[store::Todo], hours: &[weather::Hour], now: chrono::NaiveDateTime, city_hour: u32) -> Option<String> {
+    use chrono::TimeZone;
+    let mut parts: Vec<String> = Vec::new();
+    let key = now.date().format("%Y-%m-%d").to_string();
+    let open = todos.iter().filter(|t| !t.done && t.due.as_deref().is_none_or(|d| d <= key.as_str())).count();
+    if open > 0 {
+        parts.push(count_word(open, "дело", "дела", "дел"));
+    }
+    let end = (now.date() + chrono::Duration::days(1)).and_hms_opt(0, 0, 0).unwrap_or(now);
+    let next = reminders
+        .iter()
+        .filter_map(|r| chrono::Local.timestamp_opt(r.at, 0).single().map(|d| (d.naive_local(), r.text.as_str())))
+        .filter(|(at, _)| *at > now && *at < end)
+        .min_by_key(|x| x.0);
+    if let Some((at, text)) = next {
+        parts.push(format!("{} в {}", short_label(text, 18), at.format("%H:%M")));
+    }
+    // первый дождливый час сегодня (до полуночи), начиная с текущего. Прогноз может начинаться
+    // с прошлого часа (скачан в 07:55, а сейчас 08:05) — ищем текущий среди первых; нет его (прогноз
+    // устарел, например вчерашний) — про дождь молчим
+    let start = hours.iter().take(3).position(|h| h.hour == city_hour);
+    let rain = start.and_then(|s| hours[s..].iter().take_while(|h| h.hour >= city_hour).find(|h| h.rain >= 60.0));
+    if let Some(h) = rain {
+        let snow = matches!(h.code, 71..=77 | 85 | 86);
+        parts.push(format!("{} около {:02}:00", if snow { "снег" } else { "дождь" }, h.hour));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+#[cfg(test)]
+mod morning_brief_tests {
+    use super::*;
+    #[test]
+    fn says_only_what_matters() {
+        use chrono::TimeZone;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 24).unwrap();
+        let now = day.and_hms_opt(8, 0, 0).unwrap();
+        let ts = |h: u32| chrono::Local.from_local_datetime(&day.and_hms_opt(h, 30, 0).unwrap()).single().unwrap().timestamp();
+        let rem = vec![store::Reminder { text: "созвон".into(), at: ts(18), repeat: 0 }];
+        let todos = vec![
+            store::Todo { text: "a".into(), done: false, due: None },
+            store::Todo { text: "b".into(), done: false, due: Some("2026-11-24".into()) },
+            store::Todo { text: "c".into(), done: false, due: Some("2026-11-30".into()) },
+            store::Todo { text: "d".into(), done: true, due: None },
+        ];
+        let h = |hour: u32, rain: f64| weather::Hour { hour, temp: 0.0, rain, code: 61 };
+        let hours = vec![h(8, 10.0), h(9, 20.0), h(15, 70.0), h(16, 80.0)];
+        assert_eq!(morning_brief(&rem, &todos, &hours, now, 8).as_deref(), Some("2 дела · созвон в 18:30 · дождь около 15:00"));
+        // сказать нечего
+        assert_eq!(morning_brief(&[], &[], &[h(8, 0.0)], now, 8), None);
+        // прогноз через полночь: завтрашние часы (0, 1…) не считаем сегодняшними
+        assert_eq!(morning_brief(&[], &[], &[h(22, 0.0), h(23, 0.0), h(0, 90.0)], day.and_hms_opt(22, 0, 0).unwrap(), 22), None);
+        // прогноз начинается с прошлого часа — дождь всё равно находится
+        assert_eq!(morning_brief(&[], &[], &[h(7, 0.0), h(8, 0.0), h(12, 70.0)], now, 8).as_deref(), Some("дождь около 12:00"));
+        // устаревший (вчерашний) прогноз — про дождь молчим
+        assert_eq!(morning_brief(&[], &[], &[h(22, 90.0), h(23, 90.0)], now, 8), None);
     }
 }
 
