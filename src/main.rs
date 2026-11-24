@@ -1331,7 +1331,6 @@ struct App {
     /// выбранный в календаре день (None — сегодня) и поля нового дела на него
     cal_sel: Option<chrono::NaiveDate>,
     cal_text: String,
-    cal_time: String,
     meter: sys::CpuMeter,
     stats: sys::Stats,
     stats_at: Instant,
@@ -1660,7 +1659,6 @@ impl App {
             marks_occ: None,
             cal_sel: None,
             cal_text: String::new(),
-            cal_time: String::new(),
             meter: sys::CpuMeter::default(),
             stats: sys::Stats::default(),
             stats_at: now,
@@ -1934,6 +1932,11 @@ impl App {
                     let now = chrono::Local::now().timestamp();
                     for (days, hour, text) in [(0, 3, "Созвон с командой"), (0, 5, "Забрать посылку"), (2, 4, "Оплатить интернет"), (6, 2, "День рождения Миши")] {
                         app.cfg.reminders.push(store::Reminder { text: text.into(), at: now + days * 86400 + hour * 3600, repeat: 0 });
+                    }
+                    // и дела: без срока, просроченное, сделанное сегодня, на послезавтра
+                    let day = |d: i64| (chrono::Local::now().date_naive() + chrono::Duration::days(d)).format("%Y-%m-%d").to_string();
+                    for (text, done, due) in [("Купить хлеб", false, None), ("Отправить отчёт", false, Some(day(-1))), ("Позвонить в банк", true, Some(day(0))), ("Записаться к врачу", false, Some(day(2)))] {
+                        app.cfg.todos.push(store::Todo { text: text.into(), done, due });
                     }
                     Tab::Calendar
                 }
@@ -2490,10 +2493,12 @@ impl App {
                 self.ask(q);
             }
             Action::Quick(Quick::Todo(text)) => {
-                self.cfg.todos.insert(0, new_todo(&text));
-                self.cfg.todos.truncate(60);
-                self.cfg.save();
-                self.notify("Дело добавлено");
+                if push_todo(&mut self.cfg.todos, new_todo(&text)) {
+                    self.cfg.save();
+                    self.notify("Дело добавлено");
+                } else {
+                    self.notify(TODOS_FULL);
+                }
             }
             Action::Quick(Quick::Note(text)) => {
                 // пустую заметку в начале списка заменяем, иначе добавляем новую сверху
@@ -3894,10 +3899,12 @@ impl App {
         if add {
             let text = self.todo_edit.trim().to_string();
             if !text.is_empty() {
-                self.cfg.todos.insert(0, new_todo(&text));
-                self.cfg.todos.truncate(60);
-                self.todo_edit.clear();
-                self.cfg.save();
+                if push_todo(&mut self.cfg.todos, new_todo(&text)) {
+                    self.todo_edit.clear();
+                    self.cfg.save();
+                } else {
+                    self.notify(TODOS_FULL);
+                }
             }
         }
         if self.cfg.todos.is_empty() {
@@ -7622,6 +7629,8 @@ impl App {
         });
 
         let (mut click, mut remove, mut add) = (None, None, false);
+        let (mut toggle_todo, mut remove_todo): (Option<usize>, Option<usize>) = (None, None);
+        let todo_days: Vec<NaiveDate> = self.cfg.todos.iter().filter(|t| !t.done).filter_map(|t| t.due.as_deref().and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())).collect();
         ui.columns(2, |c| {
             // ----- месяц
             let ui = &mut c[0];
@@ -7672,7 +7681,8 @@ impl App {
                     p.circle_filled(star, 4.5, Color32::from_rgba_unmultiplied(weekend.r(), weekend.g(), weekend.b(), 40));
                 }
                 // точки — сколько на этот день дел (не больше трёх)
-                let n = dated.iter().filter(|d| d.1 == date).count().min(3);
+                // точки: напоминания и незакрытые дела со сроком этим днём
+                let n = (dated.iter().filter(|d| d.1 == date).count() + todo_days.iter().filter(|d| **d == date).count()).min(3);
                 for k in 0..n {
                     let dx = (k as f32 - (n as f32 - 1.0) / 2.0) * 5.0;
                     // у сегодняшнего дня точки под кружком, чтобы не налезали на число
@@ -7704,8 +7714,10 @@ impl App {
             ui.add_space(6.0);
             let mut mine: Vec<&(usize, NaiveDate, String, String, i64, bool)> = dated.iter().filter(|d| d.1 == sel).collect();
             mine.sort_by_key(|d| d.4);
-            egui::ScrollArea::vertical().max_height(if fest.is_some() { 98.0 } else { 118.0 }).auto_shrink([false, true]).show(ui, |ui| {
-                if mine.is_empty() {
+            // дела этого дня: срок этим днём; сегодня — ещё просроченные и без срока
+            let day_todos = todos_for_day(&self.cfg.todos, sel, today);
+            egui::ScrollArea::vertical().max_height(if fest.is_some() { 150.0 } else { 172.0 }).auto_shrink([false, true]).show(ui, |ui| {
+                if mine.is_empty() && day_todos.is_empty() {
                     ui.label(RichText::new(if sel < today { "В этот день дел не было." } else { "На этот день дел нет." }).color(DIM));
                 }
                 for (i, _, time, text, ts, orig) in mine {
@@ -7728,15 +7740,54 @@ impl App {
                     }
                     ui.add_space(3.0);
                 }
+                // дела — в той же ленте: кружок отмечает сделанным, крестик удаляет
+                for &(k, late) in &day_todos {
+                    let Some(t) = self.cfg.todos.get(k) else { continue };
+                    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
+                    glass_chip(ui.painter(), row, 10.0, if t.done { 0.25 } else { 0.45 });
+                    let check = Rect::from_center_size(pos2(row.left() + 18.0, row.center().y), vec2(24.0, 24.0));
+                    let cresp = ui.interact(check, ui.id().with(("cal-todo", k)), Sense::click()).on_hover_text(if t.done { "Вернуть" } else { "Сделано" });
+                    let p = ui.painter();
+                    if t.done {
+                        p.circle_filled(check.center(), 7.5, accent());
+                        p.text(check.center(), Align2::CENTER_CENTER, "\u{E73E}", FontId::proportional(9.0), BG);
+                    } else {
+                        p.circle_stroke(check.center(), 7.5, Stroke::new(1.5_f32, if cresp.hovered() { accent() } else { DIM }));
+                    }
+                    let tx = row.left() + 34.0;
+                    let text_w = (row.right() - 34.0 - tx - if late { 74.0 } else { 0.0 }).max(20.0);
+                    let shown = elide(p, &t.text, FontId::proportional(13.0), text_w);
+                    let r = p.text(pos2(tx, row.center().y), Align2::LEFT_CENTER, &shown, FontId::proportional(13.0), if t.done { DIM } else { FG });
+                    if t.done {
+                        p.line_segment([pos2(r.left(), r.center().y), pos2(r.right(), r.center().y)], Stroke::new(1.0_f32, DIM));
+                    }
+                    if late {
+                        p.text(pos2(row.right() - 36.0, row.center().y), Align2::RIGHT_CENTER, "просрочено", FontId::proportional(11.0), Color32::from_rgb(0xFF, 0x8A, 0x7A));
+                    }
+                    let x = Rect::from_center_size(pos2(row.right() - 18.0, row.center().y), vec2(26.0, 26.0));
+                    let xresp = ui.interact(x, ui.id().with(("cal-todo-del", k)), Sense::click()).on_hover_text("Удалить дело");
+                    ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(12.0), if xresp.hovered() { FG } else { DIM });
+                    if cresp.clicked() {
+                        toggle_todo = Some(k);
+                    }
+                    if xresp.clicked() {
+                        remove_todo = Some(k);
+                    }
+                    ui.add_space(3.0);
+                }
             });
             if sel >= today {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let w = (ui.available_width() - 142.0).max(80.0);
-                    let a = ui.add(egui::TextEdit::singleline(&mut self.cal_text).margin(egui::Margin::symmetric(9.0, 7.0)).hint_text(RichText::new("Новое дело").color(DIM)).desired_width(w));
-                    let b = ui.add(egui::TextEdit::singleline(&mut self.cal_time).margin(egui::Margin::symmetric(9.0, 7.0)).hint_text(RichText::new("09:00").color(DIM)).desired_width(46.0));
-                    let enter = (a.lost_focus() || b.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    add = jelly(ui, "+").on_hover_text("Напомнить в этот день").clicked() || enter;
+                    let w = (ui.available_width() - 52.0).max(80.0);
+                    let a = ui.add(
+                        egui::TextEdit::singleline(&mut self.cal_text)
+                            .margin(egui::Margin::symmetric(9.0, 7.0))
+                            .hint_text(RichText::new("18:30 созвон · купить хлеб · заметка …").color(DIM))
+                            .desired_width(w),
+                    );
+                    let enter = a.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    add = jelly(ui, "+").on_hover_text("Есть время — напоминание на этот день, нет — дело").clicked() || enter;
                 });
             }
         });
@@ -7750,22 +7801,55 @@ impl App {
                 self.cfg.save();
             }
         }
+        if let Some(k) = toggle_todo {
+            if let Some(t) = self.cfg.todos.get_mut(k) {
+                t.done = !t.done;
+                self.cfg.save();
+            }
+        }
+        if let Some(k) = remove_todo {
+            if k < self.cfg.todos.len() {
+                self.cfg.todos.remove(k);
+                self.cfg.save();
+            }
+        }
         if add {
-            let text = self.cal_text.trim().to_string();
-            let spec = self.cal_time.trim().replace(['.', ',', ' '], ":");
-            let time = if spec.is_empty() { NaiveTime::from_hms_opt(9, 0, 0) } else { NaiveTime::parse_from_str(&spec, "%H:%M").ok() };
-            let at = time.and_then(|t| resolve_here(sel.and_time(t))).map(|d| d.timestamp());
-            match at {
-                _ if text.is_empty() => self.notify("Впишите, о чём напомнить"),
-                None => self.notify("Не понял время: напишите, например, 18:30"),
-                Some(at) if at <= Local::now().timestamp() => self.notify("Это время уже прошло"),
-                Some(at) => {
-                    self.cfg.reminders.push(store::Reminder { text, at, repeat: 0 });
-                    self.cfg.reminders.sort_by_key(|r| r.at);
-                    self.cfg.save();
+            match day_input(&self.cal_text, sel, Local::now().naive_local()) {
+                None => self.notify("Впишите дело или «18:30 что напомнить»"),
+                Some(DayAdd::Remind(text, at)) => match resolve_here(at).map(|d| d.timestamp()) {
+                    None => self.notify("Не понял время: напишите, например, 18:30"),
+                    Some(ts) if ts <= Local::now().timestamp() => self.notify("Это время уже прошло"),
+                    Some(ts) => {
+                        self.cfg.reminders.push(store::Reminder { text, at: ts, repeat: 0 });
+                        self.cfg.reminders.sort_by_key(|r| r.at);
+                        self.cfg.save();
+                        self.cal_text.clear();
+                        self.notify(&format!("Напомню {} в {}", if at.date() == today { "сегодня".to_string() } else { at.format("%d.%m").to_string() }, at.format("%H:%M")));
+                    }
+                },
+                Some(DayAdd::Todo(text, due)) => {
+                    if text.is_empty() {
+                        self.notify("Впишите, что сделать");
+                    } else {
+                        if push_todo(&mut self.cfg.todos, store::Todo { text, done: false, due: due.map(|d| d.format("%Y-%m-%d").to_string()) }) {
+                            self.cfg.save();
+                            self.cal_text.clear();
+                            self.notify("Дело добавлено");
+                        } else {
+                            self.notify(TODOS_FULL);
+                        }
+                    }
+                }
+                Some(DayAdd::Note(text)) => {
+                    if self.notes.first().is_some_and(|n| n.trim().is_empty()) {
+                        self.notes[0] = text;
+                    } else {
+                        self.notes.insert(0, text);
+                    }
+                    self.note_sel = 0;
+                    self.mark_notes_dirty();
                     self.cal_text.clear();
-                    self.cal_time.clear();
-                    self.notify("Напоминание добавлено");
+                    self.notify("Заметка сохранена");
                 }
             }
         }
@@ -9883,6 +9967,179 @@ mod agenda_tests {
         // не больше max
         assert_eq!(agenda_rows(&reminders, &todos, now, 2).len(), 2);
         assert!(agenda_rows(&[], &[], now, 3).is_empty());
+    }
+}
+
+const TODOS_FULL: &str = "В списке 60 несделанных дел — закройте или удалите какое-нибудь";
+
+/// Добавляет дело в начало списка. Больше 60 — сначала уходит самое старое сделанное;
+/// если все 60 не сделаны, дело не добавляется (false), чтобы молча не потерять чужое.
+fn push_todo(list: &mut Vec<store::Todo>, todo: store::Todo) -> bool {
+    if list.len() >= 60 {
+        match list.iter().rposition(|t| t.done) {
+            Some(i) => {
+                list.remove(i);
+            }
+            None => return false,
+        }
+    }
+    list.insert(0, todo);
+    true
+}
+
+#[cfg(test)]
+mod push_todo_tests {
+    use super::*;
+    #[test]
+    fn drops_done_first_and_never_undone() {
+        let t = |s: &str, done: bool| store::Todo { text: s.into(), done, due: None };
+        let mut list: Vec<store::Todo> = (0..60).map(|i| t(&i.to_string(), i == 10)).collect();
+        assert!(push_todo(&mut list, t("новое", false)));
+        assert_eq!(list.len(), 60);
+        assert_eq!(list[0].text, "новое");
+        assert!(list.iter().all(|x| x.text != "10"), "ушло сделанное");
+        // сделанных нет — не добавляем
+        assert!(!push_todo(&mut list, t("ещё", false)));
+        assert_eq!(list.len(), 60);
+    }
+}
+
+/// Дела выбранного дня для ленты «День»: (номер в списке, просрочено ли).
+/// Срок этим днём; на сегодня — ещё просроченные и без срока (незакрытые). Незакрытые первыми.
+fn todos_for_day(todos: &[store::Todo], sel: chrono::NaiveDate, today: chrono::NaiveDate) -> Vec<(usize, bool)> {
+    let key = sel.format("%Y-%m-%d").to_string();
+    let tkey = today.format("%Y-%m-%d").to_string();
+    let mut out: Vec<(usize, bool)> = todos
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            let due = t.due.as_deref();
+            let on_day = due == Some(key.as_str());
+            let late = !t.done && due.is_some_and(|d| d < tkey.as_str());
+            let floating = sel == today && !t.done && (due.is_none() || late);
+            (on_day || floating).then_some((i, late))
+        })
+        .collect();
+    out.sort_by_key(|&(i, _)| todos[i].done);
+    out
+}
+
+#[cfg(test)]
+mod todos_for_day_tests {
+    use super::*;
+    #[test]
+    fn today_collects_floating_and_late() {
+        let d = |day: u32| chrono::NaiveDate::from_ymd_opt(2026, 11, day).unwrap();
+        let t = |text: &str, done: bool, due: Option<&str>| store::Todo { text: text.into(), done, due: due.map(Into::into) };
+        let todos = vec![
+            t("сделано сегодня", true, Some("2026-11-24")),
+            t("без срока", false, None),
+            t("вчера", false, Some("2026-11-23")),
+            t("пятница", false, Some("2026-11-27")),
+            t("сделано без срока", true, None),
+        ];
+        assert_eq!(todos_for_day(&todos, d(24), d(24)), vec![(1, false), (2, true), (0, false)]);
+        assert_eq!(todos_for_day(&todos, d(27), d(24)), vec![(3, false)]);
+        assert!(todos_for_day(&todos, d(25), d(24)).is_empty());
+    }
+}
+
+/// Что добавить из единого поля страницы «День».
+#[derive(Debug, PartialEq)]
+enum DayAdd {
+    Todo(String, Option<chrono::NaiveDate>),
+    Note(String),
+    Remind(String, chrono::NaiveDateTime),
+}
+
+/// Разбор поля «День» для выбранного дня `sel`:
+/// - быстрые команды как в поиске («дело …», «заметка …», «напомни …»);
+/// - есть время («18:30 созвон», «созвон в 9:00») — напоминание на выбранный день;
+/// - иначе дело; срок из текста («до пятницы», «завтра») или выбранный день, если он не сегодня.
+///
+/// Для другого дня время переносится на `sel`, кроме «через N мин», «завтра» и «послезавтра» — там дата своя.
+fn day_input(text: &str, sel: chrono::NaiveDate, now: chrono::NaiveDateTime) -> Option<DayAdd> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let today = now.date();
+    let low = t.to_lowercase();
+    // целыми словами: «позавтракать» — не «завтра», «перейти через дорогу» — не «через 15 мин»
+    let words: Vec<&str> = low.split_whitespace().collect();
+    let rel = words.windows(2).any(|p| p[0] == "через" && (p[1].parse::<f64>().is_ok() || p[1].starts_with("мин") || p[1].starts_with('ч')));
+    let own_date = rel || words.iter().any(|w| *w == "завтра" || *w == "послезавтра");
+    // своё число у дня — выбранный (или сегодня: тогда прошедшее время не уезжает молча на завтра,
+    // а честно говорит «уже прошло»)
+    let redate = |at: chrono::NaiveDateTime| if own_date { at } else { sel.and_time(at.time()) };
+    // какое время в тексте: «9:00» однозначно; «9.30» — только с двумя цифрами минут («1.5 л» — не время)
+    // и не после «до» («отчёт до 5.12» — срок 5 декабря, а не 05:12)
+    let colon_time = words.iter().any(|w| chrono::NaiveTime::parse_from_str(w, "%H:%M").is_ok());
+    let dot_time = words.iter().enumerate().any(|(i, w)| {
+        let ok = w.split_once('.').is_some_and(|(h, m)| (1..=2).contains(&h.len()) && m.len() == 2 && chrono::NaiveTime::parse_from_str(w, "%H.%M").is_ok());
+        ok && (i == 0 || words[i - 1] != "до")
+    });
+    let quick = parse_quick(t, now).or_else(|| match parse_quick(&format!("напомни {t}"), now) {
+        Some(Quick::Remind(s, at)) if colon_time || dot_time || rel => Some(Quick::Remind(s, at)),
+        _ => None,
+    });
+    // одно время без текста («18:30») — не дело «18:30»: пусть впишут, о чём напомнить
+    if quick.is_none() && (colon_time || dot_time) && words.len() <= 2 {
+        return None;
+    }
+    Some(match quick {
+        Some(Quick::Remind(s, at)) => DayAdd::Remind(s, redate(at)),
+        Some(Quick::Note(s)) => DayAdd::Note(s),
+        Some(Quick::Todo(src)) => {
+            let (s, due) = parse_due(&src, today);
+            DayAdd::Todo(s, due.or((sel != today).then_some(sel)))
+        }
+        None => {
+            let (s, due) = parse_due(t, today);
+            DayAdd::Todo(s, due.or((sel != today).then_some(sel)))
+        }
+    })
+}
+
+#[cfg(test)]
+mod day_input_tests {
+    use super::*;
+    #[test]
+    fn one_field_understands_everything() {
+        let d = |m: u32, day: u32| chrono::NaiveDate::from_ymd_opt(2026, m, day).unwrap();
+        let now = d(11, 24).and_hms_opt(15, 0, 0).unwrap();
+        let at = |day: chrono::NaiveDate, h: u32, mi: u32| day.and_hms_opt(h, mi, 0).unwrap();
+        // время — напоминание сегодня
+        assert_eq!(day_input("18:30 созвон", d(11, 24), now), Some(DayAdd::Remind("созвон".into(), at(d(11, 24), 18, 30))));
+        assert_eq!(day_input("созвон в 18:30", d(11, 24), now), Some(DayAdd::Remind("созвон".into(), at(d(11, 24), 18, 30))));
+        // выбран другой день — время переносится на него
+        assert_eq!(day_input("9:00 врач", d(11, 28), now), Some(DayAdd::Remind("врач".into(), at(d(11, 28), 9, 0))));
+        // «завтра» и «через» — своя дата, даже если выбран другой день
+        assert_eq!(day_input("завтра 9:00 врач", d(11, 28), now), Some(DayAdd::Remind("врач".into(), at(d(11, 25), 9, 0))));
+        assert_eq!(day_input("через 15 мин чай", d(11, 28), now), Some(DayAdd::Remind("чай".into(), at(d(11, 24), 15, 15))));
+        assert_eq!(day_input("врач завтра в 9:00", d(11, 24), now), Some(DayAdd::Remind("врач".into(), at(d(11, 25), 9, 0))));
+        // «позавтракать» — не «завтра»: переносится на выбранный день
+        assert_eq!(day_input("9:00 позавтракать", d(11, 28), now), Some(DayAdd::Remind("позавтракать".into(), at(d(11, 28), 9, 0))));
+        // «1.5 л» — не время
+        assert_eq!(day_input("купить 1.5 л молока", d(11, 24), now), Some(DayAdd::Todo("купить 1.5 л молока".into(), None)));
+        // время с точкой и двумя цифрами — время, даже со словом «завтра»
+        assert_eq!(day_input("зал 9.30 завтра", d(11, 24), now), Some(DayAdd::Remind("зал".into(), at(d(11, 25), 9, 30))));
+        // сегодня прошедшее время не уезжает на завтра молча — остаётся сегодня (дальше скажут «уже прошло»)
+        assert_eq!(day_input("9:00 врач", d(11, 24), now), Some(DayAdd::Remind("врач".into(), at(d(11, 24), 9, 0))));
+        // одно время без текста — не дело
+        assert_eq!(day_input("18:30", d(11, 24), now), None);
+        assert_eq!(day_input("в 18:30", d(11, 24), now), None);
+        // «перейти через дорогу» — не «через N минут»
+        assert!(matches!(day_input("перейти через дорогу", d(11, 24), now), Some(DayAdd::Todo(..))));
+        // без времени — дело: сегодня без срока, другой день — срок этим днём
+        assert_eq!(day_input("купить хлеб", d(11, 24), now), Some(DayAdd::Todo("купить хлеб".into(), None)));
+        assert_eq!(day_input("купить хлеб", d(11, 28), now), Some(DayAdd::Todo("купить хлеб".into(), Some(d(11, 28)))));
+        // срок из текста главнее выбранного дня
+        assert!(matches!(day_input("отчёт до 5.12", d(11, 28), now), Some(DayAdd::Todo(_, Some(x))) if x == d(12, 5)));
+        // команды из поиска
+        assert_eq!(day_input("заметка идея", d(11, 24), now), Some(DayAdd::Note("идея".into())));
+        assert_eq!(day_input("дело позвонить", d(11, 24), now), Some(DayAdd::Todo("позвонить".into(), None)));
+        assert_eq!(day_input("   ", d(11, 24), now), None);
     }
 }
 
