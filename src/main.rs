@@ -1234,6 +1234,8 @@ struct App {
     /// размер окна, пока идёт анимация: только растёт, уменьшается через WIN_SHRINK_AFTER после её конца
     win_span: Option<Rect>,
     win_busy_at: Instant,
+    /// сколько точек добавить к высоте страницы, чтобы влезло содержимое (см. page_grow_next)
+    page_grow: std::collections::HashMap<u8, f32>,
     /// подсказки для строк буфера (см. cached_hint)
     hint_cache: std::collections::HashMap<String, Option<Hint>>,
     /// окно ставим сами через SetWindowPos — тогда рисуем от запрошенного места, а не от устаревшего inner_rect
@@ -1593,6 +1595,7 @@ impl App {
             win_span: None,
             win_busy_at: Instant::now(),
             hint_cache: Default::default(),
+            page_grow: Default::default(),
             win_by_hwnd: false,
             fs_raw: false,
             fs_since: Instant::now(),
@@ -3561,6 +3564,18 @@ impl App {
             Tab::Todo => self.ui_todo(ui),
             Tab::Shot => self.ui_shot(ui),
             Tab::Settings => self.ui_settings(ui, ctx),
+        }
+        // Высоты страниц заданы числами (panel_height), и всё, что в них не влезало, обрезалось краем
+        // панели — как «Закрыть Островок» в настройках. Меряем, сколько содержимое заняло на самом деле,
+        // и дорастаем панелью ровно до него (и обратно, если содержимое стало меньше).
+        let used = ui.min_rect().bottom() - area.top();
+        let avail = area.height();
+        let key = self.tab as u8;
+        let grow = self.page_grow.get(&key).copied().unwrap_or(0.0);
+        let want = page_grow_next(grow, used, avail);
+        if (want - grow).abs() > 0.5 {
+            self.page_grow.insert(key, want);
+            ui.ctx().request_repaint();
         }
     }
 
@@ -5732,14 +5747,18 @@ impl App {
             ui.vertical(|ui| {
                 ui.add_space(8.0);
                 ui.label(RichText::new(format!("{text} · {}", w.city)).font(semi(15.0)));
-                ui.label(RichText::new(format!("Ощущается {} · влажность {:.0}% · ветер {:.1} м/с", weather::deg(w.feels), w.humidity, w.wind)).color(DIM));
+                // колонка восхода справа узкая (стрелки вместо слов) — раньше длинная строка наезжала на «Закат»
+                let line = format!("Ощущается {} · влажность {:.0}% · ветер {:.1} м/с", weather::deg(w.feels), w.humidity, w.wind).replace('.', ",");
+                let room = ui.available_width() - if w.sunrise.is_empty() { 0.0 } else { 70.0 };
+                let line = elide(ui.painter(), &line, egui::TextStyle::Body.resolve(ui.style()), room);
+                ui.label(RichText::new(line).color(DIM));
             });
             if !w.sunrise.is_empty() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.vertical(|ui| {
                         ui.add_space(10.0);
-                        ui.label(RichText::new(format!("Восход  {}", w.sunrise)).color(DIM).size(12.5));
-                        ui.label(RichText::new(format!("Закат    {}", w.sunset)).color(DIM).size(12.5));
+                        ui.label(RichText::new(format!("↑ {}", w.sunrise)).color(DIM).size(12.5)).on_hover_text("Восход");
+                        ui.label(RichText::new(format!("↓ {}", w.sunset)).color(DIM).size(12.5)).on_hover_text("Закат");
                     });
                 });
             }
@@ -7074,7 +7093,8 @@ impl App {
                     p.rect_filled(r.expand2(vec2(6.0, 0.0)), Rounding::same(9.0), rgba(255, 255, 255, (12.0 * hov) as u8));
                 }
                 p.text(pos2(r.left(), r.top() + 12.0), Align2::LEFT_CENTER, "Вернуть остров в центр", FontId::proportional(13.0), if moved { FG } else { DIM });
-                let hint = if moved { "остров можно тянуть мышью; двойной щелчок по ручке — тоже на место" } else { "остров на месте; его можно перетащить мышью" };
+                let hint = if moved { "или двойной щелчок по ручке острова" } else { "остров на месте; его можно перетащить мышью" };
+                let hint = elide(p, hint, FontId::proportional(11.0), r.width());
                 p.text(pos2(r.left(), r.top() + 29.0), Align2::LEFT_CENTER, hint, FontId::proportional(11.0), DIM);
                 if resp.clicked() {
                     self.spot_reset();
@@ -7132,7 +7152,7 @@ impl App {
                 store::save_notes(&self.notes);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            ui.label(RichText::new(format!("Островок {} · поиск по {} · щелчок по персонажу меняет настроение", env!("CARGO_PKG_VERSION"), self.hotkey_name)).color(DIM).size(11.5));
+            ui.label(RichText::new(format!("Островок {} · поиск: {}", env!("CARGO_PKG_VERSION"), self.hotkey_name)).color(DIM).size(11.5));
         });
     }
 
@@ -8822,11 +8842,17 @@ impl App {
         }
         // тень под островом и цветная вспышка при событиях
         let round = Rounding::same(r);
-        let shadow = egui::epaint::Shadow { offset: vec2(0.0, 6.0), blur: 30.0, spread: 0.0, color: rgba(0, 0, 0, 120) };
-        p.add(shadow.as_shape(rect, round));
+        // Две тени, как у окон системы: узкая у самого края и широкая еле заметная. Раньше была одна
+        // плотная (120) и широкая — на светлом фоне вокруг острова стояла серая муть с видимой границей.
+        // Тень сжата внутрь (spread < 0), чтобы под полупрозрачным корпусом не темнело.
+        let contact = egui::epaint::Shadow { offset: vec2(0.0, 2.0), blur: 8.0, spread: -1.0, color: rgba(0, 0, 0, 60) };
+        let ambient = egui::epaint::Shadow { offset: vec2(0.0, 8.0), blur: 28.0, spread: -6.0, color: rgba(0, 0, 0, 34) };
+        p.add(ambient.as_shape(rect, round));
+        p.add(contact.as_shape(rect, round));
         if let (Some(c), true) = (self.album, self.media_now.as_ref().is_some_and(|m| m.playing)) {
+            // цветное свечение под музыку: лёгкое, без «пятна» вокруг всего острова
             let breathe = 0.5 + 0.5 * (self.drip_phase * 0.7).sin();
-            let aura = egui::epaint::Shadow { offset: vec2(0.0, 2.0), blur: 24.0 + 6.0 * breathe + 12.0 * self.beat, spread: 0.0, color: rgba(c[0], c[1], c[2], (70.0 + 50.0 * breathe + 70.0 * self.beat).min(255.0) as u8) };
+            let aura = egui::epaint::Shadow { offset: vec2(0.0, 2.0), blur: 18.0 + 4.0 * breathe + 8.0 * self.beat, spread: -4.0, color: rgba(c[0], c[1], c[2], (28.0 + 18.0 * breathe + 40.0 * self.beat).min(255.0) as u8) };
             p.add(aura.as_shape(rect, round));
         }
         if let Some((color, at)) = self.glow {
@@ -9013,7 +9039,9 @@ impl App {
     fn panel_height(&self) -> f32 {
         // навигация теперь в одну строку
         let saved = if matches!(self.tab, Tab::Ai | Tab::Settings) { 0.0 } else { 24.0 };
-        -saved + match self.tab {
+        // + page_grow: если содержимое страницы не влезло в заданную высоту, панель дорастает до него
+        let grow = self.page_grow.get(&(self.tab as u8)).copied().unwrap_or(0.0);
+        grow - saved + match self.tab {
             Tab::Home => 396.0,
             Tab::Control => 276.0,
             Tab::Pult => self.pult_height(),
@@ -9038,7 +9066,8 @@ impl App {
             Tab::Calendar => 360.0 + 52.0,
             Tab::Shot => 306.0,
             Tab::Clip => 340.0 + if self.clip_imgs.is_empty() { 0.0 } else { 72.0 },
-            Tab::Inbox => 340.0,
+            // четыре сообщения целиком, дальше прокрутка (раньше четвёртое обрезалось пополам)
+            Tab::Inbox => 368.0,
             // заметка с чек-листом: страница выше, чтобы пункты и редактор не теснили друг друга
             Tab::Notes => {
                 let items = self.notes.get(self.note_sel).map_or(0, |n| store::check_items(n).len());
@@ -9514,6 +9543,44 @@ fn icon_limit(remote: bool) -> Duration {
 }
 
 /// Дополнительная пауза перед повтором записи заметок после `fails` неудач подряд (сверх 1,5 с), не больше 30 с в сумме.
+/// Сколько добавить к заданной высоте страницы: содержимое заняло `used`, а места было `avail`
+/// (вместе с уже добавленным `grow`). Запас снизу — 8 точек. Не больше 360, чтобы ошибка в странице
+/// не растянула панель на весь экран.
+/// Страница, которая занимает всё доступное место (прокрутка), даёт used == avail — её не трогаем,
+/// иначе панель росла бы на каждом кадре.
+fn page_grow_next(grow: f32, used: f32, avail: f32) -> f32 {
+    const PAD: f32 = 8.0;
+    let next = if used > avail + 0.5 {
+        grow + (used - avail) + PAD
+    } else if used + PAD < avail - 0.5 {
+        grow - (avail - used - PAD)
+    } else {
+        grow
+    };
+    next.clamp(0.0, 360.0).round()
+}
+
+#[cfg(test)]
+mod page_grow_tests {
+    #[test]
+    fn grows_to_content_and_back() {
+        use super::page_grow_next as g;
+        // влезло с запасом — ничего не добавляем
+        assert_eq!(g(0.0, 300.0, 400.0), 0.0);
+        // не влезло на 40 — добавляем 40 + запас
+        assert_eq!(g(0.0, 440.0, 400.0), 48.0);
+        // уже добавили 48, содержимое то же — стоим на месте
+        assert_eq!(g(48.0, 440.0, 448.0), 48.0);
+        // прокрутка заняла всё место — не растём
+        assert_eq!(g(0.0, 400.0, 400.0), 0.0);
+        assert_eq!(g(20.0, 420.0, 420.0), 20.0);
+        // содержимое уменьшилось — добавка уходит
+        assert_eq!(g(48.0, 300.0, 448.0), 0.0);
+        // не больше 360
+        assert_eq!(g(0.0, 5000.0, 400.0), 360.0);
+    }
+}
+
 /// Время для анимаций в f32. Секунды с запуска переводить в f32 напрямую нельзя: через сутки-двое
 /// работы точности уже не хватает, и волны, дождь и «дыхание» пилюли начинают дёргаться.
 /// Раз в час фаза перескакивает — это незаметно, в отличие от постоянной дрожи.
@@ -11158,6 +11225,26 @@ fn spectrum_mirror(p: &egui::Painter, area: Rect, bars: &[f32], color: Color32, 
 }
 
 /// Строка настройки с переключателем справа; щёлкать можно по всей строке. Возвращает true, если переключили.
+/// Текст, укороченный многоточием до ширины `max_w` (в точках).
+fn elide(p: &egui::Painter, text: &str, font: FontId, max_w: f32) -> String {
+    let width = |s: &str| p.layout_no_wrap(s.to_string(), font.clone(), FG).size().x;
+    if width(text) <= max_w {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let s: String = chars[..mid].iter().collect::<String>() + "…";
+        if width(&s) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    chars[..lo].iter().collect::<String>().trim_end().to_string() + "…"
+}
+
 fn switch_row(ui: &mut egui::Ui, on: &mut bool, title: &str, hint: &str) -> bool {
     let h = if hint.is_empty() { 30.0 } else { 40.0 };
     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
@@ -11175,6 +11262,8 @@ fn switch_row(ui: &mut egui::Ui, on: &mut bool, title: &str, hint: &str) -> bool
         text.text(pos2(r.left(), r.center().y), Align2::LEFT_CENTER, title, FontId::proportional(13.0), FG);
     } else {
         text.text(pos2(r.left(), r.top() + 12.0), Align2::LEFT_CENTER, title, FontId::proportional(13.0), FG);
+        // длинная подсказка обрезается многоточием, а не краем переключателя
+        let hint = elide(&text, hint, FontId::proportional(11.0), r.width() - 54.0);
         text.text(pos2(r.left(), r.top() + 29.0), Align2::LEFT_CENTER, hint, FontId::proportional(11.0), DIM);
     }
     let track = Rect::from_min_size(pos2(r.right() - 38.0, r.center().y - 10.0), vec2(36.0, 20.0));
