@@ -453,6 +453,8 @@ enum Msg {
     Heard(ears::Heard),
     /// снимок области пришёл из буфера обмена: ширина, высота, точки
     Shot(usize, usize, Vec<u8>),
+    /// снимок сохранён в фоне (PNG 4K кодируется долго — окно не ждёт): точки и путь или ошибка
+    ShotSaved(usize, usize, Vec<u8>, Result<String, String>),
     Download(String),
     Notice(live::Notice),
     Lyrics(String, Vec<(f64, String)>),
@@ -1243,6 +1245,9 @@ struct App {
     page_grow: std::collections::HashMap<u8, f32>,
     /// пружина размера острова пришла к цели (в этом кадре)
     size_settled: bool,
+    /// фоновые опросы корзины и звуковых программ (см. Probe)
+    bin_probe: Probe<(i64, i64)>,
+    mixer_probe: Probe<Vec<sys::AppVol>>,
     /// только что удалённая заметка: текст, место, когда — её можно вернуть NOTE_UNDO
     note_trash: Option<(String, usize, Instant)>,
     /// подсказки для строк буфера (см. cached_hint)
@@ -1606,6 +1611,8 @@ impl App {
             win_busy_at: Instant::now(),
             hint_cache: Default::default(),
             note_trash: None,
+            bin_probe: Probe::new(),
+            mixer_probe: Probe::new(),
             music_seen: None,
             page_grow: Default::default(),
             size_settled: false,
@@ -2667,7 +2674,13 @@ impl App {
                         self.lyrics = lines;
                     }
                 }
-                Msg::Shot(w, h, px) => match sys::save_png(w, h, &px) {
+                Msg::Shot(w, h, px) => self.save_shot_bg(ctx, w, h, px),
+                Msg::ShotSaved(w, h, px, res) => match res {
+                    // файл пишется секунду-другую: если за это время открыли поиск или размечают
+                    // прошлый снимок, не выдёргиваем человека — только сообщаем
+                    Ok(path) if self.mode == Mode::Palette || (self.mode == Mode::Panel && self.tab == Tab::Shot && (self.shot_drag.is_some() || !self.shot_marks.is_empty())) => {
+                        self.notify(&format!("Снимок сохранён: {}", std::path::Path::new(&path).file_name().map_or(String::new(), |n| n.to_string_lossy().to_string())));
+                    }
                     Ok(path) => self.show_shot(ctx, w, h, px, path),
                     Err(e) => self.notify(&format!("Ошибка: {e}")),
                 },
@@ -4866,9 +4879,12 @@ impl App {
         let Some(m) = self.media_now.clone() else {
             if self.sound_on() {
                 // кто звучит — спрашиваем у Windows не чаще раза в полторы секунды
-                if self.sounding.1.elapsed() > Duration::from_millis(1500) {
-                    let names: Vec<String> = sys::app_volumes().into_iter().filter(|a| a.active && !a.muted).map(|a| a.name).take(3).collect();
+                // тот же фоновый опрос, что у страницы «Звук»: окно не ждёт перебора программ
+                self.mixer_probe.kick(Duration::from_millis(1500), ui.ctx(), sys::app_volumes);
+                if let Some(list) = self.mixer_probe.take() {
+                    let names: Vec<String> = list.iter().filter(|a| a.active && !a.muted).map(|a| a.name.clone()).take(3).collect();
                     self.sounding = (names.join(", "), Instant::now());
+                    self.mixer = list;
                 }
                 ui.add_space(26.0);
                 let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 170.0), Sense::hover());
@@ -5542,8 +5558,12 @@ impl App {
             self.ctl_at = Instant::now();
             self.vol = sys::volume();
             self.mic = sys::mic_muted();
-            self.bin = sys::recycle_bin();
             self.light_theme = sys::light_theme();
+        }
+        // корзина — в фоне и раз в 10 с: опрос обходит корзины всех дисков и будит уснувшие
+        self.bin_probe.kick(Duration::from_secs(10), ui.ctx(), sys::recycle_bin);
+        if let Some(b) = self.bin_probe.take() {
+            self.bin = b;
         }
         let armed = self.confirm.filter(|c| c.1 > Instant::now()).map(|c| c.0);
         let mut act = "";
@@ -5719,6 +5739,7 @@ impl App {
                         self.confirm = None;
                         sys::empty_recycle_bin();
                         self.bin = (0, 0);
+                        self.bin_probe.reset();
                         self.notify("Корзина очищена");
                     } else {
                         arm(self, "bin");
@@ -5749,7 +5770,14 @@ impl App {
             self.mixer_at = Instant::now();
             self.vol = sys::volume();
             self.mic = sys::mic_muted();
-            self.mixer = sys::app_volumes();
+        }
+        // программы со звуком — в фоне: для каждой открывается процесс, это заметно на слабых ПК.
+        // Пока тянут ползунок, свежий список не подставляем — он перебил бы перетаскивание
+        if !ui.input(|i| i.pointer.any_down()) {
+            self.mixer_probe.kick(Duration::from_millis(900), ui.ctx(), sys::app_volumes);
+            if let Some(m) = self.mixer_probe.take() {
+                self.mixer = m;
+            }
         }
         let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 190.0), Sense::hover());
         let p = ui.painter().clone();
@@ -5936,6 +5964,7 @@ impl App {
         });
         if let Some((i, v)) = set {
             self.mixer[i].level = v;
+            self.mixer_probe.reset();
             let path = self.mixer[i].path.clone();
             // другой ползунок: неотправленный уровень прежней программы уходит сразу, а не теряется
             if let Some((old, ov)) = self.mix_push.1.take() {
@@ -5950,6 +5979,7 @@ impl App {
             let on = !self.mixer[i].muted;
             sys::set_app_mute(&self.mixer[i].path, on);
             self.mixer[i].muted = on;
+            self.mixer_probe.reset();
         }
     }
 
@@ -6780,6 +6810,16 @@ impl App {
             self.set_clipboard(&text);
             self.notify("Текст сообщения скопирован");
         }
+    }
+
+    /// Пишет снимок в PNG в фоновом потоке; карточка покажется, когда файл готов (Msg::ShotSaved).
+    fn save_shot_bg(&mut self, ctx: &egui::Context, w: usize, h: usize, px: Vec<u8>) {
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let res = sys::save_png(w, h, &px);
+            let _ = tx.send(Msg::ShotSaved(w, h, px, res));
+            ctx.request_repaint();
+        });
     }
 
     /// Показывает карточку снимка: миниатюра и что с ним можно сделать.
@@ -8484,16 +8524,13 @@ impl eframe::App for App {
                 self.shot = Some(n - 1);
             } else {
                 self.shot = None;
-                let res = sys::capture_screen().and_then(|(w, h, px)| {
-                    let path = sys::save_png(w, h, &px)?;
-                    Ok((w, h, px, path))
-                });
-                match res {
-                    Ok((w, h, px, path)) => {
+                // снимаем сразу (пока остров спрятан), а файл пишется в фоне
+                match sys::capture_screen() {
+                    Ok((w, h, px)) => {
                         if let Some(cb) = &mut self.clipboard {
-                            let _ = cb.set_image(arboard::ImageData { width: w, height: h, bytes: px.clone().into() });
+                            let _ = cb.set_image(arboard::ImageData { width: w, height: h, bytes: std::borrow::Cow::Borrowed(&px) });
                         }
-                        self.show_shot(ctx, w, h, px, path);
+                        self.save_shot_bg(ctx, w, h, px);
                     }
                     Err(e) => self.notify(&format!("Ошибка: {e}")),
                 }
@@ -10056,6 +10093,63 @@ mod agenda_tests {
         // не больше max
         assert_eq!(agenda_rows(&reminders, &todos, now, 2).len(), 2);
         assert!(agenda_rows(&[], &[], now, 3).is_empty());
+    }
+}
+
+/// Опрос Windows в фоновом потоке: окно не ждёт медленных вызовов (корзина будит уснувшие диски,
+/// микшер открывает каждую звуковую программу), а забирает готовый ответ на следующих кадрах.
+struct Probe<T> {
+    rx: Option<std::sync::mpsc::Receiver<T>>,
+    at: Option<Instant>,
+}
+
+impl<T: Send + 'static> Probe<T> {
+    fn new() -> Self {
+        Probe { rx: None, at: None }
+    }
+
+    /// Запускает опрос, если с прошлого прошло `every` и прошлый уже ответил.
+    fn kick(&mut self, every: Duration, ctx: &egui::Context, f: impl FnOnce() -> T + Send + 'static) {
+        if self.rx.is_some() || self.at.is_some_and(|t| t.elapsed() < every) {
+            return;
+        }
+        self.at = Some(Instant::now());
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            // звук и оболочка Windows работают через COM — в новом потоке его нужно включить (и выключить)
+            let com = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) }.is_ok();
+            let v = f();
+            if com {
+                unsafe { windows::Win32::System::Com::CoUninitialize() };
+            }
+            let _ = tx.send(v);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Готовый ответ, если пришёл.
+    fn take(&mut self) -> Option<T> {
+        match self.rx.as_ref()?.try_recv() {
+            Ok(v) => {
+                self.rx = None;
+                Some(v)
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.rx = None;
+                None
+            }
+        }
+    }
+
+    /// После действия пользователя: ответ, который уже в пути, устарел — выбрасываем его, а следующий
+    /// опрос откладываем на обычный срок. Не «сразу»: колесо над ползунком дёргает это каждый кадр,
+    /// и каждый шаг запускал бы новый поток с полным перебором программ.
+    fn reset(&mut self) {
+        self.rx = None;
+        self.at = Some(Instant::now());
     }
 }
 

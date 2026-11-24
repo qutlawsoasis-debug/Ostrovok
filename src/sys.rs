@@ -245,9 +245,47 @@ pub fn save_png(w: usize, h: usize, rgba: &[u8]) -> Result<String, String> {
     // настоящая папка «Изображения» (её часто переносят в OneDrive или на другой диск)
     let dir = pictures_dir().join("Островок");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(format!("Снимок {}.png", chrono::Local::now().format("%Y-%m-%d %H-%M-%S")));
-    image::save_buffer(&path, rgba, w as u32, h as u32, image::ExtendedColorType::Rgba8).map_err(|e| e.to_string())?;
+    // имя занимаем атомарно (create_new): два снимка в одну секунду пишутся теперь в фоне параллельно
+    // и иначе писали бы в один и тот же файл — получился бы испорченный PNG
+    let stem = format!("Снимок {}", chrono::Local::now().format("%Y-%m-%d %H-%M-%S"));
+    let (path, file) = (1..100)
+        .find_map(|n| {
+            let name = if n == 1 { format!("{stem}.png") } else { format!("{stem} ({n}).png") };
+            let p = dir.join(name);
+            std::fs::OpenOptions::new().write(true).create_new(true).open(&p).ok().map(|f| (p, f))
+        })
+        .ok_or_else(|| "не удалось создать файл снимка".to_string())?;
+    let mut out = std::io::BufWriter::new(file);
+    let res = image::write_buffer_with_format(&mut out, rgba, w as u32, h as u32, image::ExtendedColorType::Rgba8, image::ImageFormat::Png).map_err(|e| e.to_string());
+    if let Err(e) = res {
+        drop(out);
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
     Ok(path.display().to_string())
+}
+
+/// Во сколько раз масштабировать картинку для распознавания: мелкую — до ×2, но длинная сторона
+/// не больше предела движка `max`; слишком большую — уменьшить до предела.
+pub fn ocr_scale(w: usize, h: usize, max: u32) -> f32 {
+    let long = w.max(h).max(1) as f32;
+    let fit = max.max(1) as f32 / long;
+    if long < 1600.0 { fit.min(2.0) } else { fit.min(1.0) }
+}
+
+#[cfg(test)]
+mod ocr_scale_tests {
+    #[test]
+    fn stays_inside_engine_limit() {
+        use super::ocr_scale as k;
+        assert_eq!(k(800, 600, 2600), 2.0);
+        // 1500×900: ×2 дало бы 3000 — ограничиваем пределом
+        assert!((k(1500, 900, 2600) * 1500.0 - 2600.0).abs() < 1.0);
+        // 4K — уменьшаем
+        assert!((k(3840, 2160, 2600) * 3840.0 - 2600.0).abs() < 1.0);
+        // 1920 при пределе 2600 — как есть
+        assert_eq!(k(1920, 1080, 2600), 1.0);
+    }
 }
 
 /// Распознавание текста встроенным в Windows движком — всё локально, без интернета.
@@ -260,9 +298,12 @@ pub fn ocr(w: usize, h: usize, rgba: &[u8]) -> Result<String, String> {
     let Some(mut img) = image::RgbaImage::from_raw(w as u32, h as u32, rgba.to_vec()) else {
         return Err("повреждённый снимок".into());
     };
-    // мелкий текст распознаётся заметно лучше после увеличения
-    if w < 1600 && h < 1600 {
-        img = image::imageops::resize(&img, (w * 2) as u32, (h * 2) as u32, image::imageops::FilterType::CatmullRom);
+    // мелкий текст распознаётся заметно лучше после увеличения — но не больше предела движка:
+    // 1500×900 ×2 = 3000 и снимок 4K (3840) движок Windows отвергает целиком
+    let k = ocr_scale(w, h, OcrEngine::MaxImageDimension().unwrap_or(2600));
+    if (k - 1.0).abs() > 0.01 {
+        let (nw, nh) = (((w as f32 * k) as u32).max(1), ((h as f32 * k) as u32).max(1));
+        img = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::CatmullRom);
     }
     let (iw, ih) = (img.width() as i32, img.height() as i32);
     let mut bgra = img.into_raw();
@@ -770,6 +811,24 @@ pub fn pixel_at_cursor() -> Option<String> {
     }
 }
 
+/// Готов ли новый файл в «Загрузках»: не пустой и рядом нет его же «.part» (так делает Firefox).
+pub fn download_ready(name: &str, all: &std::collections::HashSet<String>, size: Option<u64>) -> bool {
+    size.is_some_and(|s| s > 0) && !all.contains(&format!("{name}.part"))
+}
+
+#[cfg(test)]
+mod download_ready_tests {
+    #[test]
+    fn firefox_placeholder_is_not_ready() {
+        let all: std::collections::HashSet<String> = ["film.mkv".to_string(), "film.mkv.part".to_string(), "doc.pdf".to_string()].into();
+        assert!(!super::download_ready("film.mkv", &all, Some(0)));
+        assert!(!super::download_ready("film.mkv", &all, Some(1000)));
+        assert!(super::download_ready("doc.pdf", &all, Some(5000)));
+        assert!(!super::download_ready("doc.pdf", &all, Some(0)));
+        assert!(!super::download_ready("gone.zip", &all, None));
+    }
+}
+
 /// Следит за папкой «Загрузки»: сообщает имя каждого нового готового файла, а пока что-то качается —
 /// пишет в progress, сколько байт уже скачано и с какой скоростью.
 pub fn spawn_downloads(report: impl Fn(String) + Send + 'static, progress: Arc<std::sync::Mutex<Option<(u64, f32)>>>) {
@@ -820,12 +879,20 @@ pub fn spawn_downloads(report: impl Fn(String) + Send + 'static, progress: Arc<s
                 continue;
             }
             let now = list();
+            let mut next_seen = now.clone();
             for name in now.difference(&seen) {
-                if !unfinished(name) {
-                    report(name.clone());
+                if unfinished(name) {
+                    continue;
                 }
+                // Firefox сразу кладёт пустой файл с итоговым именем рядом с «.part» — это ещё не готово:
+                // не отмечаем его увиденным и проверим на следующем круге
+                if !download_ready(name, &now, std::fs::metadata(dir.join(name)).map(|m| m.len()).ok()) {
+                    next_seen.remove(name);
+                    continue;
+                }
+                report(name.clone());
             }
-            seen = now;
+            seen = next_seen;
         }
     });
 }
