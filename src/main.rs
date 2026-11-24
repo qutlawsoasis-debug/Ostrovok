@@ -1236,6 +1236,8 @@ struct App {
     win_busy_at: Instant,
     /// сколько точек добавить к высоте страницы, чтобы влезло содержимое (см. page_grow_next)
     page_grow: std::collections::HashMap<u8, f32>,
+    /// пружина размера острова пришла к цели (в этом кадре)
+    size_settled: bool,
     /// подсказки для строк буфера (см. cached_hint)
     hint_cache: std::collections::HashMap<String, Option<Hint>>,
     /// окно ставим сами через SetWindowPos — тогда рисуем от запрошенного места, а не от устаревшего inner_rect
@@ -1596,6 +1598,7 @@ impl App {
             win_busy_at: Instant::now(),
             hint_cache: Default::default(),
             page_grow: Default::default(),
+            size_settled: false,
             win_by_hwnd: false,
             fs_raw: false,
             fs_since: Instant::now(),
@@ -3568,14 +3571,18 @@ impl App {
         // Высоты страниц заданы числами (panel_height), и всё, что в них не влезало, обрезалось краем
         // панели — как «Закрыть Островок» в настройках. Меряем, сколько содержимое заняло на самом деле,
         // и дорастаем панелью ровно до него (и обратно, если содержимое стало меньше).
-        let used = ui.min_rect().bottom() - area.top();
-        let avail = area.height();
-        let key = self.tab as u8;
-        let grow = self.page_grow.get(&key).copied().unwrap_or(0.0);
-        let want = page_grow_next(grow, used, avail);
-        if (want - grow).abs() > 0.5 {
-            self.page_grow.insert(key, want);
-            ui.ctx().request_repaint();
+        // Мерим только когда панель стоит на месте: во время пружины места то меньше, то больше
+        // (пружина перелетает цель), и подгонка раскачивала панель без конца — она дёргалась.
+        if self.size_settled && tab_t >= 1.0 {
+            let used = ui.min_rect().bottom() - area.top();
+            let avail = area.height();
+            let key = self.tab as u8;
+            let grow = self.page_grow.get(&key).copied().unwrap_or(0.0);
+            let want = page_grow_next(grow, used, avail);
+            if (want - grow).abs() > 0.5 {
+                self.page_grow.insert(key, want);
+                ui.ctx().request_repaint();
+            }
         }
     }
 
@@ -7058,6 +7065,17 @@ impl App {
                 }
             }
 
+            // «Закрыть» и версия — внизу левой колонки: отдельной строкой под обеими колонками они
+            // добавляли высоту, а слева под карточкой оставалась пустота
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if jelly(ui, "Закрыть Островок").clicked() {
+                    store::save_notes(&self.notes);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                ui.label(RichText::new(format!("v{} · поиск: {}", env!("CARGO_PKG_VERSION"), self.hotkey_name)).color(DIM).size(11.5));
+            });
+
             // ── справа: поведение
             let ui = &mut c[1];
             head(ui, "ПОВЕДЕНИЕ");
@@ -7146,14 +7164,6 @@ impl App {
             let c = ui.ctx().clone();
             update::spawn(self.upd.clone(), move || c.request_repaint());
         }
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if jelly(ui, "Закрыть Островок").clicked() {
-                store::save_notes(&self.notes);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            ui.label(RichText::new(format!("Островок {} · поиск: {}", env!("CARGO_PKG_VERSION"), self.hotkey_name)).color(DIM).size(11.5));
-        });
     }
 
     /// Прозрачность стекла в процентах (в настройках 0 значит «не трогали»).
@@ -8200,6 +8210,7 @@ impl eframe::App for App {
         self.size = size.max(vec2(40.0, 20.0));
         self.vel = vel;
         let animating = !settled;
+        self.size_settled = settled;
 
         let rect_v = Rect::from_min_size(pos2(WIN_W / 2.0 - self.size.x / 2.0, TOP + self.drop_y), self.size);
         let layout_v = Rect::from_min_size(pos2(WIN_W / 2.0 - target.x / 2.0, TOP + self.drop_y), target);
@@ -8368,7 +8379,7 @@ impl eframe::App for App {
         // а при музыке — постоянно: прозрачное OpenGL-окно на смене размера показывает растянутый
         // или пустой кадр, и остров мигал.
         let bubbles_moving = !self.bub_timer.settled() || !self.bub_call.settled() || !self.bub_clip.settled() || !self.bub_dl.settled();
-        let shape_busy = shape_anim || self.drag.is_some() || bubbles_moving;
+        let shape_busy = shape_anim || self.drag.is_some_and(|d| d.2) || bubbles_moving;
         let mut span = if shape_busy { rect_v.union(layout_v) } else { layout_v };
         for b in &bubbles_v {
             span = span.union(b.0);
@@ -8389,8 +8400,18 @@ impl eframe::App for App {
         if now.duration_since(self.win_busy_at) < WIN_SHRINK_AFTER {
             ctx.request_repaint_after(WIN_SHRINK_AFTER);
         }
+        // Левый, правый и верхний края окна стоят на месте: окно во всю ширину поля острова (780),
+        // сверху — постоянный запас; меняется только низ. Раньше окно было по ширине острова и при
+        // нажатии/раскрытии/ужатии сдвигало левый край под неподвижным курсором — egui видел это как
+        // движение мыши больше 6 точек, щелчок не засчитывался (пилюля только сжималась), а подсветка
+        // и рисунок на кадр расходились с курсором (дрожание). Прозрачные края пропускают мышь.
         let grown = span.expand(46.0);
-        let win_v = Rect::from_min_max(grown.min.floor(), grown.max.ceil());
+        // панель (700) с запасом 46 шире поля (780) на 6 точек с каждой стороны — берём 16 про запас
+        const SIDE: f32 = 16.0;
+        let win_v = Rect::from_min_max(
+            pos2(grown.min.x.min(-SIDE), grown.min.y.min(TOP - 46.0)).floor(),
+            pos2(grown.max.x.max(WIN_W + SIDE), grown.max.y).ceil(),
+        );
         // позиция и размер — одним SetWindowPos в целых пикселях экрана и только когда изменились:
         // раньше размер и место уходили двумя командами с дробными точками, и окно прыгало между ними
         let mut want = place::phys_rect([base.x * ppp, base.y * ppp], win_v, ppp);
@@ -8634,7 +8655,9 @@ impl eframe::App for App {
                     // «под курсором» считается по самой пилюле, а не по виджету: кнопки плеера лежат поверх
                     // и иначе перехватывали бы наведение — пилюля мигала бы между названием и кнопками
                     let reach = if self.hover_was { 7.0 } else { 0.0 };
-                    let hot = ui.ctx().pointer_hover_pos().is_some_and(|c| rect.expand(reach).contains(c));
+                    // по настоящему курсору (в тех же координатах, что и рисунок), а не по событиям окна:
+                    // пока окно пропускает мышь, событий нет, и egui помнит устаревшее положение
+                    let hot = cursor_win.is_some_and(|c| rect.expand(reach).contains(c));
                     self.jelly.target = if island.is_pointer_button_down_on() || face.is_pointer_button_down_on() { 0.94 } else if hot { 1.045 } else { 1.0 };
                     if hot && !self.hover_was {
                         self.sheen_at = now;

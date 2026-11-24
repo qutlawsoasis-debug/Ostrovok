@@ -1993,6 +1993,15 @@ pub fn set_click_through(hwnd: isize, pass: bool) {
         } else if ex != old {
             SetWindowLongW(h, GWL_EXSTYLE, ex as i32);
         }
+        // Окно перестало пропускать мышь, а курсор уже над ним и стоит: Windows не пришлёт движения,
+        // egui не знает, где указатель, и первое нажатие выбрасывает. Подсказываем положение сами.
+        if !pass && ex != old {
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_ok() && windows::Win32::Graphics::Gdi::ScreenToClient(h, &mut pt).as_bool() {
+                let lp = ((pt.y as u32 & 0xFFFF) << 16) | (pt.x as u32 & 0xFFFF);
+                let _ = PostMessageW(h, WM_MOUSEMOVE, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(lp as isize));
+            }
+        }
     }
 }
 
