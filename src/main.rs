@@ -148,6 +148,8 @@ struct ShotCard {
     rgba: Arc<Vec<u8>>,
     /// когда карточка сама свернётся, если её не тронули
     until: Instant,
+    /// прежние файлы этого же снимка (исходник до разметки) — «Удалить» стирает и их
+    earlier: Vec<String>,
 }
 
 /// Картинка из истории буфера: полный размер — чтобы вернуть в буфер, миниатюра — для показа.
@@ -1241,6 +1243,8 @@ struct App {
     page_grow: std::collections::HashMap<u8, f32>,
     /// пружина размера острова пришла к цели (в этом кадре)
     size_settled: bool,
+    /// только что удалённая заметка: текст, место, когда — её можно вернуть NOTE_UNDO
+    note_trash: Option<(String, usize, Instant)>,
     /// подсказки для строк буфера (см. cached_hint)
     /// когда на главной последний раз была музыка или звук (удержание карточки плеера)
     music_seen: Option<Instant>,
@@ -1601,6 +1605,7 @@ impl App {
             win_span: None,
             win_busy_at: Instant::now(),
             hint_cache: Default::default(),
+            note_trash: None,
             music_seen: None,
             page_grow: Default::default(),
             size_settled: false,
@@ -3122,9 +3127,12 @@ impl App {
         v.push(Seg::Text(chrono::Local::now().format("%H:%M").to_string(), FG));
         // напоминание скоро — обратный отсчёт с колокольчиком
         let stamp = chrono::Local::now().timestamp();
-        if let Some(r) = self.cfg.reminders.iter().filter(|r| r.at > stamp && r.at - stamp <= 600).min_by_key(|r| r.at) {
+        // за 15 минут и с началом текста: «12 мин · созвон» понятнее, чем просто «12 мин»
+        if let Some(r) = self.cfg.reminders.iter().filter(|r| r.at > stamp && r.at - stamp <= 900).min_by_key(|r| r.at) {
             let mins = ((r.at - stamp) as f64 / 60.0).ceil() as i64;
-            v.push(Seg::Text(format!("\u{E823} {mins} мин"), Color32::from_rgb(0xFF, 0x8A, 0x7A)));
+            let label = short_label(&r.text, 14);
+            let text = if label.is_empty() { format!("\u{E823} {mins} мин") } else { format!("\u{E823} {mins} мин · {label}") };
+            v.push(Seg::Text(text, Color32::from_rgb(0xFF, 0x8A, 0x7A)));
         }
         if self.inbox_unread > 0 {
             let c = self.inbox.first().map_or([0x3A, 0x9B, 0xFF], |i| i.color);
@@ -3143,8 +3151,18 @@ impl App {
         if playing || self.sound_on() {
             v.push(Seg::Eq);
         } else if let Some(w) = &self.weather {
-            let (icon, _) = weather::describe(w.code);
-            v.push(Seg::Text(format!("{icon} {}", weather::deg(w.temp)), DIM));
+            // вот-вот дождь или снег — это важнее температуры
+            let city_hour = {
+                use chrono::Timelike;
+                (chrono::Utc::now().naive_utc() + chrono::Duration::seconds(w.utc_offset as i64)).hour()
+            };
+            match rain_soon(&w.hours, city_hour) {
+                Some((pct, snow)) => v.push(Seg::Text(format!("{} {pct}%", if snow { "❄" } else { "☂" }), Color32::from_rgb(0x8F, 0xCB, 0xFF))),
+                None => {
+                    let (icon, _) = weather::describe(w.code);
+                    v.push(Seg::Text(format!("{icon} {}", weather::deg(w.temp)), DIM));
+                }
+            }
         }
         v
     }
@@ -3555,6 +3573,11 @@ impl App {
             // направление сдвига — по порядку страниц в разделах, а не по номеру в enum
             self.tab_dir = if nav_order(self.tab) > nav_order(self.tab_seen) { 1.0 } else { -1.0 };
             self.tab_seen = self.tab;
+            // при открытии полки перепроверяем только «не найденные» (флешку могли вставить):
+            // полная проверка всех путей в потоке окна подвешивала бы его на отключённых сетевых дисках
+            if self.tab == Tab::Shelf {
+                self.shelf_meta.retain(|_, v| v.is_some());
+            }
             self.tab_at = Instant::now();
         }
         let tab_t = ease(self.tab_at.elapsed().as_secs_f32() / 0.16);
@@ -4132,7 +4155,13 @@ impl App {
             self.sticky = true;
         }
         if let Some(path) = open {
-            sys::open(&path);
+            // файл удалили, пока он лежал на полке: говорим об этом и помечаем значок «не найден»
+            if !path.starts_with("\\\\") && !std::path::Path::new(&path).exists() {
+                self.shelf_meta.insert(path, None);
+                self.notify("Файл не найден — его удалили или переместили");
+            } else {
+                sys::open(&path);
+            }
         }
         if let Some(i) = remove {
             let path = self.cfg.shelf.remove(i);
@@ -6765,7 +6794,7 @@ impl App {
         let Some(img) = image::RgbaImage::from_raw(w as u32, h as u32, px.clone()) else { return };
         let small = image::imageops::thumbnail(&img, tw, th);
         let tex = ctx.load_texture("shot-card", egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], small.as_raw()), Default::default());
-        self.shot_card = Some(ShotCard { path, tex, size: (w, h), rgba: Arc::new(px), until: Instant::now() + Duration::from_secs(8) });
+        self.shot_card = Some(ShotCard { path, tex, size: (w, h), rgba: Arc::new(px), until: Instant::now() + Duration::from_secs(8), earlier: Vec::new() });
         self.shot_marks.clear();
         self.shot_drag = None;
         self.mode = Mode::Panel;
@@ -6880,8 +6909,16 @@ impl App {
                 let data = arboard::ImageData { width: size.0, height: size.1, bytes: std::borrow::Cow::Borrowed(&px) };
                 let copied = self.clipboard.as_mut().is_some_and(|cb| cb.set_image(data).is_ok());
                 // карточка дальше работает с новым файлом; не сохранился — остаётся прежний путь
-                let shown = if saved { out.to_string_lossy().to_string() } else { path };
+                let shown = if saved { out.to_string_lossy().to_string() } else { path.clone() };
+                // исходник помним: «Удалить» на новой карточке должен стереть оба файла
+                let mut earlier = self.shot_card.as_ref().map(|c| c.earlier.clone()).unwrap_or_default();
+                if saved {
+                    earlier.push(path);
+                }
                 self.show_shot(ui.ctx(), size.0, size.1, px, shown);
+                if let Some(c) = self.shot_card.as_mut() {
+                    c.earlier = earlier;
+                }
                 self.notify(match (saved, copied) {
                     (true, true) => "Разметка сохранена и в буфере",
                     (true, false) => "Разметка сохранена, в буфер не вышло",
@@ -6917,17 +6954,37 @@ impl App {
                 self.mode = Mode::Pill;
             }
             Some("shelf") => {
-                if !self.cfg.shelf.contains(&path) {
-                    self.cfg.shelf.insert(0, path);
-                    self.cfg.save();
+                // через shelf_add: без дублей и не больше 30, как при перетаскивании
+                for old in shelf_add(&mut self.cfg.shelf, path) {
+                    self.shelf_meta.remove(&old);
+                    self.shelf_thumbs.remove(&old);
                 }
+                self.cfg.save();
                 self.notify("Снимок на полке");
             }
             Some("delete") => {
-                let _ = std::fs::remove_file(&path);
+                // и размеченный файл, и исходник до разметки; с полки — тоже
+                let mut files = self.shot_card.as_ref().map(|c| c.earlier.clone()).unwrap_or_default();
+                files.push(path);
+                // с полки уходят только действительно удалённые файлы: занятый остаётся и на диске, и на полке
+                let gone: Vec<String> = files.iter().filter(|f| test_mode() || std::fs::remove_file(f).is_ok()).cloned().collect();
+                self.cfg.shelf.retain(|p| !gone.contains(p));
+                for f in &gone {
+                    self.shelf_meta.remove(f);
+                    self.shelf_thumbs.remove(f);
+                }
+                self.cfg.save();
                 self.shot_card = None;
                 self.mode = Mode::Pill;
-                self.notify("Снимок удалён");
+                self.notify(if gone.is_empty() {
+                    "Снимок не удалось удалить — файл занят"
+                } else if gone.len() < files.len() {
+                    "Удалено не всё: часть файлов занята"
+                } else if files.len() > 1 {
+                    "Снимок и размеченные копии удалены"
+                } else {
+                    "Снимок удалён"
+                });
             }
             _ => {}
         }
@@ -6955,7 +7012,7 @@ impl App {
         }
         self.note_sel = self.note_sel.min(self.notes.len() - 1);
         let q = self.note_query.trim().to_lowercase();
-        let (mut pick, mut add, mut del) = (None, false, false);
+        let (mut pick, mut add, mut del, mut undo) = (None, false, false, false);
         let full = ui.available_rect_before_wrap();
         let left = Rect::from_min_size(full.min, vec2(204.0, full.height()));
         let right = Rect::from_min_max(pos2(left.right() + 12.0, full.top()), full.max);
@@ -7069,7 +7126,18 @@ impl App {
             let n = self.notes[sel].chars().count();
             ui.label(RichText::new(format!("{} из {} · {n} симв.", sel + 1, self.notes.len())).color(DIM).size(11.5));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // удалённую заметку 8 с можно вернуть той же кнопкой — один щелчок больше не теряет текст
                 del = ui.add_enabled(self.notes.len() > 1 || n > 0, egui::Button::new("Удалить")).clicked();
+                match self.note_trash.as_ref().map(|t| t.2.elapsed()) {
+                    Some(age) if age < NOTE_UNDO => {
+                        if jelly(ui, "Вернуть").on_hover_text("Вернуть только что удалённую заметку").clicked() {
+                            undo = true;
+                        }
+                        ui.ctx().request_repaint_after(NOTE_UNDO.saturating_sub(age));
+                    }
+                    Some(_) => self.note_trash = None,
+                    None => {}
+                }
                 if jelly(ui, "+ пункт").on_hover_text("Добавить пункт чек-листа «- [ ] »").clicked() {
                     self.notes[sel] = store::append_check(&self.notes[sel]);
                     self.mark_notes_dirty();
@@ -7101,13 +7169,34 @@ impl App {
             self.note_query.clear();
         }
         if del {
-            self.notes.remove(sel);
+            let text = self.notes.remove(sel);
+            let kept = !text.trim().is_empty();
+            if kept {
+                self.note_trash = Some((text, sel, Instant::now()));
+            }
             if self.notes.is_empty() {
                 self.notes.push(String::new());
             }
             self.note_sel = sel.min(self.notes.len() - 1);
             self.mark_notes_dirty();
-            self.notify("Заметка удалена");
+            self.notify(if kept { "Заметка удалена · «Вернуть» — 8 секунд" } else { "Пустая заметка удалена" });
+        }
+        if undo {
+            if let Some((text, at, _)) = self.note_trash.take() {
+                // единственная пустая заметка, оставшаяся после удаления, уступает место вернувшейся
+                if self.notes.len() == 1 && self.notes[0].trim().is_empty() {
+                    self.notes[0] = text;
+                    self.note_sel = 0;
+                } else {
+                    let at = at.min(self.notes.len());
+                    self.notes.insert(at, text);
+                    self.note_sel = at;
+                }
+                // фильтр поиска сбрасываем, иначе вернувшаяся заметка выбрана, но не видна в списке
+                self.note_query.clear();
+                self.mark_notes_dirty();
+                self.notify("Заметка возвращена");
+            }
         }
     }
 
@@ -9969,6 +10058,36 @@ mod agenda_tests {
         assert!(agenda_rows(&[], &[], now, 3).is_empty());
     }
 }
+
+/// Начало текста для пилюли: не больше `n` букв, обрезка по слову, если можно, и многоточие.
+fn short_label(text: &str, n: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= n {
+        return flat;
+    }
+    let chars: Vec<char> = flat.chars().take(n).collect();
+    // последний пробел — в буквах, а не в байтах (кириллица — по два байта)
+    let end = match chars.iter().rposition(|c| *c == ' ') {
+        Some(i) if i >= n / 2 => i,
+        _ => chars.len(),
+    };
+    format!("{}…", chars[..end].iter().collect::<String>().trim_end())
+}
+
+#[cfg(test)]
+mod short_label_tests {
+    #[test]
+    fn cuts_by_word() {
+        use super::short_label as s;
+        assert_eq!(s("созвон", 14), "созвон");
+        assert_eq!(s("созвон с командой разработки", 14), "созвон с…");
+        assert_eq!(s("Длинноесловобезпробелов", 6), "Длинно…");
+        assert_eq!(s("  много   пробелов  ", 20), "много пробелов");
+    }
+}
+
+/// Сколько удалённую заметку можно вернуть.
+const NOTE_UNDO: Duration = Duration::from_secs(8);
 
 const TODOS_FULL: &str = "В списке 60 несделанных дел — закройте или удалите какое-нибудь";
 
