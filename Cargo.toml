@@ -1,6 +1,6 @@
 [package]
 name = "ostrovok"
-version = "0.1.77"
+version = "0.1.78"
 edition = "2021"
 description = "Островок — живая панель в верхней части экрана Windows"
 

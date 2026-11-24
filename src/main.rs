@@ -423,6 +423,9 @@ enum Tab {
     /// «Игра»: пинг, джиттер, что мешает играть, сводка игры
     Game,
     Settings,
+    /// «Инструменты»: сетка плиток с живыми подписями вместо россыпи вкладок
+    /// (новые варианты — только в конец: `as u8` служит ключом page_grow)
+    Tools,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -525,7 +528,7 @@ fn parse_quick(q: &str, now: chrono::NaiveDateTime) -> Option<Quick> {
     };
     // «завтра» и «послезавтра» сдвигают день; само слово в текст напоминания не попадает
     let shift = words.iter().position(|w| matches!(w.to_lowercase().as_str(), "завтра" | "послезавтра")).map(|i| (i, if words[i].to_lowercase() == "завтра" { 1 } else { 2 }));
-    let text_of = |skip: std::ops::Range<usize>| words.iter().enumerate().filter(|(i, _)| !skip.contains(i) && shift.map_or(true, |s| s.0 != *i)).map(|(_, w)| *w).collect::<Vec<_>>().join(" ");
+    let text_of = |skip: std::ops::Range<usize>| words.iter().enumerate().filter(|(i, _)| !skip.contains(i) && shift.is_none_or(|s| s.0 != *i)).map(|(_, w)| *w).collect::<Vec<_>>().join(" ");
     for i in 0..words.len() {
         let w = words[i].to_lowercase();
         // «в 18:30» или «18:30»
@@ -536,7 +539,7 @@ fn parse_quick(q: &str, now: chrono::NaiveDateTime) -> Option<Quick> {
                 Some((_, days)) => now.date().and_time(t) + chrono::Duration::days(days),
                 None => at_clock(t),
             };
-            return (!text.is_empty()).then(|| Quick::Remind(text, at));
+            return (!text.is_empty()).then_some(Quick::Remind(text, at));
         }
         // «через 15 мин», «через час», «через 2 часа»
         if w == "через" && i + 1 < words.len() {
@@ -1239,6 +1242,8 @@ struct App {
     /// пружина размера острова пришла к цели (в этом кадре)
     size_settled: bool,
     /// подсказки для строк буфера (см. cached_hint)
+    /// когда на главной последний раз была музыка или звук (удержание карточки плеера)
+    music_seen: Option<Instant>,
     hint_cache: std::collections::HashMap<String, Option<Hint>>,
     /// окно ставим сами через SetWindowPos — тогда рисуем от запрошенного места, а не от устаревшего inner_rect
     win_by_hwnd: bool,
@@ -1597,6 +1602,7 @@ impl App {
             win_span: None,
             win_busy_at: Instant::now(),
             hint_cache: Default::default(),
+            music_seen: None,
             page_grow: Default::default(),
             size_settled: false,
             win_by_hwnd: false,
@@ -1956,6 +1962,7 @@ impl App {
                 }
                 "sound" => Tab::Sound,
                 "settings" => Tab::Settings,
+                "tools" => Tab::Tools,
                 _ => Tab::Home,
             };
             app.tab_seen = app.tab;
@@ -3464,21 +3471,17 @@ impl App {
     }
 
     fn ui_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // одна строка: слева значки разделов, рядом текстом — страницы выбранного раздела
-        const GROUPS: [(&str, &str, &[(Tab, &str)]); 6] = [
-            ("\u{E80F}", "Обзор", &[(Tab::Home, "Сводка"), (Tab::Music, "Музыка"), (Tab::Weather, "Погода"), (Tab::Calendar, "Календарь")]),
-            ("\u{E7F4}", "Система", &[(Tab::Pult, "Пульт"), (Tab::Control, "Управление"), (Tab::Sound, "Звук"), (Tab::System, "Монитор"), (Tab::Game, "Игра")]),
-            ("\u{E90F}", "Инструменты", &[(Tab::Timer, "Таймер"), (Tab::Remind, "Напоминания"), (Tab::Qr, "QR-код")]),
-            ("\u{E70B}", "Записи", &[(Tab::Clip, "Буфер"), (Tab::Inbox, "Уведомления"), (Tab::Todo, "Дела"), (Tab::Notes, "Заметки"), (Tab::Shelf, "Полка")]),
-            ("\u{E8BD}", "ИИ", &[(Tab::Ai, "ИИ"), (Tab::Jarvis, "Джарвис")]),
-            ("\u{E713}", "Настройки", &[(Tab::Settings, "Настройки")]),
-        ];
-        let current = GROUPS.iter().position(|g| g.2.iter().any(|t| t.0 == self.tab)).unwrap_or(0);
+        // Пять разделов вместо шести групп и двадцати вкладок. У «Сейчас» и «Инструментов» внутренние
+        // страницы открываются из карточек и плиток, а в шапке тогда видно «‹ раздел · страница».
+        // У «Дня» и «Системы» страницы — рядом текстом, как раньше. Первая страница группы — её корень.
+        let current = nav_group(self.tab);
+        let current_root = NAV[current].2[0].0;
+        let tabs_row = NAV[current].3;
         let mut go: Option<Tab> = None;
         let row = ui.available_rect_before_wrap();
         let mid = row.top() + 15.0;
         let mut x = row.left() + 46.0;
-        for (gi, (glyph, name, pages)) in GROUPS.iter().enumerate() {
+        for (gi, (glyph, name, pages, _)) in NAV.iter().enumerate() {
             let id = ui.id().with(("group", *name));
             let r = Rect::from_min_size(pos2(x, row.top()), vec2(34.0, 30.0));
             let resp = ui.interact(r, id, Sense::click()).on_hover_text(*name);
@@ -3488,7 +3491,8 @@ impl App {
                 glass_chip(ui.painter(), r, 11.0, sel * 0.9 + hov * (1.0 - sel) * 0.4);
             }
             ui.painter().text(r.center(), Align2::CENTER_CENTER, *glyph, FontId::proportional(15.0), mix(DIM, FG, sel.max(hov * 0.6)));
-            if resp.clicked() && gi != current {
+            // повторный щелчок по своему разделу возвращает на его главную страницу
+            if resp.clicked() && (gi != current || self.tab != pages[0].0) {
                 go = Some(pages[0].0);
             }
             x += 37.0;
@@ -3496,8 +3500,21 @@ impl App {
         x += 5.0;
         ui.painter().line_segment([pos2(x, row.top() + 8.0), pos2(x, row.top() + 22.0)], Stroke::new(1.0_f32, rgba(255, 255, 255, 34)));
         x += 11.0;
-        let pages = GROUPS[current].2;
-        if pages.len() > 1 {
+        let pages = NAV[current].2;
+        if !tabs_row && self.tab != current_root {
+            // внутренняя страница: «‹ Раздел · Страница», щелчок по стрелке — назад
+            let back = Rect::from_min_size(pos2(x - 4.0, row.top() + 2.0), vec2(26.0, 26.0));
+            let bresp = ui.interact(back, ui.id().with("nav-back"), Sense::click()).on_hover_text(format!("Назад: {}", NAV[current].1));
+            let bh = ui.ctx().animate_bool_with_time(bresp.id.with("hov"), bresp.hovered(), 0.10);
+            glass_chip(ui.painter(), back, 9.0, 0.35 + 0.5 * bh);
+            ui.painter().text(back.center(), Align2::CENTER_CENTER, "\u{E76B}", FontId::proportional(11.0), mix(DIM, FG, 0.5 + 0.5 * bh));
+            if bresp.clicked() {
+                go = Some(current_root);
+            }
+            let page = pages.iter().find(|p| p.0 == self.tab).map_or("", |p| p.1);
+            let r = ui.painter().text(pos2(back.right() + 9.0, mid), Align2::LEFT_CENTER, NAV[current].1, semi(13.0), DIM);
+            ui.painter().text(pos2(r.right() + 6.0, mid), Align2::LEFT_CENTER, format!("·  {page}"), semi(13.5), FG);
+        } else if tabs_row {
             for (t, name) in pages {
                 let id = ui.id().with(("page", *name));
                 let width = ui.painter().layout_no_wrap(name.to_string(), semi(13.0), FG).size().x + 18.0;
@@ -3512,7 +3529,7 @@ impl App {
                 x += width;
             }
         } else {
-            ui.painter().text(pos2(x + 2.0, mid), Align2::LEFT_CENTER, GROUPS[current].1, semi(13.5), FG);
+            ui.painter().text(pos2(x + 2.0, mid), Align2::LEFT_CENTER, NAV[current].1, semi(13.5), FG);
         }
         {
             let r = Rect::from_min_size(pos2(row.right() - 34.0, row.top()), vec2(34.0, 30.0));
@@ -3530,7 +3547,8 @@ impl App {
         }
         ui.add_space(10.0);
         if self.tab != self.tab_seen {
-            self.tab_dir = if (self.tab as u8) > (self.tab_seen as u8) { 1.0 } else { -1.0 };
+            // направление сдвига — по порядку страниц в разделах, а не по номеру в enum
+            self.tab_dir = if nav_order(self.tab) > nav_order(self.tab_seen) { 1.0 } else { -1.0 };
             self.tab_seen = self.tab;
             self.tab_at = Instant::now();
         }
@@ -3567,6 +3585,7 @@ impl App {
             Tab::Todo => self.ui_todo(ui),
             Tab::Shot => self.ui_shot(ui),
             Tab::Settings => self.ui_settings(ui, ctx),
+            Tab::Tools => self.ui_tools(ui, ctx),
         }
         // Высоты страниц заданы числами (panel_height), и всё, что в них не влезало, обрезалось краем
         // панели — как «Закрыть Островок» в настройках. Меряем, сколько содержимое заняло на самом деле,
@@ -4169,7 +4188,152 @@ impl App {
         }
     }
 
-    /// Обзор → Сводка: что сейчас (время, музыка, погода), состояние компьютера, быстрые действия, программы.
+    /// «Инструменты»: всё, что раньше было россыпью вкладок, — плитками с живой подписью.
+    fn ui_tools(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        enum Go {
+            Page(Tab),
+            Act(&'static str),
+        }
+        let timer = match (self.timer_end, self.timer_paused) {
+            (Some(end), _) => (format!("идёт · {}", fmt_left(end)), true),
+            (None, Some(_)) => ("на паузе".to_string(), true),
+            _ => (if self.focus.is_some() { "фокус".to_string() } else { "не запущен".to_string() }, false),
+        };
+        let clips = if self.clips.is_empty() { ("пусто".to_string(), false) } else { (count_word(self.clips.len(), "запись", "записи", "записей"), false) };
+        let notes = (count_word(self.notes.len(), "заметка", "заметки", "заметок"), false);
+        let shelf = if self.cfg.shelf.is_empty() { ("перетащите файл".to_string(), false) } else { (count_word(self.cfg.shelf.len(), "файл", "файла", "файлов"), false) };
+        let inbox = if self.inbox_unread > 0 {
+            (count_word(self.inbox_unread, "новое", "новых", "новых"), true)
+        } else if self.inbox.is_empty() {
+            ("пока пусто".to_string(), false)
+        } else {
+            (count_word(self.inbox.len(), "сообщение", "сообщения", "сообщений"), false)
+        };
+        let music = match self.media_now.as_ref() {
+            Some(m) if m.playing => (m.title.clone(), true),
+            Some(m) => (format!("пауза · {}", m.title), false),
+            None => ("ничего не играет".to_string(), false),
+        };
+        let ai = if self.api_key().is_empty() { ("нужен ключ".to_string(), false) } else { ("спросить Claude".to_string(), false) };
+        #[allow(clippy::type_complexity)]
+        let tiles: [(Go, &str, &str, (String, bool), [u8; 3]); 12] = [
+            (Go::Page(Tab::Timer), "\u{E916}", "Таймер", timer, [0xFF, 0xB3, 0x40]),
+            (Go::Page(Tab::Clip), "\u{E77F}", "Буфер", clips, [0x6F, 0xDB, 0xFF]),
+            (Go::Page(Tab::Notes), "\u{E70B}", "Заметки", notes, [0xFF, 0xD0, 0x60]),
+            (Go::Page(Tab::Shelf), "\u{E8B7}", "Полка", shelf, [0xFF, 0xA0, 0x5A]),
+            (Go::Page(Tab::Inbox), "\u{E8BD}", "Уведомления", inbox, [0x3A, 0x9B, 0xFF]),
+            (Go::Page(Tab::Qr), "\u{ED14}", "QR-код", ("из текста или Wi‑Fi".to_string(), false), [0x4A, 0xE0, 0x6F]),
+            (Go::Page(Tab::Ai), "\u{E99A}", "ИИ", ai, [0xC0, 0x9B, 0xFF]),
+            (Go::Page(Tab::Jarvis), "\u{E720}", "Джарвис", ("голосовой помощник".to_string(), false), [0x9B, 0x99, 0xFF]),
+            (Go::Act("region"), "\u{E7A8}", "Снимок области", ("в буфер и карточкой".to_string(), false), [0x5A, 0xAB, 0xFF]),
+            // музыка: страница плеера доступна и в тишине (на главной карточка плеера только когда играет)
+            (Go::Page(Tab::Music), "\u{E8D6}", "Музыка", music, [0xFF, 0x7A, 0xB6]),
+            (Go::Act("ocr"), "\u{E8D2}", "Текст с экрана", ("выделите — скопирую".to_string(), false), [0xFF, 0xB3, 0x40]),
+            (Go::Act("picker"), "\u{EF3C}", "Пипетка", ("цвет под курсором".to_string(), false), [0xFF, 0x5C, 0x7F]),
+        ];
+        const COLS: usize = 4;
+        const TILE_H: f32 = 72.0;
+        const GAP: f32 = 8.0;
+        let w = (ui.available_width() - GAP * (COLS as f32 - 1.0)) / COLS as f32;
+        let rows = tiles.len().div_ceil(COLS);
+        let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), rows as f32 * TILE_H + (rows as f32 - 1.0) * GAP), Sense::hover());
+        let mut pick: Option<usize> = None;
+        for (i, (_, glyph, title, (sub, live), col)) in tiles.iter().enumerate() {
+            let (cx, cy) = ((i % COLS) as f32, (i / COLS) as f32);
+            let r = Rect::from_min_size(area.min + vec2(cx * (w + GAP), cy * (TILE_H + GAP)), vec2(w, TILE_H));
+            let resp = ui.interact(r, ui.id().with(("tool", i)), Sense::click());
+            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+            let down = ui.ctx().animate_bool_with_time(resp.id.with("down"), resp.is_pointer_button_down_on(), 0.06);
+            let p = ui.painter();
+            glass_chip(p, r.shrink(down), 16.0, 0.5 + 0.5 * hov);
+            let tone = Color32::from_rgb(col[0], col[1], col[2]);
+            let ic = pos2(r.left() + 26.0, r.top() + 24.0 - 1.5 * hov);
+            p.circle_filled(ic, 14.0 + hov, rgba(col[0], col[1], col[2], (40.0 + 36.0 * hov) as u8));
+            p.text(ic, Align2::CENTER_CENTER, *glyph, FontId::proportional(14.0), tone);
+            let text_w = r.width() - 24.0;
+            p.text(pos2(r.left() + 12.0, r.bottom() - 26.0), Align2::LEFT_CENTER, elide(p, title, semi(12.5), text_w), semi(12.5), FG);
+            let sub = elide(p, sub, FontId::proportional(11.0), text_w);
+            p.text(pos2(r.left() + 12.0, r.bottom() - 11.0), Align2::LEFT_CENTER, sub, FontId::proportional(11.0), if *live { tone } else { DIM });
+            if *live {
+                // «живая» плитка: точка в углу — там сейчас что-то происходит
+                p.circle_filled(pos2(r.right() - 14.0, r.top() + 14.0), 3.5, tone);
+            }
+            if resp.clicked() {
+                pick = Some(i);
+            }
+        }
+        if let Some(i) = pick {
+            match tiles[i].0 {
+                Go::Page(t) => self.tab = t,
+                Go::Act(id) => self.run_action(id, ctx),
+            }
+        }
+    }
+
+    /// Карточка «Дальше» на главной: ближайшие напоминания до конца завтрашнего дня и незакрытые дела
+    /// (сначала со сроком сегодня или просроченные). Щелчок открывает «День».
+    fn home_agenda(&mut self, ui: &mut egui::Ui, p: &egui::Painter, r: Rect) {
+        let resp = ui.interact(r, ui.id().with("home-agenda"), Sense::click()).on_hover_text("Открыть «День»");
+        let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+        glass_chip(p, r, 20.0, 0.6 + 0.4 * hov);
+        let rows = agenda_rows(&self.cfg.reminders, &self.cfg.todos, chrono::Local::now().naive_local(), 3);
+        let clip = p.with_clip_rect(r.shrink2(vec2(12.0, 0.0)));
+        clip.text(r.min + vec2(16.0, 12.0), Align2::LEFT_TOP, "ДАЛЬШЕ", semi(11.0), DIM);
+        if rows.is_empty() {
+            clip.text(r.min + vec2(16.0, 36.0), Align2::LEFT_TOP, "День свободен", semi(15.0), FG);
+            clip.text(r.min + vec2(16.0, 60.0), Align2::LEFT_TOP, "В поиске: «напомни 18:30 …» или «дело …»", FontId::proportional(11.5), DIM);
+        } else {
+            for (i, (when, text, soon)) in rows.iter().enumerate() {
+                let y = r.top() + 38.0 + i as f32 * 20.0;
+                let lead = p.layout_no_wrap(when.clone(), semi(12.0), FG).size().x;
+                clip.text(pos2(r.left() + 16.0, y), Align2::LEFT_CENTER, when, semi(12.0), if *soon { accent() } else { DIM });
+                let x = r.left() + 16.0 + lead.max(38.0) + 8.0;
+                let t = elide(p, text, FontId::proportional(12.5), r.right() - 14.0 - x);
+                clip.text(pos2(x, y), Align2::LEFT_CENTER, t, FontId::proportional(12.5), FG);
+            }
+        }
+        if resp.clicked() {
+            self.tab = Tab::Calendar;
+        }
+    }
+
+    /// Живая карточка главной (вместо колец процессора и памяти): идущий таймер, новое сообщение или
+    /// дела на сегодня. Ничего такого нет — возвращает false, и на её месте остаются кольца.
+    fn home_live(&mut self, ui: &mut egui::Ui, p: &egui::Painter, r: Rect) -> bool {
+        let key = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let today = self.cfg.todos.iter().filter(|t| !t.done && t.due.as_deref().is_some_and(|d| d <= key.as_str())).count();
+        let (glyph, color, title, sub, go): (&str, Color32, String, String, Tab) = if let Some(end) = self.timer_end {
+            let what = if self.focus.is_some_and(|f| f.0) { "Перерыв" } else if self.focus.is_some() { "Фокус" } else { "Таймер" };
+            ("\u{E916}", Color32::from_rgb(0xFF, 0xB3, 0x40), format!("{what} · {}", fmt_left(end)), "открыть таймер".into(), Tab::Timer)
+        } else if self.timer_paused.is_some() {
+            ("\u{E769}", Color32::from_rgb(0xFF, 0xB3, 0x40), "Таймер на паузе".into(), "открыть таймер".into(), Tab::Timer)
+        } else if let Some(m) = self.inbox.first().filter(|_| self.inbox_unread > 0) {
+            let c = Color32::from_rgb(m.color[0], m.color[1], m.color[2]);
+            let more = if self.inbox_unread > 1 { format!(" · ещё {}", self.inbox_unread - 1) } else { String::new() };
+            // переносы строк в тексте сообщения налезали бы на соседнюю строку карточки
+            ("\u{E8BD}", c, format!("{} · {}{more}", m.title, m.app), m.body.replace(['\n', '\r'], " "), Tab::Inbox)
+        } else if today > 0 {
+            let first = self.cfg.todos.iter().find(|t| !t.done && t.due.as_deref().is_some_and(|d| d <= key.as_str())).map_or(String::new(), |t| t.text.clone());
+            ("\u{E73E}", accent(), format!("На сегодня: {}", count_word(today, "дело", "дела", "дел")), first, Tab::Todo)
+        } else {
+            return false;
+        };
+        let resp = ui.interact(r, ui.id().with("home-live"), Sense::click());
+        let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+        glass_chip(p, r, 16.0, 0.55 + 0.45 * hov);
+        let c = pos2(r.left() + 25.0, r.center().y);
+        p.circle_filled(c, 14.0, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 46));
+        p.text(c, Align2::CENTER_CENTER, glyph, FontId::proportional(14.0), color);
+        let w = r.right() - 12.0 - (r.left() + 48.0);
+        p.text(pos2(r.left() + 48.0, r.center().y - 8.0), Align2::LEFT_CENTER, elide(p, &title, semi(12.5), w), semi(12.5), FG);
+        p.text(pos2(r.left() + 48.0, r.center().y + 9.0), Align2::LEFT_CENTER, elide(p, &sub, FontId::proportional(11.5), w), FontId::proportional(11.5), DIM);
+        if resp.clicked() {
+            self.tab = go;
+        }
+        true
+    }
+
+    /// «Сейчас»: часы, музыка или «Дальше», погода, живая карточка, громкость, быстрые действия, программы.
     fn ui_home(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         use chrono::Datelike;
         if self.ctl_at.elapsed() > Duration::from_millis(800) && !ui.input(|i| i.pointer.any_down()) {
@@ -4246,6 +4410,15 @@ impl App {
             }
         }
 
+        // средняя карточка по ситуации: играет музыка — плеер, тишина — «Дальше» (что впереди сегодня).
+        // Раньше в тишине здесь висела бесполезная карточка «Ничего не играет».
+        // звук в тихих местах трека пропадает на секунды — плеер держится ещё 6 с, а не мигает с «Дальше»
+        if self.media_now.is_some() || self.sound_on() {
+            self.music_seen = Some(Instant::now());
+        }
+        if self.music_seen.is_none_or(|t| t.elapsed() > Duration::from_secs(6)) {
+            self.home_agenda(ui, &p, music_r);
+        } else {
         glass_chip(&p, music_r, 20.0, 0.6);
         let art = Rect::from_min_size(music_r.min + vec2(12.0, 12.0), vec2(76.0, 76.0));
         match &self.thumb {
@@ -4302,11 +4475,9 @@ impl App {
                     p.text(pos2(x, music_r.top() + 16.0), Align2::LEFT_TOP, "Играет звук", semi(14.0), FG);
                     let strip = Rect::from_min_max(pos2(x, music_r.top() + 38.0), pos2(music_r.right() - 16.0, music_r.bottom() - 14.0));
                     spectrum(&p, strip, &self.bars, accent(), 0.8, 1.0);
-                } else {
-                    p.text(pos2(x, music_r.top() + 30.0), Align2::LEFT_TOP, "Ничего не играет", semi(14.0), FG);
-                    p.text(pos2(x, music_r.top() + 51.0), Align2::LEFT_TOP, "Включите музыку в плеере", FontId::proportional(12.0), DIM);
                 }
             }
+        }
         }
 
         let wresp = ui.interact(weather_r, ui.id().with("home-weather"), Sense::click());
@@ -4327,7 +4498,22 @@ impl App {
                 let clip = p.with_clip_rect(weather_r.shrink2(vec2(10.0, 0.0)));
                 clip.text(weather_r.min + vec2(16.0, 8.0), Align2::LEFT_TOP, format!("{icon} {}", weather::deg(w.temp)), light(30.0), FG);
                 clip.text(weather_r.min + vec2(17.0, 54.0), Align2::LEFT_TOP, text, FontId::proportional(12.5), FG);
-                clip.text(weather_r.min + vec2(17.0, 75.0), Align2::LEFT_TOP, &w.city, FontId::proportional(11.5), DIM);
+                // дождь скоро — важнее названия города
+                // час — во времени города: прогноз приходит в его поясе
+                let city_hour = {
+                    use chrono::Timelike;
+                    (chrono::Utc::now().naive_utc() + chrono::Duration::seconds(w.utc_offset as i64)).hour()
+                };
+                match rain_soon(&w.hours, city_hour) {
+                    Some((pct, snow)) => clip.text(
+                        weather_r.min + vec2(17.0, 75.0),
+                        Align2::LEFT_TOP,
+                        if snow { format!("❄ снег ~{pct}% в ближ. час") } else { format!("☂ дождь ~{pct}% в ближ. час") },
+                        FontId::proportional(11.5),
+                        Color32::from_rgb(0x8F, 0xCB, 0xFF),
+                    ),
+                    None => clip.text(weather_r.min + vec2(17.0, 75.0), Align2::LEFT_TOP, &w.city, FontId::proportional(11.5), DIM),
+                };
             }
             None => {
                 let city_set = self.cfg.lat.is_some();
@@ -4349,7 +4535,10 @@ impl App {
             Rect::from_min_size(pos2(row.left() + k * (w + 8.0), row.top()), vec2(w * span + 8.0 * (span - 1.0), row.height()))
         };
         let mem = if self.stats.mem_total > 0.0 { (self.stats.mem_used / self.stats.mem_total) as f32 } else { 0.0 };
-        for (k, (name, frac, value)) in [("Процессор", self.stats.cpu, format!("{:.0}%", self.stats.cpu * 100.0)), ("Память", mem, format!("{:.1} ГБ", self.stats.mem_used))].into_iter().enumerate() {
+        // живое (таймер, новое сообщение, дела на сегодня) — на месте колец процессора и памяти
+        let live_shown = self.home_live(ui, &p, cell(0.0, 2.0));
+        let gauges = if live_shown { Vec::new() } else { vec![("Процессор", self.stats.cpu, format!("{:.0}%", self.stats.cpu * 100.0)), ("Память", mem, format!("{:.1} ГБ", self.stats.mem_used))] };
+        for (k, (name, frac, value)) in gauges.into_iter().enumerate() {
             let r = cell(k as f32, 1.0);
             let resp = ui.interact(r, ui.id().with(("gauge", k)), Sense::click());
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
@@ -9101,6 +9290,8 @@ impl App {
             Tab::System => if self.stats.battery.is_some() { 416.0 } else { 394.0 },
             Tab::Game => self.game_height(),
             Tab::Settings => 528.0,
+            // три ряда плиток
+            Tab::Tools => 276.0,
         }
     }
 
@@ -9565,7 +9756,173 @@ fn icon_limit(remote: bool) -> Duration {
     }
 }
 
-/// Дополнительная пауза перед повтором записи заметок после `fails` неудач подряд (сверх 1,5 с), не больше 30 с в сумме.
+/// Разделы панели: значок, название, страницы (первая — главная раздела) и показывать ли страницы
+/// рядом текстом (иначе они открываются из карточек и плиток, а в шапке — «‹ раздел · страница»).
+#[allow(clippy::type_complexity)]
+const NAV: [(&str, &str, &[(Tab, &str)], bool); 5] = [
+    ("\u{E80F}", "Сейчас", &[(Tab::Home, "Сейчас"), (Tab::Music, "Музыка"), (Tab::Weather, "Погода")], false),
+    ("\u{E787}", "День", &[(Tab::Calendar, "Календарь"), (Tab::Remind, "Напоминания"), (Tab::Todo, "Дела")], true),
+    (
+        "\u{E90F}",
+        "Инструменты",
+        &[
+            (Tab::Tools, "Инструменты"),
+            (Tab::Timer, "Таймер"),
+            (Tab::Clip, "Буфер"),
+            (Tab::Notes, "Заметки"),
+            (Tab::Shelf, "Полка"),
+            (Tab::Qr, "QR-код"),
+            (Tab::Inbox, "Уведомления"),
+            (Tab::Shot, "Снимок"),
+            (Tab::Ai, "ИИ"),
+            (Tab::Jarvis, "Джарвис"),
+        ],
+        false,
+    ),
+    ("\u{E7F4}", "Система", &[(Tab::Pult, "Пульт"), (Tab::Control, "Управление"), (Tab::Sound, "Звук"), (Tab::System, "Монитор"), (Tab::Game, "Игра")], true),
+    ("\u{E713}", "Настройки", &[(Tab::Settings, "Настройки")], false),
+];
+
+/// Номер раздела NAV, в котором лежит страница. Полный match: новую страницу компилятор не даст забыть.
+fn nav_group(t: Tab) -> usize {
+    match t {
+        Tab::Home | Tab::Music | Tab::Weather => 0,
+        Tab::Calendar | Tab::Remind | Tab::Todo => 1,
+        Tab::Tools | Tab::Timer | Tab::Clip | Tab::Notes | Tab::Shelf | Tab::Qr | Tab::Inbox | Tab::Shot | Tab::Ai | Tab::Jarvis => 2,
+        Tab::Pult | Tab::Control | Tab::Sound | Tab::System | Tab::Game => 3,
+        Tab::Settings => 4,
+    }
+}
+
+/// Порядок страницы в панели: раздел, потом место в разделе (для направления анимации).
+fn nav_order(t: Tab) -> (usize, usize) {
+    let g = nav_group(t);
+    (g, NAV[g].2.iter().position(|p| p.0 == t).unwrap_or(0))
+}
+
+#[cfg(test)]
+mod nav_tests {
+    use super::*;
+    #[test]
+    fn every_page_sits_in_its_group() {
+        // nav_group и NAV не должны расходиться: каждая страница из NAV лежит в своём разделе
+        for (gi, g) in NAV.iter().enumerate() {
+            for (t, _) in g.2 {
+                assert_eq!(nav_group(*t), gi, "страница «{}» не в своём разделе", g.1);
+            }
+        }
+    }
+}
+
+/// Строки карточки «Дальше»: (когда, что, скоро ли). Сначала напоминания с этого момента до конца
+/// завтрашнего дня по времени, потом незакрытые дела: просроченные и на сегодня, затем без срока.
+fn agenda_rows(reminders: &[store::Reminder], todos: &[store::Todo], now: chrono::NaiveDateTime, max: usize) -> Vec<(String, String, bool)> {
+    use chrono::TimeZone;
+    let today = now.date();
+    let end = (today + chrono::Duration::days(2)).and_hms_opt(0, 0, 0).unwrap_or(now);
+    let mut out = Vec::new();
+    let mut rem: Vec<(chrono::NaiveDateTime, &str)> = reminders
+        .iter()
+        .filter_map(|r| chrono::Local.timestamp_opt(r.at, 0).single().map(|d| (d.naive_local(), r.text.as_str())))
+        .filter(|(at, _)| *at >= now && *at < end)
+        .collect();
+    rem.sort_by_key(|x| x.0);
+    for (at, text) in rem.into_iter().take(max) {
+        let mins = (at - now).num_minutes();
+        let when = if at.date() == today { at.format("%H:%M").to_string() } else { format!("завтра {}", at.format("%H:%M")) };
+        out.push((when, text.to_string(), mins <= 60));
+    }
+    let key = today.format("%Y-%m-%d").to_string();
+    let mut due: Vec<&store::Todo> = todos.iter().filter(|t| !t.done).collect();
+    // просроченные и сегодняшние — первыми, потом без срока, будущие — в конце
+    due.sort_by_key(|t| match t.due.as_deref() {
+        Some(d) if d <= key.as_str() => 0,
+        None => 1,
+        Some(_) => 2,
+    });
+    for t in due {
+        if out.len() >= max {
+            break;
+        }
+        let late = t.due.as_deref().is_some_and(|d| d < key.as_str());
+        let when = match t.due.as_deref() {
+            Some(d) if d < key.as_str() => "просрочено".to_string(),
+            Some(d) if d == key.as_str() => "сегодня".to_string(),
+            _ => "дело".to_string(),
+        };
+        out.push((when, t.text.clone(), late));
+    }
+    out
+}
+
+#[cfg(test)]
+mod agenda_tests {
+    use super::*;
+    #[test]
+    fn reminders_first_then_todos() {
+        use chrono::TimeZone;
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 11, 24).unwrap().and_hms_opt(15, 0, 0).unwrap();
+        let at = |h: u32, d: u32| chrono::Local.from_local_datetime(&chrono::NaiveDate::from_ymd_opt(2026, 11, d).unwrap().and_hms_opt(h, 0, 0).unwrap()).single().unwrap().timestamp();
+        let reminders = vec![
+            store::Reminder { text: "созвон".into(), at: at(18, 24), repeat: 0 },
+            store::Reminder { text: "прошлое".into(), at: at(9, 24), repeat: 0 },
+            store::Reminder { text: "врач".into(), at: at(9, 25), repeat: 0 },
+            store::Reminder { text: "далеко".into(), at: at(9, 28), repeat: 0 },
+        ];
+        let todos = vec![
+            store::Todo { text: "без срока".into(), done: false, due: None },
+            store::Todo { text: "сделано".into(), done: true, due: None },
+            store::Todo { text: "вчерашнее".into(), done: false, due: Some("2026-11-23".into()) },
+        ];
+        let rows = agenda_rows(&reminders, &todos, now, 5);
+        let texts: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+        assert_eq!(texts, ["созвон", "врач", "вчерашнее", "без срока"]);
+        assert_eq!(rows[0].0, "18:00");
+        assert_eq!(rows[1].0, "завтра 09:00");
+        assert_eq!(rows[2].0, "просрочено");
+        // не больше max
+        assert_eq!(agenda_rows(&reminders, &todos, now, 2).len(), 2);
+        assert!(agenda_rows(&[], &[], now, 3).is_empty());
+    }
+}
+
+/// Вероятность осадков в ближайший час (прогноз почасовой: текущий и следующий час), если она 50 % и выше.
+/// Берутся только часы `now_hour` и следующий: если прогноз устарел (офлайн), подсказки нет.
+/// Второе значение — снег (коды 71–77, 85–86), а не дождь.
+fn rain_soon(hours: &[weather::Hour], now_hour: u32) -> Option<(u8, bool)> {
+    let near: Vec<&weather::Hour> = hours.iter().take(3).filter(|h| h.hour == now_hour % 24 || h.hour == (now_hour + 1) % 24).collect();
+    let top = near.iter().max_by(|a, b| a.rain.total_cmp(&b.rain))?;
+    (top.rain >= 50.0).then(|| (top.rain.round().min(100.0) as u8, matches!(top.code, 71..=77 | 85 | 86)))
+}
+
+#[cfg(test)]
+mod rain_tests {
+    use super::*;
+    fn h(hour: u32, rain: f64, code: i64) -> weather::Hour {
+        weather::Hour { hour, temp: 0.0, rain, code }
+    }
+    #[test]
+    fn only_current_and_next_hour() {
+        assert_eq!(rain_soon(&[h(15, 20.0, 3), h(16, 70.0, 61)], 15), Some((70, false)));
+        assert_eq!(rain_soon(&[h(15, 80.0, 73)], 15), Some((80, true)));
+        assert_eq!(rain_soon(&[h(15, 40.0, 61)], 15), None);
+        // прогноз устарел: часы не совпадают
+        assert_eq!(rain_soon(&[h(9, 90.0, 61), h(10, 90.0, 61)], 15), None);
+        // через полночь
+        assert_eq!(rain_soon(&[h(23, 0.0, 0), h(0, 60.0, 61)], 23), Some((60, false)));
+    }
+}
+
+/// Слово с числом: 1 заметка, 3 заметки, 5 заметок.
+fn count_word(n: usize, one: &str, few: &str, many: &str) -> String {
+    let w = match (n % 10, n % 100) {
+        (1, x) if x != 11 => one,
+        (2..=4, x) if !(12..=14).contains(&x) => few,
+        _ => many,
+    };
+    format!("{n} {w}")
+}
+
 /// Сколько добавить к заданной высоте страницы: содержимое заняло `used`, а места было `avail`
 /// (вместе с уже добавленным `grow`). Запас снизу — 8 точек. Не больше 360, чтобы ошибка в странице
 /// не растянула панель на весь экран.
@@ -9620,6 +9977,7 @@ fn fs_settle(raw: bool) -> Duration {
 /// окно только растёт: смена размера прозрачного OpenGL-окна на каждом кадре давала мигание.
 const WIN_SHRINK_AFTER: Duration = Duration::from_millis(350);
 
+/// Дополнительная пауза перед повтором записи заметок после `fails` неудач подряд (сверх 1,5 с), не больше 30 с в сумме.
 fn notes_retry_delay(fails: u32) -> Duration {
     let total = store::FLUSH_AFTER.saturating_mul(1u32 << fails.min(5)).min(Duration::from_secs(30));
     total.saturating_sub(store::FLUSH_AFTER)
