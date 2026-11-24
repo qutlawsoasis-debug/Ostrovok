@@ -3794,7 +3794,7 @@ impl App {
         let mut add = false;
         ui.horizontal(|ui| {
             let w = (ui.available_width() - 250.0).max(120.0);
-            ui.add(
+            let t = ui.add(
                 egui::TextEdit::singleline(&mut self.remind_text)
                     .margin(egui::Margin::symmetric(9.0, 7.0))
                     .hint_text(RichText::new("О чём напомнить").color(DIM))
@@ -3806,17 +3806,22 @@ impl App {
                     .hint_text(RichText::new("18:30 или +15").color(DIM))
                     .desired_width(110.0),
             );
-            add = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            // Enter работает в обоих полях (раньше — только во времени, а в тексте просто терялся фокус)
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            // Enter в тексте при пустом времени — переходим в поле времени, а не ругаемся «не понял время»
+            if t.lost_focus() && enter && self.remind_time.trim().is_empty() {
+                r.request_focus();
+            } else {
+                add = (r.lost_focus() || t.lost_focus()) && enter;
+            }
             add |= jelly(ui, "Добавить").clicked();
         });
         // быстрое время: щелчок подставляет время, а если текст уже вписан — сразу добавляет
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            use chrono::Timelike;
-            let now = chrono::Local::now();
-            let to_tomorrow_9 = (24 * 60 - (now.hour() * 60 + now.minute()) as i64 + 9 * 60).max(1);
-            for (label, spec) in [("+5 мин", "+5".to_string()), ("+15 мин", "+15".into()), ("+1 час", "+60".into()), ("вечером 19:00", "19:00".into()), ("завтра 9:00", format!("+{to_tomorrow_9}"))] {
+            // «завтра 9:00» — точное время, а не «+N минут»: пока пишут текст, оно не уплывает на 9:03
+            for (label, spec) in [("+5 мин", "+5".to_string()), ("+15 мин", "+15".into()), ("+1 час", "+60".into()), ("вечером 19:00", "19:00".into()), ("завтра 9:00", "завтра 9:00".into())] {
                 let w = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(12.0), FG).size().x + 20.0;
                 let (r, resp) = ui.allocate_exact_size(vec2(w, 26.0), Sense::click());
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
@@ -3887,7 +3892,7 @@ impl App {
     }
 
     fn add_reminder(&mut self) {
-        use chrono::{Local, NaiveTime};
+        use chrono::Local;
         let text = self.remind_text.trim().to_string();
         let spec = self.remind_time.trim().replace(',', ".");
         if text.is_empty() {
@@ -3895,7 +3900,13 @@ impl App {
             return;
         }
         let now = Local::now();
-        let at = if let Ok(time) = NaiveTime::parse_from_str(&spec, "%H:%M") {
+        // «завтра 9:00» — ровно завтра в это время (кнопка быстрого времени и ручной ввод)
+        let low = spec.to_lowercase();
+        let tomorrow = low.strip_prefix("завтра").map(|t| t.trim()).map(|t| t.strip_prefix("в ").unwrap_or(t)).and_then(clock_spec);
+        let at = if let Some(time) = tomorrow {
+            let day = now.date_naive().succ_opt().map(|d| d.and_time(time));
+            day.and_then(|d| resolve_here(weekday_first(d, self.remind_repeat))).map(|d| d.timestamp())
+        } else if let Some(time) = clock_spec(&spec) {
             let today = now.date_naive().and_time(time);
             let day = if today <= now.naive_local() { today + chrono::Duration::days(1) } else { today };
             resolve_here(weekday_first(day, self.remind_repeat)).map(|d| d.timestamp())
@@ -10150,6 +10161,32 @@ impl<T: Send + 'static> Probe<T> {
     fn reset(&mut self) {
         self.rx = None;
         self.at = Some(Instant::now());
+    }
+}
+
+/// Время из поля напоминания: «18:30» или «18.30» (с точкой — только две цифры минут,
+/// иначе «1.5» — это полторы минуты, а не 01:05).
+fn clock_spec(s: &str) -> Option<chrono::NaiveTime> {
+    let s = s.trim();
+    if let Some((_, m)) = s.split_once('.') {
+        if m.len() != 2 {
+            return None;
+        }
+    }
+    chrono::NaiveTime::parse_from_str(&s.replace('.', ":"), "%H:%M").ok()
+}
+
+#[cfg(test)]
+mod clock_spec_tests {
+    #[test]
+    fn dot_needs_two_minute_digits() {
+        use super::clock_spec as c;
+        let t = |h, m| chrono::NaiveTime::from_hms_opt(h, m, 0);
+        assert_eq!(c("18:30"), t(18, 30));
+        assert_eq!(c("9.30"), t(9, 30));
+        assert_eq!(c("1.5"), None);
+        assert_eq!(c("+15"), None);
+        assert_eq!(c("15"), None);
     }
 }
 

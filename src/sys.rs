@@ -1192,11 +1192,12 @@ pub fn set_light_theme(light: bool) {
         let _ = key.set_value("AppsUseLightTheme", &v);
         let _ = key.set_value("SystemUsesLightTheme", &v);
     }
-    unsafe {
-        // сообщаем открытым программам, что тема изменилась
+    // сообщаем открытым программам, что тема изменилась. В своём потоке: рассылка ждёт каждое окно
+    // до 200 мс, и с зависшей программой окно острова замирало бы на эти доли секунды
+    std::thread::spawn(|| unsafe {
         let what: Vec<u16> = "ImmersiveColorSet\0".encode_utf16().collect();
         SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(what.as_ptr() as isize), SMTO_ABORTIFHUNG, 200, None);
-    }
+    });
 }
 
 /// Сколько в корзине: число объектов и размер в байтах.
