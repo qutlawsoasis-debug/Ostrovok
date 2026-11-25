@@ -1438,6 +1438,11 @@ impl App {
         let (lens_tx, lens_rx) = glass::spawn(ctx.clone());
         let fx = cc.gl.as_ref().and_then(|gl| fx::Fx::new(gl)).map(Arc::new);
         let mut cfg = store::Settings::load();
+        // автозапуск: если его не выключали галочкой, а записи в реестре нет (антивирус стёр) или она
+        // ведёт на старый файл — восстанавливаем, иначе остров молча перестаёт стартовать с Windows
+        if store::heal_autostart(!cfg.no_autostart) {
+            store::log_err("автозапуск восстановлен: записи не было или она вела на другой файл");
+        }
         let spot0 = if test_mode() { None } else { restore_spot(&cfg.spots) };
         cfg.world = sanitize_world(&cfg.world);
         THEME.store((cfg.theme as usize).min(THEMES.len() - 1), Ordering::Relaxed);
@@ -7640,6 +7645,9 @@ impl App {
             }
             if switch_row(ui, &mut self.autostart, "Запуск вместе с Windows", "") {
                 store::set_autostart(self.autostart);
+                // желание запоминаем в настройках: по нему остров восстановит запись, если её сотрут
+                self.cfg.no_autostart = !self.autostart;
+                self.cfg.save();
                 self.autostart = store::autostart_enabled();
             }
             let state = self.upd.lock().unwrap().clone();

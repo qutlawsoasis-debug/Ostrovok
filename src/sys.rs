@@ -22,9 +22,10 @@ pub fn single_instance() -> bool {
     }
 }
 
-/// То же после самообновления: прежняя копия ещё закрывается, поэтому ждём её до восьми секунд.
+/// Ждёт, пока прежняя копия (обновление) отпустит «единственный экземпляр» — до 30 с. Раньше было 8 с:
+/// если выход затягивался (остановка Джарвиса, запись заметок), новая версия молча сдавалась.
 pub fn wait_single_instance() -> bool {
-    for _ in 0..80 {
+    for _ in 0..300 {
         unsafe {
             let h = CreateMutexW(None, true, w!("Ostrovok.SingleInstance"));
             if windows::Win32::Foundation::GetLastError() != ERROR_ALREADY_EXISTS {

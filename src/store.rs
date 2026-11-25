@@ -81,6 +81,11 @@ pub struct Settings {
     /// не обновляться с GitHub самостоятельно
     #[serde(default)]
     pub no_update: bool,
+    /// автозапуск выключен галочкой в настройках (по умолчанию — запускать вместе с Windows).
+    /// Само желание хранится здесь, а не только в реестре: запись в реестре стирает антивирус
+    /// или она устаревает после переноса файла — тогда остров восстанавливает её при запуске
+    #[serde(default)]
+    pub no_autostart: bool,
     /// версия, которая запускалась в прошлый раз, — чтобы сказать «обновлено»
     #[serde(default)]
     pub last_version: String,
@@ -951,6 +956,56 @@ pub fn set_autostart_path(exe: &std::path::Path) {
     use winreg::{enums::*, RegKey};
     if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE) {
         let _ = key.set_value(RUN_NAME, &run_value(&exe));
+    }
+}
+
+/// Восстанавливает автозапуск, если его ждут (галочка не снята), а записи в реестре нет или она
+/// указывает на другой файл (антивирус стёр, файл перенесли, обновление легло в другое место).
+/// true — запись пришлось написать заново.
+pub fn heal_autostart(wanted: bool) -> bool {
+    use winreg::{enums::*, RegKey};
+    if !wanted || !test_free() {
+        return false;
+    }
+    let have = RegKey::predef(HKEY_CURRENT_USER).open_subkey(RUN_KEY).and_then(|k| k.get_value::<String, _>(RUN_NAME)).ok();
+    // Чужую рабочую запись не трогаем: установленная копия могла перенести автозапуск на себя, и
+    // запущенный скачанный файл не должен забирать его обратно. Чиним только пропавшую запись
+    // или запись на файл, которого больше нет (антивирус удалил, файл перенесли).
+    if !autostart_needs_fix(have.as_deref(), |p| std::path::Path::new(p).exists()) {
+        return false;
+    }
+    // цель — установленная копия, если она есть, иначе этот файл
+    let installed = crate::install::home().map(|h| h.join("Ostrovok.exe")).filter(|p| p.exists());
+    let Some(target) = installed.or_else(|| std::env::current_exe().ok()) else { return false };
+    set_autostart_path(&target);
+    true
+}
+
+/// Нужно ли чинить автозапуск: записи нет или файл, на который она ведёт, не существует.
+pub fn autostart_needs_fix(have: Option<&str>, exists: impl Fn(&str) -> bool) -> bool {
+    match have {
+        None => true,
+        Some(h) => {
+            let path = h.trim().trim_matches('"');
+            path.is_empty() || !exists(path)
+        }
+    }
+}
+
+#[cfg(test)]
+mod heal_tests {
+    #[test]
+    fn heals_only_missing_or_dead_entry() {
+        use super::autostart_needs_fix as f;
+        let alive = |p: &str| p.ends_with("Programs\\Ostrovok\\Ostrovok.exe") || p.ends_with("Downloads\\Ostrovok.exe");
+        // записи нет — чиним
+        assert!(f(None, alive));
+        // запись на удалённый файл — чиним
+        assert!(f(Some(r#""D:\old\Ostrovok.exe""#), alive));
+        // рабочая запись (в том числе на установленную копию) — не трогаем
+        assert!(!f(Some(r#""C:\Users\u\AppData\Local\Programs\Ostrovok\Ostrovok.exe""#), alive));
+        assert!(!f(Some(r#""C:\Users\u\Downloads\Ostrovok.exe""#), alive));
+        assert!(f(Some("  "), alive));
     }
 }
 
