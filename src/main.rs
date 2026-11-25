@@ -43,6 +43,17 @@ fn fg() -> Color32 {
     let c = theme().fg;
     Color32::from_rgb(c[0], c[1], c[2])
 }
+/// Второй цвет для данных (кольца, графики) рядом с акцентом: в холодных темах — голубой,
+/// в тёплой «Кофе» — песочный, чтобы голубое не выбивалось из кофейной гаммы.
+fn data2() -> Color32 {
+    if theme().flat { Color32::from_rgb(214, 188, 150) } else { Color32::from_rgb(0x8F, 0xD3, 0xFF) }
+}
+
+/// Цвет смысловой шкалы (температура) в выбранной теме: в плоской — приглушён к тексту.
+fn soften(c: Color32) -> Color32 {
+    if theme().flat { mix(c, fg(), 0.65) } else { c }
+}
+
 /// Второстепенный цвет текста выбранной темы.
 fn dim() -> Color32 {
     let c = theme().dim;
@@ -4690,7 +4701,7 @@ impl App {
             glass_chip(&p, r, R_CARD, 0.5 + 0.5 * hov);
             let c = pos2(r.left() + 26.0, r.center().y);
             let shown = ui.ctx().animate_value_with_time(resp.id.with("v"), frac.clamp(0.0, 1.0), 0.5);
-            let color = if shown > 0.9 { Color32::from_rgb(0xFF, 0x6B, 0x6B) } else if k == 0 { Color32::from_rgb(0x8F, 0xD3, 0xFF) } else { accent() };
+            let color = if shown > 0.9 { Color32::from_rgb(0xFF, 0x6B, 0x6B) } else if k == 0 { data2() } else { accent() };
             p.circle_stroke(c, 13.0, Stroke::new(3.5_f32, rgba(255, 255, 255, 26)));
             let steps = (shown * 40.0).ceil().max(1.0) as usize;
             let arc: Vec<Pos2> = (0..=steps)
@@ -6257,7 +6268,7 @@ impl App {
                             let t = d.min + (d.max - d.min) * (s as f64 + 0.5) / steps as f64;
                             let c = weather::temp_rgb(t);
                             let round = if s == 0 || s == steps - 1 { 2.0 } else { 0.0 };
-                            p.rect_filled(Rect::from_min_max(pos2(x0, track.top()), pos2(x1 + 0.5, track.bottom())), Rounding::same(round), Color32::from_rgb(c[0], c[1], c[2]));
+                            p.rect_filled(Rect::from_min_max(pos2(x0, track.top()), pos2(x1 + 0.5, track.bottom())), Rounding::same(round), soften(Color32::from_rgb(c[0], c[1], c[2])));
                         }
                         if i == 0 {
                             // сейчас: белая точка с тёмной обводкой
@@ -7905,7 +7916,7 @@ impl App {
             if jelly(ui, "›").clicked() {
                 self.cal_shift += 1;
             }
-            ui.label(RichText::new(format!("{} {year}", MONTHS[month0 as usize])).font(semi(15.0)));
+            ui.label(RichText::new(format!("{} {year}", MONTHS[month0 as usize])).font(light(22.0)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if (self.cal_shift != 0 || self.cal_sel.is_some_and(|d| d != today)) && jelly(ui, "Сегодня").clicked() {
                     self.cal_shift = 0;
@@ -7920,7 +7931,7 @@ impl App {
         ui.columns(2, |c| {
             // ----- месяц
             let ui = &mut c[0];
-            let cell = vec2(ui.available_width() / 7.0, 31.0);
+            let cell = vec2(ui.available_width() / 7.0, 33.0);
             let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0 + cell.y * 6.0), Sense::hover());
             let origin = area.min;
             let p = ui.painter().clone();
@@ -7958,7 +7969,7 @@ impl App {
                 } else {
                     fg()
                 };
-                p.text(at, Align2::CENTER_CENTER, day.to_string(), semi(13.5), color);
+                p.text(at, Align2::CENTER_CENTER, day.to_string(), semi(14.5), color);
                 // праздник — маленькая коралловая звёздочка справа сверху
                 if fest {
                     let star = at + vec2(10.5, -9.5);
@@ -8007,12 +8018,12 @@ impl App {
                     ui.label(RichText::new(if sel < today { "В этот день дел не было." } else { "На этот день дел нет." }).color(dim()));
                 }
                 for (i, _, time, text, ts, orig) in mine {
-                    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
+                    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::hover());
                     glass_chip(ui.painter(), row, R_CTRL, 0.45);
                     let p = ui.painter().with_clip_rect(row.shrink2(vec2(0.0, 0.0)));
-                    p.text(pos2(row.left() + 12.0, row.center().y), Align2::LEFT_CENTER, time, semi(13.0), accent());
-                    p.with_clip_rect(Rect::from_min_max(pos2(row.left() + 58.0, row.top()), pos2(row.right() - 34.0, row.bottom())))
-                        .text(pos2(row.left() + 58.0, row.center().y), Align2::LEFT_CENTER, text, FontId::proportional(13.0), fg());
+                    p.text(pos2(row.left() + 12.0, row.center().y), Align2::LEFT_CENTER, time, semi(14.5), accent());
+                    p.with_clip_rect(Rect::from_min_max(pos2(row.left() + 64.0, row.top()), pos2(row.right() - 34.0, row.bottom())))
+                        .text(pos2(row.left() + 64.0, row.center().y), Align2::LEFT_CENTER, text, FontId::proportional(14.5), fg());
                     let x = Rect::from_center_size(pos2(row.right() - 18.0, row.center().y), vec2(26.0, 26.0));
                     if *orig {
                         let resp = ui.interact(x, ui.id().with(("cal-del", *i, *ts)), Sense::click());
@@ -8029,7 +8040,7 @@ impl App {
                 // дела — в той же ленте: кружок отмечает сделанным, крестик удаляет
                 for &(k, late) in &day_todos {
                     let Some(t) = self.cfg.todos.get(k) else { continue };
-                    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
+                    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::hover());
                     glass_chip(ui.painter(), row, R_CTRL, if t.done { 0.25 } else { 0.45 });
                     let check = Rect::from_center_size(pos2(row.left() + 18.0, row.center().y), vec2(24.0, 24.0));
                     let cresp = ui.interact(check, ui.id().with(("cal-todo", k)), Sense::click()).on_hover_text(if t.done { "Вернуть" } else { "Сделано" });
@@ -8042,8 +8053,8 @@ impl App {
                     }
                     let tx = row.left() + 34.0;
                     let text_w = (row.right() - 34.0 - tx - if late { 74.0 } else { 0.0 }).max(20.0);
-                    let shown = elide(p, &t.text, FontId::proportional(13.0), text_w);
-                    let r = p.text(pos2(tx, row.center().y), Align2::LEFT_CENTER, &shown, FontId::proportional(13.0), if t.done { dim() } else { fg() });
+                    let shown = elide(p, &t.text, FontId::proportional(14.5), text_w);
+                    let r = p.text(pos2(tx, row.center().y), Align2::LEFT_CENTER, &shown, FontId::proportional(14.5), if t.done { dim() } else { fg() });
                     if t.done {
                         p.line_segment([pos2(r.left(), r.center().y), pos2(r.right(), r.center().y)], Stroke::new(1.0_f32, dim()));
                     }
@@ -8144,7 +8155,7 @@ impl App {
     /// Система → Монитор: четыре кольца — процессор, память, диск и батарея (или время работы).
     fn ui_system(&mut self, ui: &mut egui::Ui) {
         let s = self.stats.clone();
-        let blue = Color32::from_rgb(0x8F, 0xD3, 0xFF);
+        let blue = data2();
         let green = Color32::from_rgb(0x7B, 0xE0, 0x9A);
         let (d, h, m) = (s.uptime / 86400, s.uptime % 86400 / 3600, s.uptime % 3600 / 60);
         // название, доля, крупное значение, пояснение, цвет, краснеть ли при переполнении
@@ -8178,11 +8189,11 @@ impl App {
             let c = pos2(r.center().x, r.top() + 46.0);
             let hot = alarm && shown > 0.9;
             ring(ui.painter(), c, 30.0, 6.0, shown, if hot { Color32::from_rgb(0xFF, 0x6B, 0x6B) } else { color });
-            ui.painter().text(c, Align2::CENTER_CENTER, value, semi(14.0), fg());
-            ui.painter().text(pos2(c.x, r.top() + 96.0), Align2::CENTER_CENTER, name, semi(12.5), fg());
+            ui.painter().text(c, Align2::CENTER_CENTER, value, light(20.0), fg());
+            ui.painter().text(pos2(c.x, r.top() + 96.0), Align2::CENTER_CENTER, name, semi(13.5), fg());
             // диск почти полон — вместо «свободно …» подсказываем, что делать
             let (detail, dc) = if hot && name == "Диск C:" { (format!("{detail} · освободить"), Color32::from_rgb(0xFF, 0x9A, 0x8A)) } else { (detail, dim()) };
-            ui.painter().text(pos2(c.x, r.top() + 114.0), Align2::CENTER_CENTER, detail, FontId::proportional(11.5), dc);
+            ui.painter().text(pos2(c.x, r.top() + 114.0), Align2::CENTER_CENTER, detail, FontId::proportional(12.0), dc);
             if let Some((cmd, tip)) = target {
                 if resp.on_hover_text(tip).clicked() {
                     // диспетчер задач — полным путём из системной папки, а не по имени (по имени ищется сначала в текущей папке)
