@@ -38,22 +38,43 @@ const PILL_H: f32 = 36.0;
 const PANEL_W: f32 = 700.0;
 const ROW_H: f32 = 34.0;
 
-const FG: Color32 = Color32::from_rgb(250, 250, 252);
-const DIM: Color32 = Color32::from_rgb(196, 200, 212);
+/// Основной цвет текста выбранной темы.
+fn fg() -> Color32 {
+    let c = theme().fg;
+    Color32::from_rgb(c[0], c[1], c[2])
+}
+/// Второстепенный цвет текста выбранной темы.
+fn dim() -> Color32 {
+    let c = theme().dim;
+    Color32::from_rgb(c[0], c[1], c[2])
+}
 /// Тема оформления: название, цвет акцента и оттенок тёмного стекла.
 struct Theme {
     name: &'static str,
     accent: [u8; 3],
     glass: [u8; 3],
+    /// основной и второстепенный цвет текста
+    fg: [u8; 3],
+    dim: [u8; 3],
+    /// плоские карточки: без стеклянных бликов и обводок, блоки разделяет воздух
+    flat: bool,
 }
 
-const THEMES: [Theme; 6] = [
-    Theme { name: "Лаванда", accent: [185, 164, 255], glass: [11, 11, 20] },
-    Theme { name: "Океан", accent: [112, 198, 255], glass: [7, 13, 24] },
-    Theme { name: "Мята", accent: [118, 232, 182], glass: [7, 17, 15] },
-    Theme { name: "Закат", accent: [255, 158, 112], glass: [22, 11, 10] },
-    Theme { name: "Сакура", accent: [255, 152, 204], glass: [21, 9, 17] },
-    Theme { name: "Графит", accent: [226, 229, 236], glass: [13, 13, 14] },
+/// Номер тёплой темы «Кофе» в THEMES.
+const WARM_THEME: usize = 6;
+
+const COOL_FG: [u8; 3] = [250, 250, 252];
+const COOL_DIM: [u8; 3] = [196, 200, 212];
+
+const THEMES: [Theme; 7] = [
+    Theme { name: "Лаванда", accent: [185, 164, 255], glass: [11, 11, 20], fg: COOL_FG, dim: COOL_DIM, flat: false },
+    Theme { name: "Океан", accent: [112, 198, 255], glass: [7, 13, 24], fg: COOL_FG, dim: COOL_DIM, flat: false },
+    Theme { name: "Мята", accent: [118, 232, 182], glass: [7, 17, 15], fg: COOL_FG, dim: COOL_DIM, flat: false },
+    Theme { name: "Закат", accent: [255, 158, 112], glass: [22, 11, 10], fg: COOL_FG, dim: COOL_DIM, flat: false },
+    Theme { name: "Сакура", accent: [255, 152, 204], glass: [21, 9, 17], fg: COOL_FG, dim: COOL_DIM, flat: false },
+    Theme { name: "Графит", accent: [226, 229, 236], glass: [13, 13, 14], fg: COOL_FG, dim: COOL_DIM, flat: false },
+    // тёплый минимализм: кофейный корпус, кремовый текст, тёплый серый, терракотовый акцент, плоские блоки
+    Theme { name: "Кофе", accent: [226, 146, 92], glass: [27, 22, 18], fg: [244, 236, 224], dim: [172, 160, 145], flat: true },
 ];
 
 /// Номер выбранной темы. Цвета читают отовсюду, поэтому он общий.
@@ -291,7 +312,7 @@ fn badge_text(n: usize) -> String {
 }
 
 fn badge_w(ctx: &egui::Context, n: usize) -> f32 {
-    (ctx.fonts(|f| f.layout_no_wrap(badge_text(n), semi(11.5), FG).size().x) + 12.0).max(18.0)
+    (ctx.fonts(|f| f.layout_no_wrap(badge_text(n), semi(11.5), fg()).size().x) + 12.0).max(18.0)
 }
 
 /// «5 сообщений», «1 сообщение», «22 сообщения».
@@ -1445,6 +1466,15 @@ impl App {
         }
         let spot0 = if test_mode() { None } else { restore_spot(&cfg.spots) };
         cfg.world = sanitize_world(&cfg.world);
+        // разовый переход на тёплую тему «Кофе» у тех, кто не менял тему по умолчанию (0 — «Лаванда»);
+        // дальше выбор за человеком — отметка warm_offered больше не даст переключить
+        if !test_mode() && !cfg.warm_offered {
+            if cfg.theme == 0 {
+                cfg.theme = WARM_THEME as u8;
+            }
+            cfg.warm_offered = true;
+            cfg.save();
+        }
         THEME.store((cfg.theme as usize).min(THEMES.len() - 1), Ordering::Relaxed);
         if let Some(t) = std::env::var("OSTROVOK_THEME").ok().and_then(|v| v.parse::<usize>().ok()) {
             THEME.store(t.min(THEMES.len() - 1), Ordering::Relaxed);
@@ -3239,7 +3269,7 @@ impl App {
         if let Some(since) = self.net_down.filter(|s| s.elapsed() >= NET_ALARM) {
             v.push(Seg::Text(format!("\u{E701} нет сети · {}", fmt_gone(since.elapsed().as_secs())), Color32::from_rgb(0xFF, 0x6B, 0x61)));
             // только тревога и часы — рядом с треком пилюля переполнилась бы
-            v.push(Seg::Text(chrono::Local::now().format("%H:%M").to_string(), FG));
+            v.push(Seg::Text(chrono::Local::now().format("%H:%M").to_string(), fg()));
             return v;
         }
         let playing = self.media_now.as_ref().is_some_and(|m| m.playing);
@@ -3249,7 +3279,7 @@ impl App {
         if let Some(m) = self.media_now.as_ref().filter(|m| m.playing || self.hover_was) {
             v.push(Seg::Track(if m.artist.trim().is_empty() { m.title.clone() } else { format!("{} — {}", m.title, m.artist) }));
         }
-        v.push(Seg::Text(chrono::Local::now().format("%H:%M").to_string(), FG));
+        v.push(Seg::Text(chrono::Local::now().format("%H:%M").to_string(), fg()));
         // напоминание скоро — обратный отсчёт с колокольчиком
         let stamp = chrono::Local::now().timestamp();
         // за 15 минут и с началом текста: «12 мин · созвон» понятнее, чем просто «12 мин»
@@ -3289,7 +3319,7 @@ impl App {
                 Some((pct, snow)) => v.push(Seg::Text(format!("{} {pct}%", if snow { "❄" } else { "☂" }), Color32::from_rgb(0x8F, 0xCB, 0xFF))),
                 None => {
                     let (icon, _) = weather::describe(w.code);
-                    v.push(Seg::Text(format!("{icon} {}", weather::deg(w.temp)), DIM));
+                    v.push(Seg::Text(format!("{icon} {}", weather::deg(w.temp)), dim()));
                 }
             }
         }
@@ -3302,10 +3332,10 @@ impl App {
             w += match s {
                 Seg::Thumb => 20.0,
                 Seg::Eq => meter::EQ_W,
-                Seg::Track(t) => ctx.fonts(|f| f.layout_no_wrap(t.clone(), semi(13.0), FG).size().x).clamp(96.0, 170.0),
-                Seg::Text(t, _) => ctx.fonts(|f| f.layout_no_wrap(t.clone(), semi(13.5), FG).size().x),
+                Seg::Track(t) => ctx.fonts(|f| f.layout_no_wrap(t.clone(), semi(13.0), fg()).size().x).clamp(96.0, 170.0),
+                Seg::Text(t, _) => ctx.fonts(|f| f.layout_no_wrap(t.clone(), semi(13.5), fg()).size().x),
                 Seg::Badge(n, _) => badge_w(ctx, *n),
-                Seg::Battery(pct, _) => 25.0 + ctx.fonts(|f| f.layout_no_wrap(format!("{pct}%"), semi(12.5), FG).size().x),
+                Seg::Battery(pct, _) => 25.0 + ctx.fonts(|f| f.layout_no_wrap(format!("{pct}%"), semi(12.5), fg()).size().x),
             } + 10.0;
         }
         (w + 6.0).clamp(120.0, 520.0)
@@ -3467,7 +3497,7 @@ impl App {
             p.line_segment([pos2(cx - ex + size.x / 2.0, ey - 1.5), pos2(cx + ex - size.x / 2.0, ey - 1.5)], Stroke::new(1.0_f32, white));
         }
         if emo == Emotion::Sleepy {
-            p.text(pos2(o.x + 38.0, o.y + 2.0), Align2::CENTER_CENTER, "z", FontId::proportional(10.0), DIM);
+            p.text(pos2(o.x + 38.0, o.y + 2.0), Align2::CENTER_CENTER, "z", FontId::proportional(10.0), dim());
         }
     }
 
@@ -3541,7 +3571,7 @@ impl App {
                 }
                 Seg::Track(t) => {
                     // название трека; под курсором на его месте — кнопки управления
-                    let full = p.layout_no_wrap(t.clone(), semi(13.0), FG);
+                    let full = p.layout_no_wrap(t.clone(), semi(13.0), fg());
                     let w = full.size().x.clamp(96.0, 170.0);
                     let area = Rect::from_min_size(pos2(x, rect.top()), vec2(w, rect.height()));
                     if self.hover_was {
@@ -3553,7 +3583,7 @@ impl App {
                             if hov > 0.0 {
                                 p.circle_filled(hit.center(), 12.0, rgba(255, 255, 255, (36.0 * hov) as u8));
                             }
-                            p.text(hit.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(if k == 1 { 15.0 } else { 12.5 }), FG);
+                            p.text(hit.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(if k == 1 { 15.0 } else { 12.5 }), fg());
                             if resp.clicked() {
                                 let _ = self.media_tx.send(match k {
                                     0 => media::Cmd::Prev,
@@ -3575,7 +3605,7 @@ impl App {
                             0.0
                         };
                         let h = full.size().y;
-                        p.with_clip_rect(area.intersect(rect)).galley(pos2(x - shift, cy - h / 2.0), full, FG);
+                        p.with_clip_rect(area.intersect(rect)).galley(pos2(x - shift, cy - h / 2.0), full, fg());
                     }
                     x += w + 10.0;
                 }
@@ -3640,9 +3670,9 @@ impl App {
             let sel = ui.ctx().animate_bool_with_time(id.with("sel"), gi == current, 0.14);
             let hov = ui.ctx().animate_bool_with_time(id.with("hov"), resp.hovered(), 0.10);
             if sel > 0.0 || hov > 0.0 {
-                glass_chip(ui.painter(), r, 11.0, sel * 0.9 + hov * (1.0 - sel) * 0.4);
+                glass_chip(ui.painter(), r, R_CTRL, sel * 0.9 + hov * (1.0 - sel) * 0.4);
             }
-            ui.painter().text(r.center(), Align2::CENTER_CENTER, *glyph, FontId::proportional(15.0), mix(DIM, FG, sel.max(hov * 0.6)));
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, *glyph, FontId::proportional(15.0), mix(dim(), fg(), sel.max(hov * 0.6)));
             // повторный щелчок по своему разделу возвращает на его главную страницу
             if resp.clicked() && (gi != current || self.tab != pages[0].0) {
                 go = Some(pages[0].0);
@@ -3658,37 +3688,38 @@ impl App {
             let back = Rect::from_min_size(pos2(x - 4.0, row.top() + 2.0), vec2(26.0, 26.0));
             let bresp = ui.interact(back, ui.id().with("nav-back"), Sense::click()).on_hover_text(format!("Назад: {}", NAV[current].1));
             let bh = ui.ctx().animate_bool_with_time(bresp.id.with("hov"), bresp.hovered(), 0.10);
-            glass_chip(ui.painter(), back, 9.0, 0.35 + 0.5 * bh);
-            ui.painter().text(back.center(), Align2::CENTER_CENTER, "\u{E76B}", FontId::proportional(11.0), mix(DIM, FG, 0.5 + 0.5 * bh));
+            glass_chip(ui.painter(), back, R_CTRL, 0.35 + 0.5 * bh);
+            ui.painter().text(back.center(), Align2::CENTER_CENTER, "\u{E76B}", FontId::proportional(11.0), mix(dim(), fg(), 0.5 + 0.5 * bh));
             if bresp.clicked() {
                 go = Some(current_root);
             }
             let page = pages.iter().find(|p| p.0 == self.tab).map_or("", |p| p.1);
-            let r = ui.painter().text(pos2(back.right() + 9.0, mid), Align2::LEFT_CENTER, NAV[current].1, semi(13.0), DIM);
-            ui.painter().text(pos2(r.right() + 6.0, mid), Align2::LEFT_CENTER, format!("·  {page}"), semi(13.5), FG);
+            let r = ui.painter().text(pos2(back.right() + 9.0, mid), Align2::LEFT_CENTER, NAV[current].1, semi(13.0), dim());
+            ui.painter().text(pos2(r.right() + 6.0, mid), Align2::LEFT_CENTER, format!("·  {page}"), semi(13.5), fg());
         } else if tabs_row {
             for (t, name) in pages {
                 let id = ui.id().with(("page", *name));
-                let width = ui.painter().layout_no_wrap(name.to_string(), semi(13.0), FG).size().x + 18.0;
+                let width = ui.painter().layout_no_wrap(name.to_string(), semi(13.0), fg()).size().x + 18.0;
                 let r = Rect::from_min_size(pos2(x, row.top() + 2.0), vec2(width, 26.0));
                 let resp = ui.interact(r, id, Sense::click());
                 let sel = ui.ctx().animate_bool_with_time(id.with("sel"), self.tab == *t, 0.14);
                 let hov = ui.ctx().animate_bool_with_time(id.with("hov"), resp.hovered(), 0.10);
-                ui.painter().text(r.center(), Align2::CENTER_CENTER, *name, semi(13.0), mix(DIM, FG, sel.max(hov * 0.6)));
+                ui.painter().text(r.center(), Align2::CENTER_CENTER, *name, semi(13.0), mix(dim(), fg(), sel.max(hov * 0.6)));
                 if resp.clicked() {
                     go = Some(*t);
                 }
                 x += width;
             }
         } else {
-            ui.painter().text(pos2(x + 2.0, mid), Align2::LEFT_CENTER, NAV[current].1, semi(13.5), FG);
+            // на главной странице раздела название тише: раздел и так виден по подсвеченному значку
+            ui.painter().text(pos2(x + 2.0, mid), Align2::LEFT_CENTER, NAV[current].1, semi(13.0), mix(dim(), fg(), 0.45));
         }
         {
             let r = Rect::from_min_size(pos2(row.right() - 34.0, row.top()), vec2(34.0, 30.0));
             let resp = ui.interact(r, ui.id().with("search"), Sense::click()).on_hover_text(format!("Поиск · {}", self.hotkey_name));
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
-            glass_chip(ui.painter(), r, 11.0, 0.35 + 0.5 * hov);
-            ui.painter().text(r.center(), Align2::CENTER_CENTER, "\u{E721}", FontId::proportional(14.0), mix(DIM, FG, hov));
+            glass_chip(ui.painter(), r, R_CTRL, 0.35 + 0.5 * hov);
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, "\u{E721}", FontId::proportional(14.0), mix(dim(), fg(), hov));
             if resp.clicked() {
                 self.toggle_palette(ctx);
             }
@@ -3767,12 +3798,12 @@ impl App {
         // переключатель «Текст / Wi‑Fi» — две капсулы
         ui.horizontal(|ui| {
             for (wifi, label) in [(false, "\u{E8C1}  Текст"), (true, "\u{E701}  Wi‑Fi")] {
-                let w = ui.painter().layout_no_wrap(label.to_string(), semi(12.5), FG).size().x + 26.0;
+                let w = ui.painter().layout_no_wrap(label.to_string(), semi(12.5), fg()).size().x + 26.0;
                 let (r, resp) = ui.allocate_exact_size(vec2(w, 28.0), Sense::click());
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
                 let on = self.qr_wifi == wifi;
-                glass_chip(ui.painter(), r, 14.0, if on { 1.1 } else { 0.4 + 0.4 * hov });
-                ui.painter().text(r.center(), Align2::CENTER_CENTER, label, semi(12.5), if on { accent() } else { mix(DIM, FG, hov) });
+                glass_chip(ui.painter(), r, R_ROW, if on { 1.1 } else { 0.4 + 0.4 * hov });
+                ui.painter().text(r.center(), Align2::CENTER_CENTER, label, semi(12.5), if on { accent() } else { mix(dim(), fg(), hov) });
                 if resp.clicked() {
                     self.qr_wifi = wifi;
                 }
@@ -3782,14 +3813,14 @@ impl App {
         let wifi_text;
         let text: &str = if self.qr_wifi {
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.wifi_ssid).char_limit(1000).margin(egui::Margin::symmetric(9.0, 7.0)).hint_text(RichText::new("Сеть").color(DIM)).desired_width(150.0));
+                ui.add(egui::TextEdit::singleline(&mut self.wifi_ssid).char_limit(1000).margin(egui::Margin::symmetric(9.0, 7.0)).hint_text(RichText::new("Сеть").color(dim())).desired_width(150.0));
                 if self.wifi_secure {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.wifi_pass)
                             .char_limit(1000)
                             .password(!self.wifi_show)
                             .margin(egui::Margin::symmetric(9.0, 7.0))
-                            .hint_text(RichText::new("Пароль").color(DIM))
+                            .hint_text(RichText::new("Пароль").color(dim()))
                             .desired_width(150.0),
                     );
                     if jelly(ui, if self.wifi_show { "\u{ED1A}" } else { "\u{E7B3}" }).on_hover_text(if self.wifi_show { "Скрыть пароль" } else { "Показать пароль" }).clicked() {
@@ -3809,7 +3840,7 @@ impl App {
                     egui::TextEdit::singleline(&mut self.qr_text)
                         .char_limit(1000)
                         .margin(egui::Margin::symmetric(9.0, 7.0))
-                        .hint_text(RichText::new("Текст или ссылка").color(DIM))
+                        .hint_text(RichText::new("Текст или ссылка").color(dim()))
                         .desired_width(w),
                 );
                 if jelly(ui, "Из буфера").clicked() {
@@ -3853,15 +3884,15 @@ impl App {
                 // справа — что в коде и что с ним сделать
                 let side_r = Rect::from_min_max(pos2(sq.right() + 40.0, sq.top() + 6.0), pos2(area.right(), sq.bottom()));
                 let kind = qr_kind(text);
-                p.text(side_r.min, Align2::LEFT_TOP, kind, semi(14.0), FG);
+                p.text(side_r.min, Align2::LEFT_TOP, kind, semi(14.0), fg());
                 // у Wi‑Fi показываем только сеть и защиту — пароль на экран не выводим
                 let preview: String = if self.qr_wifi {
                     format!("Сеть «{}» · {}", self.wifi_ssid.trim().chars().take(32).collect::<String>(), if self.wifi_secure { "WPA" } else { "без пароля" })
                 } else {
                     text.chars().take(60).collect::<String>() + if text.chars().count() > 60 { "…" } else { "" }
                 };
-                p.with_clip_rect(side_r).text(side_r.min + vec2(0.0, 22.0), Align2::LEFT_TOP, preview, FontId::proportional(12.0), DIM);
-                p.text(side_r.min + vec2(0.0, 42.0), Align2::LEFT_TOP, format!("{n}×{n} точек · наводите камеру телефона"), FontId::proportional(11.5), DIM);
+                p.with_clip_rect(side_r).text(side_r.min + vec2(0.0, 22.0), Align2::LEFT_TOP, preview, FontId::proportional(12.0), dim());
+                p.text(side_r.min + vec2(0.0, 42.0), Align2::LEFT_TOP, format!("{n}×{n} точек · наводите камеру телефона"), FontId::proportional(11.5), dim());
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(side_r.min + vec2(0.0, 74.0), side_r.max)));
                 let (mut copy, mut save) = (false, false);
                 child.horizontal(|ui| {
@@ -3900,7 +3931,7 @@ impl App {
                 }
             }
             None => {
-                ui.painter().text(area.center(), Align2::CENTER_CENTER, "Текст слишком длинный для кода", FontId::proportional(13.5), DIM);
+                ui.painter().text(area.center(), Align2::CENTER_CENTER, "Текст слишком длинный для кода", FontId::proportional(13.5), dim());
             }
         }
     }
@@ -3913,13 +3944,13 @@ impl App {
             let t = ui.add(
                 egui::TextEdit::singleline(&mut self.remind_text)
                     .margin(egui::Margin::symmetric(9.0, 7.0))
-                    .hint_text(RichText::new("О чём напомнить").color(DIM))
+                    .hint_text(RichText::new("О чём напомнить").color(dim()))
                     .desired_width(w),
             );
             let r = ui.add(
                 egui::TextEdit::singleline(&mut self.remind_time)
                     .margin(egui::Margin::symmetric(9.0, 7.0))
-                    .hint_text(RichText::new("18:30 или +15").color(DIM))
+                    .hint_text(RichText::new("18:30 или +15").color(dim()))
                     .desired_width(110.0),
             );
             // Enter работает в обоих полях (раньше — только во времени, а в тексте просто терялся фокус)
@@ -3938,12 +3969,12 @@ impl App {
             ui.spacing_mut().item_spacing.x = 6.0;
             // «завтра 9:00» — точное время, а не «+N минут»: пока пишут текст, оно не уплывает на 9:03
             for (label, spec) in [("+5 мин", "+5".to_string()), ("+15 мин", "+15".into()), ("+1 час", "+60".into()), ("вечером 19:00", "19:00".into()), ("завтра 9:00", "завтра 9:00".into())] {
-                let w = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(12.0), FG).size().x + 20.0;
+                let w = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(12.0), fg()).size().x + 20.0;
                 let (r, resp) = ui.allocate_exact_size(vec2(w, 26.0), Sense::click());
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
                 let on = self.remind_time == spec;
-                glass_chip(ui.painter(), r, 13.0, if on { 1.1 } else { 0.4 + 0.5 * hov });
-                ui.painter().text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.0), if on { accent() } else { mix(DIM, FG, hov) });
+                glass_chip(ui.painter(), r, R_ROW, if on { 1.1 } else { 0.4 + 0.5 * hov });
+                ui.painter().text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.0), if on { accent() } else { mix(dim(), fg(), hov) });
                 if resp.clicked() {
                     self.remind_time = spec;
                     if !self.remind_text.trim().is_empty() {
@@ -3954,18 +3985,18 @@ impl App {
             // повтор: щелчок перебирает «без повтора → каждый день → по будням → каждую неделю»
             let on = self.remind_repeat != 0;
             let label = format!("\u{E8EE}  {}", repeat_name(self.remind_repeat));
-            let w = ui.painter().layout_no_wrap(label.clone(), FontId::proportional(12.0), FG).size().x + 20.0;
+            let w = ui.painter().layout_no_wrap(label.clone(), FontId::proportional(12.0), fg()).size().x + 20.0;
             let (r, resp) = ui.allocate_exact_size(vec2(w, 26.0), Sense::click());
             let resp = resp.on_hover_text("Повтор нового напоминания — щелчок меняет");
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
-            glass_chip(ui.painter(), r, 13.0, if on { 1.1 } else { 0.4 + 0.5 * hov });
-            ui.painter().text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.0), if on { accent() } else { mix(DIM, FG, hov) });
+            glass_chip(ui.painter(), r, R_ROW, if on { 1.1 } else { 0.4 + 0.5 * hov });
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.0), if on { accent() } else { mix(dim(), fg(), hov) });
             if resp.clicked() {
                 self.remind_repeat = (self.remind_repeat + 1) % 4;
             }
         });
         ui.add_space(2.0);
-        ui.label(RichText::new("Можно и из поиска: «напомни 18:30 позвонить» или «напомни через 15 мин чай».").color(DIM).size(11.5));
+        ui.label(RichText::new("Можно и из поиска: «напомни 18:30 позвонить» или «напомни через 15 мин чай».").color(dim()).size(11.5));
         if add {
             self.add_reminder();
         }
@@ -3976,7 +4007,7 @@ impl App {
             }
             for (i, r) in self.cfg.reminders.iter().enumerate() {
                 let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
-                glass_chip(ui.painter(), row, 10.0, 0.45);
+                glass_chip(ui.painter(), row, R_CTRL, 0.45);
                 let when = chrono::DateTime::from_timestamp(r.at, 0)
                     .map(|d| d.with_timezone(&chrono::Local).format("%d.%m  %H:%M").to_string())
                     .unwrap_or_default();
@@ -3990,10 +4021,10 @@ impl App {
                     p.galley(at, g, accent());
                 }
                 p.with_clip_rect(Rect::from_min_max(pos2(row.left() + 120.0, row.top()), pos2(text_end, row.bottom())))
-                    .text(pos2(row.left() + 120.0, row.center().y), Align2::LEFT_CENTER, &r.text, FontId::proportional(13.5), FG);
+                    .text(pos2(row.left() + 120.0, row.center().y), Align2::LEFT_CENTER, &r.text, FontId::proportional(13.5), fg());
                 let x = Rect::from_center_size(pos2(row.right() - 20.0, row.center().y), vec2(26.0, 26.0));
                 let resp = ui.interact(x, ui.id().with(("del-reminder", i)), Sense::click());
-                ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(12.0), if resp.hovered() { FG } else { DIM });
+                ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(12.0), if resp.hovered() { fg() } else { dim() });
                 if resp.clicked() {
                     remove = Some(i);
                 }
@@ -4050,7 +4081,7 @@ impl App {
             let r = ui.add(
                 egui::TextEdit::singleline(&mut self.todo_edit)
                     .margin(egui::Margin::symmetric(9.0, 7.0))
-                    .hint_text(RichText::new("Что сделать · «до пятницы», «завтра», «до 5.12»").color(DIM))
+                    .hint_text(RichText::new("Что сделать · «до пятницы», «завтра», «до 5.12»").color(dim()))
                     .desired_width(ui.available_width() - 112.0),
             );
             let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -4084,13 +4115,13 @@ impl App {
             let p = ui.painter().clone();
             let total = self.cfg.todos.len();
             let title = if left == 0 { "Всё сделано".to_string() } else { format!("Сделано {done} из {total}") };
-            let t = p.text(pos2(row.left() + 4.0, row.center().y), Align2::LEFT_CENTER, title, semi(13.5), if left == 0 { accent() } else { FG });
+            let t = p.text(pos2(row.left() + 4.0, row.center().y), Align2::LEFT_CENTER, title, semi(13.5), if left == 0 { accent() } else { fg() });
             let link_w = if done > 0 { 132.0 } else { 0.0 };
             if done > 0 {
                 let lr = Rect::from_min_max(pos2(row.right() - link_w, row.top()), row.max);
                 let resp = ui.interact(lr, ui.id().with("todo-clear"), Sense::click()).on_hover_text("Удалить отмеченные дела");
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
-                let g = p.text(pos2(row.right() - 4.0, row.center().y), Align2::RIGHT_CENTER, "убрать сделанные", FontId::proportional(12.5), mix(DIM, FG, hov));
+                let g = p.text(pos2(row.right() - 4.0, row.center().y), Align2::RIGHT_CENTER, "убрать сделанные", FontId::proportional(12.5), mix(dim(), fg(), hov));
                 if hov > 0.0 {
                     p.line_segment([pos2(g.left(), g.bottom()), pos2(g.right(), g.bottom())], Stroke::new(1.0_f32, rgba(255, 255, 255, (90.0 * hov) as u8)));
                 }
@@ -4127,10 +4158,10 @@ impl App {
                 let k = ui.ctx().animate_bool_with_time(ui.id().with(("todo-done", &item.text)), item.done, 0.16);
                 let p = ui.painter();
                 // сделанные карточки тише: меньше стекла
-                glass_chip(p, row, 12.0, (0.42 - 0.22 * k) + 0.45 * hov);
+                glass_chip(p, row, R_ROW, (0.42 - 0.22 * k) + 0.45 * hov);
                 let c = pos2(row.left() + 20.0, row.center().y);
                 let a = accent();
-                p.circle_stroke(c, 8.5, Stroke::new(1.5_f32, mix(DIM, a, k.max(hov * 0.6))));
+                p.circle_stroke(c, 8.5, Stroke::new(1.5_f32, mix(dim(), a, k.max(hov * 0.6))));
                 if k > 0.0 {
                     p.circle_filled(c, 8.5 * k, a);
                     p.text(c, Align2::CENTER_CENTER, "\u{E73E}", FontId::proportional(9.5), Color32::from_rgba_unmultiplied(16, 14, 28, (k * 255.0) as u8));
@@ -4138,8 +4169,8 @@ impl App {
                 // срок — капсула справа: просрочено красным, сегодня оранжевым, остальное тихо
                 let mut text_end = row.right() - 34.0;
                 if let Some((label, level)) = &due {
-                    let col = if item.done { DIM } else {
-                        match level { 2 => Color32::from_rgb(0xFF, 0x6B, 0x6B), 1 => Color32::from_rgb(0xFF, 0xB3, 0x40), _ => mix(DIM, FG, 0.35) }
+                    let col = if item.done { dim() } else {
+                        match level { 2 => Color32::from_rgb(0xFF, 0x6B, 0x6B), 1 => Color32::from_rgb(0xFF, 0xB3, 0x40), _ => mix(dim(), fg(), 0.35) }
                     };
                     let g = p.layout_no_wrap(label.clone(), FontId::proportional(11.5), col);
                     let cap = Rect::from_min_size(pos2(text_end - g.size().x - 18.0, row.center().y - 10.0), vec2(g.size().x + 18.0, 20.0));
@@ -4150,15 +4181,15 @@ impl App {
                 }
                 let text = p
                     .with_clip_rect(Rect::from_min_max(pos2(row.left() + 40.0, row.top()), pos2(text_end, row.bottom())))
-                    .text(pos2(row.left() + 40.0, row.center().y), Align2::LEFT_CENTER, &item.text, FontId::proportional(13.5), mix(FG, DIM, k));
+                    .text(pos2(row.left() + 40.0, row.center().y), Align2::LEFT_CENTER, &item.text, FontId::proportional(13.5), mix(fg(), dim(), k));
                 if k > 0.0 {
                     let end = text.left() + text.width().min(text_end - text.left()) * k;
-                    p.line_segment([pos2(text.left(), row.center().y + 1.0), pos2(end, row.center().y + 1.0)], Stroke::new(1.2_f32, DIM));
+                    p.line_segment([pos2(text.left(), row.center().y + 1.0), pos2(end, row.center().y + 1.0)], Stroke::new(1.2_f32, dim()));
                 }
                 let x = Rect::from_center_size(pos2(row.right() - 16.0, row.center().y), vec2(24.0, 24.0));
                 let del = ui.interact(x, ui.id().with(("todo-del", i)), Sense::click());
                 if hov > 0.0 || del.hovered() {
-                    ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(11.0), if del.hovered() { FG } else { DIM });
+                    ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(11.0), if del.hovered() { fg() } else { dim() });
                 }
                 if del.clicked() {
                     remove = Some(i);
@@ -4189,7 +4220,7 @@ impl App {
         ui.horizontal(|ui| {
             let w = (ui.available_width() - 120.0).max(80.0);
             ui.allocate_ui_with_layout(vec2(w, 30.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.add(egui::Label::new(RichText::new("Щелчок — открыть, правый — показать в папке, можно вытащить мышью").color(DIM).size(12.5)).truncate());
+                ui.add(egui::Label::new(RichText::new("Щелчок — открыть, правый — показать в папке, можно вытащить мышью").color(dim()).size(12.5)).truncate());
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if jelly(ui, "Очистить").clicked() {
@@ -4257,11 +4288,11 @@ impl App {
                         }
                         (None, Some(tex)) if size.is_some() => rounded_image(ui.painter(), tex, icon_r, 0.0),
                         _ => {
-                            ui.painter().text(icon_r.center(), Align2::CENTER_CENTER, "\u{E7C3}", FontId::proportional(26.0), DIM);
+                            ui.painter().text(icon_r.center(), Align2::CENTER_CENTER, "\u{E7C3}", FontId::proportional(26.0), dim());
                         }
                     }
                     let short: String = if name.chars().count() > 15 { name.chars().take(14).collect::<String>() + "…" } else { name.to_string() };
-                    ui.painter().text(pos2(cell.center().x, cell.top() + 62.0), Align2::CENTER_CENTER, short, semi(11.5), if size.is_some() { FG } else { DIM });
+                    ui.painter().text(pos2(cell.center().x, cell.top() + 62.0), Align2::CENTER_CENTER, short, semi(11.5), if size.is_some() { fg() } else { dim() });
                     let info = match size {
                         None => "файл не найден".to_string(),
                         Some(u64::MAX) => "папка".to_string(),
@@ -4269,13 +4300,13 @@ impl App {
                         Some(b) if b >= 1 << 20 => format!("{:.1} МБ", b as f64 / (1u64 << 20) as f64).replace('.', ","),
                         Some(b) => format!("{} КБ", (b / 1024).max(1)),
                     };
-                    ui.painter().text(pos2(cell.center().x, cell.top() + 79.0), Align2::CENTER_CENTER, info, FontId::proportional(10.5), DIM);
+                    ui.painter().text(pos2(cell.center().x, cell.top() + 79.0), Align2::CENTER_CENTER, info, FontId::proportional(10.5), dim());
                     // крестик в углу появляется под курсором
                     let x = Rect::from_center_size(pos2(cell.right() - 14.0, cell.top() + 14.0), vec2(22.0, 22.0));
                     let del = ui.interact(x, ui.id().with(("del-shelf", i)), Sense::click());
                     if hov > 0.0 || del.hovered() {
                         ui.painter().circle_filled(x.center(), 9.0, rgba(255, 255, 255, if del.hovered() { 60 } else { 26 }));
-                        ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(9.5), FG);
+                        ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(9.5), fg());
                     }
                     if del.clicked() {
                         remove = Some(i);
@@ -4421,15 +4452,16 @@ impl App {
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
             let down = ui.ctx().animate_bool_with_time(resp.id.with("down"), resp.is_pointer_button_down_on(), 0.06);
             let p = ui.painter();
-            glass_chip(p, r.shrink(down), 16.0, 0.5 + 0.5 * hov);
+            glass_chip(p, r.shrink(down), R_CARD, 0.5 + 0.5 * hov);
             let tone = Color32::from_rgb(col[0], col[1], col[2]);
             let ic = pos2(r.left() + 26.0, r.top() + 24.0 - 1.5 * hov);
-            p.circle_filled(ic, 14.0 + hov, rgba(col[0], col[1], col[2], (40.0 + 36.0 * hov) as u8));
-            p.text(ic, Align2::CENTER_CENTER, *glyph, FontId::proportional(14.0), tone);
+            // подложка нейтральная, цвет — у знака и приглушён; при наведении проявляется (раньше — радуга подложек)
+            p.circle_filled(ic, 14.0 + hov, mix_a(rgba(255, 255, 255, 18), rgba(col[0], col[1], col[2], 70), hov));
+            p.text(ic, Align2::CENTER_CENTER, *glyph, FontId::proportional(14.0), mix(mix(tone, fg(), 0.45), tone, hov));
             let text_w = r.width() - 24.0;
-            p.text(pos2(r.left() + 12.0, r.bottom() - 26.0), Align2::LEFT_CENTER, elide(p, title, semi(12.5), text_w), semi(12.5), FG);
-            let sub = elide(p, sub, FontId::proportional(11.0), text_w);
-            p.text(pos2(r.left() + 12.0, r.bottom() - 11.0), Align2::LEFT_CENTER, sub, FontId::proportional(11.0), if *live { tone } else { DIM });
+            p.text(pos2(r.left() + 14.0, r.bottom() - 28.0), Align2::LEFT_CENTER, elide(p, title, semi(14.0), text_w), semi(14.0), fg());
+            let sub = elide(p, sub, FontId::proportional(12.0), text_w);
+            p.text(pos2(r.left() + 14.0, r.bottom() - 12.0), Align2::LEFT_CENTER, sub, FontId::proportional(12.0), if *live { tone } else { mix(dim(), BG, 0.1) });
             if *live {
                 // «живая» плитка: точка в углу — там сейчас что-то происходит
                 p.circle_filled(pos2(r.right() - 14.0, r.top() + 14.0), 3.5, tone);
@@ -4451,21 +4483,22 @@ impl App {
     fn home_agenda(&mut self, ui: &mut egui::Ui, p: &egui::Painter, r: Rect) {
         let resp = ui.interact(r, ui.id().with("home-agenda"), Sense::click()).on_hover_text("Открыть «День»");
         let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
-        glass_chip(p, r, 20.0, 0.6 + 0.4 * hov);
+        glass_chip(p, r, R_CARD, 0.6 + 0.4 * hov);
         let rows = agenda_rows(&self.cfg.reminders, &self.cfg.todos, chrono::Local::now().naive_local(), 3);
-        let clip = p.with_clip_rect(r.shrink2(vec2(12.0, 0.0)));
-        clip.text(r.min + vec2(16.0, 12.0), Align2::LEFT_TOP, "ДАЛЬШЕ", semi(11.0), DIM);
+        let clip = p.with_clip_rect(r.shrink2(vec2(14.0, 0.0)));
+        clip.text(r.min + vec2(18.0, 12.0), Align2::LEFT_TOP, "ДАЛЬШЕ", semi(11.0), mix(dim(), BG, 0.15));
         if rows.is_empty() {
-            clip.text(r.min + vec2(16.0, 36.0), Align2::LEFT_TOP, "День свободен", semi(15.0), FG);
-            clip.text(r.min + vec2(16.0, 60.0), Align2::LEFT_TOP, "В поиске: «напомни 18:30 …» или «дело …»", FontId::proportional(11.5), DIM);
+            clip.text(r.min + vec2(18.0, 34.0), Align2::LEFT_TOP, "День свободен", semi(19.0), fg());
+            clip.text(r.min + vec2(18.0, 64.0), Align2::LEFT_TOP, "Напишите в поиске «напомни 18:30 …» или «дело …»", FontId::proportional(13.0), dim());
         } else {
+            // время — отдельной колонкой одной ширины, текст — крупно и ровно
+            let col = rows.iter().map(|(w, _, _)| p.layout_no_wrap(w.clone(), semi(14.0), fg()).size().x).fold(44.0f32, f32::max);
             for (i, (when, text, soon)) in rows.iter().enumerate() {
-                let y = r.top() + 38.0 + i as f32 * 20.0;
-                let lead = p.layout_no_wrap(when.clone(), semi(12.0), FG).size().x;
-                clip.text(pos2(r.left() + 16.0, y), Align2::LEFT_CENTER, when, semi(12.0), if *soon { accent() } else { DIM });
-                let x = r.left() + 16.0 + lead.max(38.0) + 8.0;
-                let t = elide(p, text, FontId::proportional(12.5), r.right() - 14.0 - x);
-                clip.text(pos2(x, y), Align2::LEFT_CENTER, t, FontId::proportional(12.5), FG);
+                let y = r.top() + 42.0 + i as f32 * 22.0;
+                clip.text(pos2(r.left() + 18.0, y), Align2::LEFT_CENTER, when, semi(14.0), if *soon { accent() } else { mix(dim(), fg(), 0.3) });
+                let x = r.left() + 18.0 + col + 14.0;
+                let t = elide(p, text, FontId::proportional(14.5), r.right() - 16.0 - x);
+                clip.text(pos2(x, y), Align2::LEFT_CENTER, t, FontId::proportional(14.5), fg());
             }
         }
         if resp.clicked() {
@@ -4498,13 +4531,13 @@ impl App {
         };
         let resp = ui.interact(r, ui.id().with("home-live"), Sense::click());
         let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
-        glass_chip(p, r, 16.0, 0.55 + 0.45 * hov);
+        glass_chip(p, r, R_CARD, 0.55 + 0.45 * hov);
         let c = pos2(r.left() + 25.0, r.center().y);
         p.circle_filled(c, 14.0, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 46));
         p.text(c, Align2::CENTER_CENTER, glyph, FontId::proportional(14.0), color);
         let w = r.right() - 12.0 - (r.left() + 48.0);
-        p.text(pos2(r.left() + 48.0, r.center().y - 8.0), Align2::LEFT_CENTER, elide(p, &title, semi(12.5), w), semi(12.5), FG);
-        p.text(pos2(r.left() + 48.0, r.center().y + 9.0), Align2::LEFT_CENTER, elide(p, &sub, FontId::proportional(11.5), w), FontId::proportional(11.5), DIM);
+        p.text(pos2(r.left() + 48.0, r.center().y - 8.0), Align2::LEFT_CENTER, elide(p, &title, semi(12.5), w), semi(12.5), fg());
+        p.text(pos2(r.left() + 48.0, r.center().y + 9.0), Align2::LEFT_CENTER, elide(p, &sub, FontId::proportional(11.5), w), FontId::proportional(11.5), dim());
         if resp.clicked() {
             self.tab = go;
         }
@@ -4521,74 +4554,56 @@ impl App {
         }
         let p = ui.painter().clone();
 
-        // ── верхний ряд: «сейчас», музыка, погода
-        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 100.0), Sense::hover());
-        let now_r = Rect::from_min_size(row.min, vec2(190.0, row.height()));
-        let weather_r = Rect::from_min_max(pos2(row.right() - 150.0, row.top()), row.max);
-        let music_r = Rect::from_min_max(pos2(now_r.right() + 8.0, row.top()), pos2(weather_r.left() - 8.0, row.bottom()));
-
+        // ── шапка «Сейчас»: крупное время и погода без карточек — один главный акцент на экране.
+        // Раньше здесь стояли три коробки одинакового веса (часы, музыка, погода), и глазу не за что
+        // было зацепиться; теперь время — самое крупное, погода — вторая, всё остальное ниже.
+        let (hero, _) = ui.allocate_exact_size(vec2(ui.available_width(), 80.0), Sense::hover());
         {
-            let resp = ui.interact(now_r, ui.id().with("home-now"), Sense::click());
-            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
-            glass_chip(&p, now_r, 20.0, 0.6 + 0.4 * hov);
-            let t = chrono::Local::now();
-            // небо за часами: рассвет, день, закат или ночь со звёздами — по восходу и закату из погоды
-            {
-                let hm = |s: &str| s.split_once(':').and_then(|(h, m)| Some(h.trim().parse::<f32>().ok()? + m.trim().parse::<f32>().ok()? / 60.0));
-                let rise = self.weather.as_ref().and_then(|w| hm(&w.sunrise)).unwrap_or(7.0);
-                let set = self.weather.as_ref().and_then(|w| hm(&w.sunset)).unwrap_or(18.0);
-                use chrono::Timelike;
-                // час считаем во времени города: восход и закат приходят в его поясе
-                let city_t = match &self.weather {
-                    Some(w) => chrono::Utc::now().naive_utc() + chrono::Duration::seconds(w.utc_offset as i64),
-                    None => t.naive_local(),
-                };
-                let mut h = city_t.hour() as f32 + city_t.minute() as f32 / 60.0;
-                if test_mode() {
-                    if let Some(v) = std::env::var("OSTROVOK_HOUR").ok().and_then(|v| v.parse::<f32>().ok()) {
-                        h = v;
-                    }
-                }
-                let (top, low) = sky_colors(day_phase(h, rise, set));
-                gradient_rrect(&p, now_r.shrink(1.0), 19.0, |q| {
-                    let k = ((q.y - now_r.top()) / now_r.height()).clamp(0.0, 1.0);
-                    let side = ((q.x - now_r.left()) / now_r.width()).clamp(0.0, 1.0);
-                    mix_a(top, low, k * 0.8 + side * 0.2)
-                });
-                if day_phase(h, rise, set) == 3 {
-                    for (i, (x, y)) in [(0.70, 0.18), (0.82, 0.30), (0.90, 0.14), (0.62, 0.36), (0.77, 0.52), (0.93, 0.44), (0.55, 0.12)].into_iter().enumerate() {
-                        let at = now_r.min + vec2(now_r.width() * x, now_r.height() * y);
-                        p.circle_filled(at, if i % 3 == 0 { 1.4 } else { 0.9 }, rgba(255, 255, 255, if i % 2 == 0 { 170 } else { 110 }));
-                    }
-                }
-            }
             const DAYS: [&str; 7] = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"];
             const MONTHS: [&str; 12] = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
-            p.text(now_r.min + vec2(16.0, 6.0), Align2::LEFT_TOP, t.format("%H:%M").to_string(), light(38.0), FG);
+            let t = chrono::Local::now();
+            let time_r = Rect::from_min_size(hero.min, vec2(hero.width() * 0.55, hero.height()));
+            let resp = ui.interact(time_r, ui.id().with("home-now"), Sense::click()).on_hover_text("Открыть «День»");
+            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+            p.text(hero.min + vec2(2.0, -6.0), Align2::LEFT_TOP, t.format("%H:%M").to_string(), light(52.0), fg());
             let date = format!("{}, {} {}", DAYS[t.weekday().num_days_from_monday() as usize], t.day(), MONTHS[t.month0() as usize]);
-            p.text(now_r.min + vec2(17.0, 54.0), Align2::LEFT_TOP, date, FontId::proportional(12.5), FG);
-            // ближайшее дело: таймер или напоминание
-            let stamp = t.timestamp();
-            let next = self.cfg.reminders.iter().filter(|r| r.at > stamp).min_by_key(|r| r.at);
-            let todo_left = self.cfg.todos.iter().filter(|t| !t.done).count();
-            // строка «что дальше» — только когда карточку «Дальше» заменил плеер; таймер здесь не повторяем,
-            // он и так в живой карточке и в капле пилюли
-            let (line, color) = if self.media_now.is_none() {
-                (String::new(), DIM)
-            } else if let Some(r) = next {
-                let mins = (r.at - stamp) / 60;
-                let when = if mins < 60 { format!("через {} мин", mins.max(1)) } else if mins < 1440 { format!("через {} ч", mins / 60) } else { format!("через {} д", mins / 1440) };
-                (format!("\u{E823}  {when} · {}", r.text), accent())
-            } else if todo_left > 0 {
-                (format!("\u{E73E}  дел в списке: {todo_left}"), accent())
-            } else {
-                ("\u{E823}  дел на сегодня нет".to_string(), DIM)
-            };
-            p.with_clip_rect(now_r.shrink2(vec2(12.0, 0.0))).text(now_r.min + vec2(17.0, 75.0), Align2::LEFT_TOP, line, FontId::proportional(11.5), color);
+            p.text(hero.min + vec2(4.0, 60.0), Align2::LEFT_TOP, date, FontId::proportional(14.0), mix(dim(), fg(), 0.35 + 0.5 * hov));
             if resp.clicked() {
-                self.tab = if self.timer_end.is_some() { Tab::Timer } else if next.is_some() { Tab::Remind } else if todo_left > 0 { Tab::Todo } else { Tab::Calendar };
+                self.tab = Tab::Calendar;
+            }
+            // погода справа, тем же языком: крупная цифра, под ней одна строка
+            let wr = Rect::from_min_max(pos2(hero.right() - 240.0, hero.top()), hero.max);
+            let wresp = ui.interact(wr, ui.id().with("home-weather"), Sense::click());
+            let whov = ui.ctx().animate_bool_with_time(wresp.id.with("hov"), wresp.hovered(), 0.12);
+            match &self.weather {
+                Some(w) => {
+                    let (icon, text) = weather::describe(w.code);
+                    p.text(pos2(hero.right() - 2.0, hero.top() + 2.0), Align2::RIGHT_TOP, format!("{icon}  {}", weather::deg(w.temp)), light(36.0), fg());
+                    let city_hour = {
+                        use chrono::Timelike;
+                        (chrono::Utc::now().naive_utc() + chrono::Duration::seconds(w.utc_offset as i64)).hour()
+                    };
+                    // дождь скоро — важнее описания
+                    let (line, col) = match rain_soon(&w.hours, city_hour) {
+                        Some((pct, snow)) => (format!("{} ~{pct}% в ближ. час", if snow { "❄ снег" } else { "☂ дождь" }), Color32::from_rgb(0x8F, 0xCB, 0xFF)),
+                        None => (text.to_string(), mix(dim(), fg(), 0.35 + 0.5 * whov)),
+                    };
+                    p.text(pos2(hero.right() - 2.0, hero.top() + 60.0), Align2::RIGHT_TOP, line, FontId::proportional(14.0), col);
+                }
+                None => {
+                    let city_set = self.cfg.lat.is_some();
+                    let (head, _) = weather::empty_text(city_set, self.weather_err.as_deref());
+                    p.text(pos2(hero.right() - 2.0, hero.top() + 14.0), Align2::RIGHT_TOP, "Погода", semi(16.0), fg());
+                    p.text(pos2(hero.right() - 2.0, hero.top() + 40.0), Align2::RIGHT_TOP, if city_set { head } else { "укажите город" }, FontId::proportional(13.0), dim());
+                }
+            }
+            if wresp.clicked() {
+                self.tab = if self.weather.is_some() { Tab::Weather } else { Tab::Settings };
             }
         }
+        ui.add_space(4.0);
+        // широкая карточка: плеер или «Дальше» — во всю ширину, крупным шрифтом
+        let (music_r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 100.0), Sense::hover());
 
         // средняя карточка по ситуации: есть плеер (Spotify, браузер…) — плеер, иначе «Дальше».
         // Просто звук (голос в Discord, игра) плеер не включает: раньше карточка показывала пустую
@@ -4596,7 +4611,7 @@ impl App {
         if self.media_now.is_none() {
             self.home_agenda(ui, &p, music_r);
         } else {
-        glass_chip(&p, music_r, 20.0, 0.6);
+        glass_chip(&p, music_r, R_CARD, 0.6);
         let art = Rect::from_min_size(music_r.min + vec2(12.0, 12.0), vec2(76.0, 76.0));
         match &self.thumb {
             Some(t) => rounded_image(&p, t, art, 14.0),
@@ -4604,7 +4619,7 @@ impl App {
                 Some(m) => art_placeholder(&p, art, 14.0, &m.title, 26.0),
                 None => {
                     p.rect_filled(art, Rounding::same(14.0), tint(20));
-                    p.text(art.center(), Align2::CENTER_CENTER, "\u{E8D6}", FontId::proportional(24.0), DIM);
+                    p.text(art.center(), Align2::CENTER_CENTER, "\u{E8D6}", FontId::proportional(24.0), dim());
                 }
             },
         }
@@ -4617,14 +4632,14 @@ impl App {
                 let text = p.with_clip_rect(Rect::from_min_max(pos2(x, music_r.top()), pos2(music_r.right() - 12.0, music_r.bottom())));
                 let at = if m.playing { m.pos + m.at.elapsed().as_secs_f64() } else { m.pos };
                 let lyric = self.lyrics.iter().rev().find(|l| l.0 <= at).map(|l| l.1.clone());
-                text.text(pos2(x, music_r.top() + 13.0), Align2::LEFT_TOP, &m.title, semi(14.0), FG);
+                text.text(pos2(x, music_r.top() + 12.0), Align2::LEFT_TOP, elide(&text, &m.title, semi(17.0), music_r.right() - 26.0 - x), semi(17.0), fg());
                 match lyric {
-                    Some(line) => text.text(pos2(x, music_r.top() + 33.0), Align2::LEFT_TOP, line, FontId::proportional(12.0), accent()),
-                    None => text.text(pos2(x, music_r.top() + 33.0), Align2::LEFT_TOP, &m.artist, FontId::proportional(12.0), DIM),
+                    Some(line) => text.text(pos2(x, music_r.top() + 36.0), Align2::LEFT_TOP, line, FontId::proportional(13.5), accent()),
+                    None => text.text(pos2(x, music_r.top() + 36.0), Align2::LEFT_TOP, &m.artist, FontId::proportional(13.5), dim()),
                 };
                 if m.dur > 0.0 {
-                    let accent = self.album.map_or(FG, |c| Color32::from_rgb(c[0], c[1], c[2]));
-                    let track = Rect::from_min_max(pos2(x, music_r.top() + 56.0), pos2(music_r.right() - 14.0, music_r.top() + 60.0));
+                    let accent = self.album.map_or(fg(), |c| Color32::from_rgb(c[0], c[1], c[2]));
+                    let track = Rect::from_min_max(pos2(x, music_r.top() + 62.0), pos2(music_r.right() - 16.0, music_r.top() + 65.0));
                     p.rect_filled(track, Rounding::same(2.0), rgba(255, 255, 255, 0x2A));
                     let done = Rect::from_min_max(track.min, pos2(track.left() + track.width() * media::track_frac(at, 0.0, m.dur, false), track.bottom()));
                     p.rect_filled(done, Rounding::same(2.0), accent);
@@ -4637,7 +4652,7 @@ impl App {
                     if hov > 0.0 {
                         p.circle_filled(hit.center(), 14.0, rgba(255, 255, 255, (30.0 * hov) as u8));
                     }
-                    p.text(hit.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(if cmd == 1 { 16.0 } else { 13.0 }), FG);
+                    p.text(hit.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(if cmd == 1 { 16.0 } else { 13.0 }), fg());
                     if resp.clicked() {
                         let _ = self.media_tx.send(match cmd {
                             0 => media::Cmd::Prev,
@@ -4649,7 +4664,7 @@ impl App {
             }
             None => {
                 if self.sound_on() {
-                    p.text(pos2(x, music_r.top() + 16.0), Align2::LEFT_TOP, "Играет звук", semi(14.0), FG);
+                    p.text(pos2(x, music_r.top() + 16.0), Align2::LEFT_TOP, "Играет звук", semi(14.0), fg());
                     let strip = Rect::from_min_max(pos2(x, music_r.top() + 38.0), pos2(music_r.right() - 16.0, music_r.bottom() - 14.0));
                     spectrum(&p, strip, &self.bars, accent(), 0.8, 1.0);
                 }
@@ -4657,53 +4672,6 @@ impl App {
         }
         }
 
-        let wresp = ui.interact(weather_r, ui.id().with("home-weather"), Sense::click());
-        let whov = ui.ctx().animate_bool_with_time(wresp.id.with("hov"), wresp.hovered(), 0.12);
-        glass_chip(&p, weather_r, 20.0, 0.6 + 0.4 * whov);
-        match &self.weather {
-            Some(w) => {
-                let (icon, text) = weather::describe(w.code);
-                // свечение в верхнем правом углу — цвета погоды
-                let tc = weather::tint(w.code);
-                let glow = Color32::from_rgba_unmultiplied(tc[0], tc[1], tc[2], 52);
-                let corner = weather_r.right_top();
-                let reach = weather_r.width().max(weather_r.height());
-                gradient_rrect(&p, weather_r.shrink(1.0), 19.0, |q| {
-                    let d = ((q - corner).length() / reach).clamp(0.0, 1.0);
-                    mix_a(glow, Color32::TRANSPARENT, d)
-                });
-                let clip = p.with_clip_rect(weather_r.shrink2(vec2(10.0, 0.0)));
-                clip.text(weather_r.min + vec2(16.0, 8.0), Align2::LEFT_TOP, format!("{icon} {}", weather::deg(w.temp)), light(30.0), FG);
-                clip.text(weather_r.min + vec2(17.0, 54.0), Align2::LEFT_TOP, text, FontId::proportional(12.5), FG);
-                // дождь скоро — важнее названия города
-                // час — во времени города: прогноз приходит в его поясе
-                let city_hour = {
-                    use chrono::Timelike;
-                    (chrono::Utc::now().naive_utc() + chrono::Duration::seconds(w.utc_offset as i64)).hour()
-                };
-                match rain_soon(&w.hours, city_hour) {
-                    Some((pct, snow)) => clip.text(
-                        weather_r.min + vec2(17.0, 75.0),
-                        Align2::LEFT_TOP,
-                        if snow { format!("❄ снег ~{pct}% в ближ. час") } else { format!("☂ дождь ~{pct}% в ближ. час") },
-                        FontId::proportional(11.5),
-                        Color32::from_rgb(0x8F, 0xCB, 0xFF),
-                    ),
-                    None => clip.text(weather_r.min + vec2(17.0, 75.0), Align2::LEFT_TOP, &w.city, FontId::proportional(11.5), DIM),
-                };
-            }
-            None => {
-                let city_set = self.cfg.lat.is_some();
-                let (head, _) = weather::empty_text(city_set, self.weather_err.as_deref());
-                let sub = if city_set { head } else { "укажите город" };
-                p.text(weather_r.min + vec2(16.0, 30.0), Align2::LEFT_TOP, "Погода", semi(14.0), FG);
-                let clip = p.with_clip_rect(weather_r.shrink2(vec2(10.0, 0.0)));
-                clip.text(weather_r.min + vec2(16.0, 51.0), Align2::LEFT_TOP, sub, FontId::proportional(12.0), DIM);
-            }
-        }
-        if wresp.clicked() {
-            self.tab = if self.weather.is_some() { Tab::Weather } else { Tab::Settings };
-        }
 
         // ── состояние компьютера: два кольца, громкость и микрофон
         let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 50.0), Sense::hover());
@@ -4719,7 +4687,7 @@ impl App {
             let r = cell(k as f32, 1.0);
             let resp = ui.interact(r, ui.id().with(("gauge", k)), Sense::click());
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
-            glass_chip(&p, r, 16.0, 0.5 + 0.5 * hov);
+            glass_chip(&p, r, R_CARD, 0.5 + 0.5 * hov);
             let c = pos2(r.left() + 26.0, r.center().y);
             let shown = ui.ctx().animate_value_with_time(resp.id.with("v"), frac.clamp(0.0, 1.0), 0.5);
             let color = if shown > 0.9 { Color32::from_rgb(0xFF, 0x6B, 0x6B) } else if k == 0 { Color32::from_rgb(0x8F, 0xD3, 0xFF) } else { accent() };
@@ -4732,26 +4700,26 @@ impl App {
                 })
                 .collect();
             p.add(egui::Shape::line(arc, Stroke::new(3.5_f32, color)));
-            p.text(pos2(r.left() + 50.0, r.center().y - 8.0), Align2::LEFT_CENTER, name, semi(12.5), FG);
-            p.text(pos2(r.left() + 50.0, r.center().y + 9.0), Align2::LEFT_CENTER, value, FontId::proportional(11.5), DIM);
+            p.text(pos2(r.left() + 50.0, r.center().y - 8.0), Align2::LEFT_CENTER, name, semi(12.5), fg());
+            p.text(pos2(r.left() + 50.0, r.center().y + 9.0), Align2::LEFT_CENTER, value, FontId::proportional(11.5), dim());
             if resp.clicked() {
                 self.tab = Tab::System;
             }
         }
         {
             let r = cell(2.0, 1.0);
-            glass_chip(&p, r, 16.0, 0.5);
+            glass_chip(&p, r, R_CARD, 0.5);
             match self.vol {
                 Some((level, muted)) => {
                     let icon = Rect::from_center_size(pos2(r.left() + 24.0, r.center().y), vec2(30.0, 30.0));
                     let resp = ui.interact(icon, ui.id().with("home-mute"), Sense::click()).on_hover_text(if muted { "Включить звук" } else { "Выключить звук" });
-                    p.text(icon.center(), Align2::CENTER_CENTER, if muted { "\u{E74F}" } else { "\u{E767}" }, FontId::proportional(17.0), if muted { DIM } else { accent() });
+                    p.text(icon.center(), Align2::CENTER_CENTER, if muted { "\u{E74F}" } else { "\u{E767}" }, FontId::proportional(17.0), if muted { dim() } else { accent() });
                     if resp.clicked() {
                         sys::set_mute(!muted);
                         self.vol = Some((level, !muted));
                     }
-                    p.text(pos2(r.left() + 46.0, r.center().y - 8.0), Align2::LEFT_CENTER, "Громкость", semi(12.5), FG);
-                    p.text(pos2(r.right() - 13.0, r.center().y - 8.0), Align2::RIGHT_CENTER, format!("{:.0}%", level * 100.0), FontId::proportional(11.5), DIM);
+                    p.text(pos2(r.left() + 46.0, r.center().y - 8.0), Align2::LEFT_CENTER, "Громкость", semi(12.5), fg());
+                    p.text(pos2(r.right() - 13.0, r.center().y - 8.0), Align2::RIGHT_CENTER, format!("{:.0}%", level * 100.0), FontId::proportional(11.5), dim());
                     let mut v = level;
                     let track = Rect::from_min_max(pos2(r.left() + 46.0, r.center().y + 3.0), pos2(r.right() - 13.0, r.center().y + 15.0));
                     if slim_slider(ui, ui.id().with("home-vol"), track, &mut v, accent(), muted) {
@@ -4760,7 +4728,7 @@ impl App {
                     }
                 }
                 None => {
-                    p.text(pos2(r.left() + 16.0, r.center().y), Align2::LEFT_CENTER, "Звука нет", semi(12.5), DIM);
+                    p.text(pos2(r.left() + 16.0, r.center().y), Align2::LEFT_CENTER, "Звука нет", semi(12.5), dim());
                 }
             }
         }
@@ -4768,15 +4736,15 @@ impl App {
             let r = cell(3.0, 1.0);
             let resp = ui.interact(r, ui.id().with("home-mic"), Sense::click());
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
-            glass_chip(&p, r, 16.0, 0.5 + 0.5 * hov);
+            glass_chip(&p, r, R_CARD, 0.5 + 0.5 * hov);
             let (state, color) = match self.mic {
                 Some(true) => ("выключен", Color32::from_rgb(0xFF, 0x6B, 0x6B)),
                 Some(false) => ("включён", Color32::from_rgb(0x7B, 0xE0, 0x9A)),
-                None => ("не найден", DIM),
+                None => ("не найден", dim()),
             };
             p.text(pos2(r.left() + 24.0, r.center().y), Align2::CENTER_CENTER, "\u{E720}", FontId::proportional(17.0), color);
-            p.text(pos2(r.left() + 46.0, r.center().y - 8.0), Align2::LEFT_CENTER, "Микрофон", semi(12.5), FG);
-            p.text(pos2(r.left() + 46.0, r.center().y + 9.0), Align2::LEFT_CENTER, state, FontId::proportional(11.5), DIM);
+            p.text(pos2(r.left() + 46.0, r.center().y - 8.0), Align2::LEFT_CENTER, "Микрофон", semi(12.5), fg());
+            p.text(pos2(r.left() + 46.0, r.center().y + 9.0), Align2::LEFT_CENTER, state, FontId::proportional(11.5), dim());
             if resp.clicked() {
                 if let Some(m) = self.mic {
                     sys::set_mic_mute(!m);
@@ -4801,13 +4769,14 @@ impl App {
         let ids = ACTIONS.map(|a| a.0);
         let shown = visible_actions(&ids, &self.cfg.hidden_actions);
         let has_hidden = shown.len() < ACTIONS.len();
-        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 60.0), Sense::hover());
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::hover());
         // +1 — место под «Все»
         let step = row.width() / (shown.len() + has_hidden as usize + 1) as f32;
         for (slot, &i) in shown.iter().enumerate() {
             let (id, glyph, label, col) = &ACTIONS[i];
             let r = Rect::from_min_size(pos2(row.left() + step * slot as f32, row.top()), vec2(step, row.height()));
-            let resp = ui.interact(r, ui.id().with(("act", *id)), Sense::click()).on_hover_text(format!("{} · правый щелчок — скрыть", match *id {
+            let resp = ui.interact(r, ui.id().with(("act", *id)), Sense::click()).on_hover_text(format!("{label}
+{} · правый щелчок — скрыть", match *id {
                 "region" => "Выделите часть экрана — снимок попадёт в буфер",
                 "full" => "Снимок всего экрана: файл в «Изображения\\Островок» и копия в буфере",
                 "ocr" => "Выделите область — текст с неё скопируется",
@@ -4822,10 +4791,10 @@ impl App {
             }
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
             let down = ui.ctx().animate_bool_with_time(resp.id.with("down"), resp.is_pointer_button_down_on(), 0.06);
-            let at = pos2(r.center().x, r.top() + 21.0 - 2.0 * hov + 2.0 * down);
-            p.circle_filled(at, 18.0 + 1.5 * hov - 1.5 * down, rgba(col[0], col[1], col[2], (36.0 + 40.0 * hov) as u8));
-            p.text(at, Align2::CENTER_CENTER, *glyph, FontId::proportional(16.0), Color32::from_rgb(col[0], col[1], col[2]));
-            p.text(pos2(r.center().x, r.bottom() - 8.0), Align2::CENTER_CENTER, *label, FontId::proportional(11.0), mix(DIM, FG, hov));
+            let at = pos2(r.center().x, r.center().y - 1.5 * hov + 1.5 * down);
+            let tone = Color32::from_rgb(col[0], col[1], col[2]);
+            p.circle_filled(at, 18.0 + 1.5 * hov - 1.5 * down, mix_a(rgba(255, 255, 255, 18), rgba(col[0], col[1], col[2], 70), hov));
+            p.text(at, Align2::CENTER_CENTER, *glyph, FontId::proportional(16.0), mix(mix(tone, fg(), 0.45), tone, hov));
             if resp.clicked() {
                 act = id;
             }
@@ -4836,10 +4805,9 @@ impl App {
             let names: Vec<&str> = self.cfg.hidden_actions.iter().filter_map(|h| ACTIONS.iter().find(|a| a.0 == h).map(|a| a.2)).collect();
             let resp = ui.interact(r, ui.id().with("act-restore"), Sense::click()).on_hover_text(format!("Скрыто: {}\nЩелчок — вернуть «{}»", names.join(", "), names.last().copied().unwrap_or("")));
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
-            let at = pos2(r.center().x, r.top() + 21.0 - 2.0 * hov);
+            let at = pos2(r.center().x, r.center().y - 1.5 * hov);
             p.circle_stroke(at, 17.0 + 1.5 * hov, Stroke::new(1.2_f32, rgba(255, 255, 255, (60.0 + 80.0 * hov) as u8)));
-            p.text(at, Align2::CENTER_CENTER, "\u{E710}", FontId::proportional(14.0), mix(DIM, FG, hov));
-            p.text(pos2(r.center().x, r.bottom() - 8.0), Align2::CENTER_CENTER, format!("ещё {}", names.len()), FontId::proportional(11.0), mix(DIM, FG, hov));
+            p.text(at, Align2::CENTER_CENTER, "\u{E710}", FontId::proportional(14.0), mix(dim(), fg(), hov));
             restore = resp.clicked();
         }
         let all;
@@ -4849,10 +4817,9 @@ impl App {
             let r = Rect::from_min_size(pos2(row.left() + step * slot as f32, row.top()), vec2(step, row.height()));
             let resp = ui.interact(r, ui.id().with("act-all"), Sense::click()).on_hover_text("Все инструменты: QR-код, пипетка, заметки, полка…");
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
-            let at = pos2(r.center().x, r.top() + 21.0 - 2.0 * hov);
+            let at = pos2(r.center().x, r.center().y - 1.5 * hov);
             p.circle_filled(at, 18.0 + 1.5 * hov, rgba(255, 255, 255, (22.0 + 26.0 * hov) as u8));
-            p.text(at, Align2::CENTER_CENTER, "\u{E712}", FontId::proportional(16.0), mix(DIM, FG, 0.4 + 0.6 * hov));
-            p.text(pos2(r.center().x, r.bottom() - 8.0), Align2::CENTER_CENTER, "Все", FontId::proportional(11.0), mix(DIM, FG, hov));
+            p.text(at, Align2::CENTER_CENTER, "\u{E712}", FontId::proportional(16.0), mix(dim(), fg(), 0.4 + 0.6 * hov));
             all = resp.clicked();
         }
         if all {
@@ -4893,14 +4860,14 @@ impl App {
                 let resp = resp.on_hover_text(format!("{} · правый щелчок — убрать", app.name));
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
                 let down = ui.ctx().animate_bool_with_time(resp.id.with("down"), resp.is_pointer_button_down_on(), 0.06);
-                glass_chip(ui.painter(), r, 12.0, 0.45 + 0.55 * hov);
+                glass_chip(ui.painter(), r, R_ROW, 0.45 + 0.55 * hov);
                 let icon = &pin_icons[i];
                 let size = 24.0 + 2.0 * hov - 2.0 * down;
                 match icon {
                     Some(tex) => rounded_image(ui.painter(), tex, Rect::from_center_size(r.center(), vec2(size, size)), 0.0),
                     None => {
                         let letter: String = app.name.chars().take(1).collect();
-                        ui.painter().text(r.center(), Align2::CENTER_CENTER, letter.to_uppercase(), semi(15.0), FG);
+                        ui.painter().text(r.center(), Align2::CENTER_CENTER, letter.to_uppercase(), semi(15.0), fg());
                     }
                 }
                 if resp.clicked() {
@@ -4915,7 +4882,7 @@ impl App {
                     let r = ui.add(
                         egui::TextEdit::singleline(q)
                             .margin(egui::Margin::symmetric(10.0, 9.0))
-                            .hint_text(RichText::new("Название программы, Enter").color(DIM))
+                            .hint_text(RichText::new("Название программы, Enter").color(dim()))
                             .desired_width(210.0),
                     );
                     r.request_focus();
@@ -4929,9 +4896,9 @@ impl App {
                     let wide = self.cfg.apps.is_empty();
                     let (r, resp) = ui.allocate_exact_size(vec2(if wide { 210.0 } else { 38.0 }, 38.0), Sense::click());
                     let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
-                    glass_chip(ui.painter(), r, 12.0, 0.35 + 0.6 * hov);
+                    glass_chip(ui.painter(), r, R_ROW, 0.35 + 0.6 * hov);
                     let label = if wide { "\u{E710}   Закрепить приложение" } else { "\u{E710}" };
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, label, semi(13.0), mix(DIM, FG, hov));
+                    ui.painter().text(r.center(), Align2::CENTER_CENTER, label, semi(13.0), mix(dim(), fg(), hov));
                     if resp.clicked() {
                         self.app_query = Some(String::new());
                     }
@@ -4983,9 +4950,9 @@ impl App {
         let frac_now = ((now.timestamp() - midnight) as f32 / day_len as f32).clamp(0.0, 1.0);
         let left_n = marks.iter().filter(|m| m.0 > frac_now).count();
         let shov = ui.ctx().animate_bool_with_time(sresp.id.with("hov"), sresp.hovered(), 0.12);
-        p.text(pos2(strip.left() + 2.0, strip.center().y), Align2::LEFT_CENTER, "Сегодня", semi(11.5), mix(DIM, FG, shov));
+        p.text(pos2(strip.left() + 2.0, strip.center().y), Align2::LEFT_CENTER, "Сегодня", semi(11.5), mix(dim(), fg(), shov));
         let tail = if left_n > 0 { format!("ещё {}", dela_word(left_n)) } else if marks.is_empty() { "день свободен".into() } else { "всё позади".into() };
-        p.text(pos2(strip.right() - 2.0, strip.center().y), Align2::RIGHT_CENTER, tail, FontId::proportional(11.0), if left_n > 0 { accent() } else { DIM });
+        p.text(pos2(strip.right() - 2.0, strip.center().y), Align2::RIGHT_CENTER, tail, FontId::proportional(11.0), if left_n > 0 { accent() } else { dim() });
         let track = Rect::from_min_max(pos2(strip.left() + 62.0, strip.center().y - 2.0), pos2(strip.right() - 92.0, strip.center().y + 2.0));
         if track.width() > 40.0 {
             p.rect_filled(track, Rounding::same(2.0), rgba(255, 255, 255, (28.0 + 14.0 * shov) as u8));
@@ -5010,7 +4977,7 @@ impl App {
             }
             let nx = x_of(frac_now);
             p.circle_filled(pos2(nx, track.center().y), 7.0, Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 50));
-            p.circle_filled(pos2(nx, track.center().y), 3.5, FG);
+            p.circle_filled(pos2(nx, track.center().y), 3.5, fg());
             let sresp = sresp.on_hover_text(tip.unwrap_or_else(|| format!("Сейчас {} · щелчок — напоминания", now.format("%H:%M"))));
             if sresp.clicked() {
                 self.tab = Tab::Remind;
@@ -5034,20 +5001,20 @@ impl App {
                 ui.add_space(26.0);
                 let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 170.0), Sense::hover());
                 let p = ui.painter().clone();
-                glass_chip(&p, area, 20.0, 0.4);
+                glass_chip(&p, area, R_CARD, 0.4);
                 spectrum(&p.with_clip_rect(area), area.shrink2(vec2(18.0, 0.0)), &self.bars, accent, 0.85, 0.72);
                 ui.add_space(12.0);
                 ui.vertical_centered(|ui| {
                     ui.label(RichText::new(if self.sounding.0.is_empty() { "Играет звук компьютера".to_string() } else { format!("Звучит: {}", self.sounding.0) }).font(semi(16.5)));
-                    ui.label(RichText::new("Плеер не сообщил название трека, поэтому остров показывает сам звук.").color(DIM));
+                    ui.label(RichText::new("Плеер не сообщил название трека, поэтому остров показывает сам звук.").color(dim()));
                 });
                 return;
             }
             ui.add_space(70.0);
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new("\u{E8D6}").size(34.0).color(DIM));
+                ui.label(RichText::new("\u{E8D6}").size(34.0).color(dim()));
                 ui.label(RichText::new("Ничего не играет").font(semi(16.5)));
-                ui.label(RichText::new("Включите музыку в Spotify, браузере или любом плеере — она появится здесь.").color(DIM));
+                ui.label(RichText::new("Включите музыку в Spotify, браузере или любом плеере — она появится здесь.").color(dim()));
             });
             return;
         };
@@ -5064,8 +5031,8 @@ impl App {
         let x = art.right() + 18.0;
         let text = p.with_clip_rect(Rect::from_min_max(pos2(x, row.top()), row.max));
         let (title, artist) = (media::ellipsize_chars(&m.title, 40), media::ellipsize_chars(&m.artist, 48));
-        let tr = text.text(pos2(x, row.top() + 4.0), Align2::LEFT_TOP, &title, semi(18.0), FG);
-        let ar = text.text(pos2(x, row.top() + 30.0), Align2::LEFT_TOP, &artist, FontId::proportional(13.5), DIM);
+        let tr = text.text(pos2(x, row.top() + 4.0), Align2::LEFT_TOP, &title, semi(18.0), fg());
+        let ar = text.text(pos2(x, row.top() + 30.0), Align2::LEFT_TOP, &artist, FontId::proportional(13.5), dim());
         if title != m.title || artist != m.artist || tr.right() > row.right() || ar.right() > row.right() {
             let full = format!("{} — {}", m.title, m.artist);
             ui.interact(tr.union(ar).intersect(row), ui.id().with("music-title"), Sense::hover()).on_hover_text(full);
@@ -5086,10 +5053,10 @@ impl App {
             if let Some(to) = to {
                 // где окажемся — время над курсором
                 let tip = pos2(ptr.x.clamp(track.left() + 16.0, track.right() - 16.0), track.top() - 12.0);
-                let g = p.layout_no_wrap(clock(to), FontId::proportional(11.0), FG);
+                let g = p.layout_no_wrap(clock(to), FontId::proportional(11.0), fg());
                 let r = Rect::from_center_size(tip, g.size() + vec2(10.0, 4.0));
                 p.rect_filled(r, Rounding::same(6.0), rgba(10, 10, 18, (210.0 * grab) as u8));
-                p.galley(r.min + vec2(5.0, 2.0), g, FG);
+                p.galley(r.min + vec2(5.0, 2.0), g, fg());
                 if seek.dragged() || seek.clicked() {
                     at = to; // ползунок едет за мышью сразу
                 }
@@ -5106,9 +5073,9 @@ impl App {
         if m.dur > 0.0 {
             let done = Rect::from_min_max(track.min, pos2(track.left() + track.width() * media::track_frac(at, 0.0, m.dur, false), track.bottom()));
             p.rect_filled(done, Rounding::same(2.5 + 1.5 * grab), accent);
-            p.circle_filled(pos2(done.right(), track.center().y), 5.0 + 2.0 * grab, FG);
-            p.text(pos2(x, track.bottom() + 6.0), Align2::LEFT_TOP, clock(at), FontId::proportional(11.5), DIM);
-            p.text(pos2(row.right(), track.bottom() + 6.0), Align2::RIGHT_TOP, clock(m.dur), FontId::proportional(11.5), DIM);
+            p.circle_filled(pos2(done.right(), track.center().y), 5.0 + 2.0 * grab, fg());
+            p.text(pos2(x, track.bottom() + 6.0), Align2::LEFT_TOP, clock(at), FontId::proportional(11.5), dim());
+            p.text(pos2(row.right(), track.bottom() + 6.0), Align2::RIGHT_TOP, clock(m.dur), FontId::proportional(11.5), dim());
         }
         // управление
         let mid = pos2((x + row.right()) / 2.0, row.bottom() - 9.0);
@@ -5118,13 +5085,13 @@ impl App {
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
             let down = ui.ctx().animate_bool_with_time(resp.id.with("down"), resp.is_pointer_button_down_on(), 0.06);
             if cmd == 1 {
-                p.circle_filled(hit.center(), 17.0 + hov - 1.5 * down, FG);
+                p.circle_filled(hit.center(), 17.0 + hov - 1.5 * down, fg());
                 p.text(hit.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(15.0), BG);
             } else {
                 if hov > 0.0 {
                     p.circle_filled(hit.center(), 16.0, rgba(255, 255, 255, (34.0 * hov) as u8));
                 }
-                p.text(hit.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(15.0), FG);
+                p.text(hit.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(15.0), fg());
             }
             if resp.clicked() {
                 let _ = self.media_tx.send(match cmd {
@@ -5138,20 +5105,20 @@ impl App {
         // текст песни: текущая строка яркая, соседние гаснут
         ui.add_space(6.0);
         let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 132.0), Sense::hover());
-        glass_chip(&p, area, 18.0, 0.4);
+        glass_chip(&p, area, R_CARD, 0.4);
         let no_text = self.cfg.lyrics && self.lyrics.is_empty();
         if !no_text {
             spectrum(&p.with_clip_rect(area), area.shrink2(vec2(14.0, 0.0)), &self.bars, accent, 0.26, 0.62);
         }
         let lines = p.with_clip_rect(area.shrink(8.0));
         if !self.cfg.lyrics {
-            lines.text(area.center() - vec2(0.0, 16.0), Align2::CENTER_CENTER, "Текст песни выключен", semi(14.0), FG);
-            lines.text(area.center() + vec2(0.0, 4.0), Align2::CENTER_CENTER, "Для него исполнитель и название трека отправляются на lrclib.net", FontId::proportional(12.0), DIM);
+            lines.text(area.center() - vec2(0.0, 16.0), Align2::CENTER_CENTER, "Текст песни выключен", semi(14.0), fg());
+            lines.text(area.center() + vec2(0.0, 4.0), Align2::CENTER_CENTER, "Для него исполнитель и название трека отправляются на lrclib.net", FontId::proportional(12.0), dim());
             let b = Rect::from_center_size(area.center() + vec2(0.0, 36.0), vec2(150.0, 30.0));
             let resp = ui.interact(b, ui.id().with("lyrics-on"), Sense::click());
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
-            glass_chip(&p, b, 12.0, 0.6 + 0.5 * hov);
-            p.text(b.center(), Align2::CENTER_CENTER, "Включить текст", semi(13.0), FG);
+            glass_chip(&p, b, R_ROW, 0.6 + 0.5 * hov);
+            p.text(b.center(), Align2::CENTER_CENTER, "Включить текст", semi(13.0), fg());
             if resp.clicked() {
                 self.cfg.lyrics = true;
                 self.cfg.save();
@@ -5161,7 +5128,7 @@ impl App {
             // текста нет — вместо пустой рамки крупный зеркальный эквалайзер в цвет обложки
             let t = anim_t(ui.input(|i| i.time));
             spectrum_mirror(&p.with_clip_rect(area), area.shrink2(vec2(18.0, 26.0)).translate(vec2(0.0, 8.0)), &self.bars, accent, t, m.playing);
-            lines.text(pos2(area.center().x, area.top() + 16.0), Align2::CENTER_CENTER, "Текста для этого трека не нашлось — только звук", FontId::proportional(11.5), DIM);
+            lines.text(pos2(area.center().x, area.top() + 16.0), Align2::CENTER_CENTER, "Текста для этого трека не нашлось — только звук", FontId::proportional(11.5), dim());
         } else {
             let cur = self.lyrics.iter().rposition(|l| l.0 <= at);
             // плавная прокрутка: строка въезжает на место за время до следующей
@@ -5180,7 +5147,7 @@ impl App {
                 }
                 let y = area.center().y + off as f32 * 24.0 + slide - 6.0;
                 let far = (off as f32).abs();
-                let (font, color) = if off == 0 { (semi(15.5), FG) } else { (FontId::proportional(13.5), mix(DIM, BG, (far - 1.0) * 0.4 + 0.15)) };
+                let (font, color) = if off == 0 { (semi(15.5), fg()) } else { (FontId::proportional(13.5), mix(dim(), BG, (far - 1.0) * 0.4 + 0.15)) };
                 lines.text(pos2(area.center().x, y), Align2::CENTER_CENTER, &self.lyrics[i as usize].1, font, color);
             }
         }
@@ -5229,17 +5196,17 @@ impl App {
             let down = ui.ctx().animate_bool_with_time(resp.id.with("down"), resp.is_pointer_button_down_on(), 0.06);
             let lit = ui.ctx().animate_bool_with_time(resp.id.with("on"), *on, 0.18);
             let r = r.shrink(3.0 * down);
-            glass_chip(&p, r, 18.0, 0.45 + 0.4 * hov);
+            glass_chip(&p, r, R_CARD, 0.45 + 0.4 * hov);
             if lit > 0.0 {
                 p.rect_filled(r.shrink(1.0), Rounding::same(17.0), Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), (lit * 215.0) as u8));
             }
-            let ink = mix(FG, ink_dark, lit);
+            let ink = mix(fg(), ink_dark, lit);
             let c = pos2(r.left() + 24.0, r.top() + 26.0);
             p.circle_filled(c, 15.0, rgba(255, 255, 255, (26.0 + 30.0 * (1.0 - lit)) as u8));
             p.text(c, Align2::CENTER_CENTER, *glyph, FontId::proportional(15.0), ink);
             let clip = p.with_clip_rect(r);
             clip.text(pos2(r.left() + 12.0, r.bottom() - 30.0), Align2::LEFT_CENTER, *title, semi(12.5), ink);
-            clip.text(pos2(r.left() + 12.0, r.bottom() - 14.0), Align2::LEFT_CENTER, *state, FontId::proportional(10.5), mix(DIM, Color32::from_rgb(40, 34, 60), lit));
+            clip.text(pos2(r.left() + 12.0, r.bottom() - 14.0), Align2::LEFT_CENTER, *state, FontId::proportional(10.5), mix(dim(), Color32::from_rgb(40, 34, 60), lit));
             if resp.clicked() {
                 act = id;
             }
@@ -5268,13 +5235,13 @@ impl App {
         let slider = |ui: &mut egui::Ui, key: &str, glyph: &str, name: &str, val: f32, tone: Color32| -> Option<f32> {
             let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click_and_drag());
             let hov = ui.ctx().animate_bool_with_time(resp.id.with(key), resp.hovered() || resp.dragged(), 0.12);
-            glass_chip(&p, r, 17.0, 0.45 + 0.35 * hov);
+            glass_chip(&p, r, R_CARD, 0.45 + 0.35 * hov);
             let shown = ui.ctx().animate_value_with_time(resp.id.with((key, "v")), val, 0.15);
             let fill = Rect::from_min_max(r.min, pos2(r.left() + (r.width() * shown).max(34.0), r.bottom())).shrink(1.0);
             p.rect_filled(fill, Rounding::same(16.0), Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), 200));
             p.text(pos2(r.left() + 17.0, r.center().y), Align2::CENTER_CENTER, glyph, FontId::proportional(14.0), ink_dark);
-            p.text(pos2(r.left() + 40.0, r.center().y), Align2::LEFT_CENTER, name, semi(12.5), FG);
-            p.text(pos2(r.right() - 14.0, r.center().y), Align2::RIGHT_CENTER, format!("{:.0}%", val * 100.0), semi(12.5), FG);
+            p.text(pos2(r.left() + 40.0, r.center().y), Align2::LEFT_CENTER, name, semi(12.5), fg());
+            p.text(pos2(r.right() - 14.0, r.center().y), Align2::RIGHT_CENTER, format!("{:.0}%", val * 100.0), semi(12.5), fg());
             if resp.dragged() || resp.clicked() {
                 resp.interact_pointer_pos().map(|pos| ((pos.x - r.left()) / r.width()).clamp(0.0, 1.0))
             } else {
@@ -5303,12 +5270,12 @@ impl App {
         if let Some(b) = &battery {
             ui.add_space(8.0);
             let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
-            glass_chip(&p, r, 16.0, 0.45);
+            glass_chip(&p, r, R_CARD, 0.45);
             let rgb = battery_rgb(b.pct, b.charging);
             let tone = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
             p.text(pos2(r.left() + 22.0, r.center().y), Align2::CENTER_CENTER, pult::battery_glyph(b.pct, b.charging), FontId::proportional(20.0), tone);
-            p.text(pos2(r.left() + 44.0, r.top() + 15.0), Align2::LEFT_CENTER, format!("Батарея · {}%", b.pct), semi(12.5), FG);
-            p.text(pos2(r.left() + 44.0, r.top() + 31.0), Align2::LEFT_CENTER, pult::battery_status(b), FontId::proportional(10.5), DIM);
+            p.text(pos2(r.left() + 44.0, r.top() + 15.0), Align2::LEFT_CENTER, format!("Батарея · {}%", b.pct), semi(12.5), fg());
+            p.text(pos2(r.left() + 44.0, r.top() + 31.0), Align2::LEFT_CENTER, pult::battery_status(b), FontId::proportional(10.5), dim());
             let bar = Rect::from_min_size(pos2(r.right() - 120.0, r.center().y - 3.0), vec2(104.0, 6.0));
             p.rect_filled(bar, Rounding::same(3.0), rgba(255, 255, 255, 26));
             p.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * b.pct as f32 / 100.0, 6.0)), Rounding::same(3.0), tone);
@@ -5318,22 +5285,22 @@ impl App {
         ui.add_space(8.0);
         let (h, hresp) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::click());
         let hov = ui.ctx().animate_bool_with_time(hresp.id.with("hov"), hresp.hovered(), 0.10);
-        p.text(pos2(h.left() + 4.0, h.center().y), Align2::LEFT_CENTER, "\u{E702}  Устройства", semi(12.5), DIM);
-        p.text(pos2(h.right() - 4.0, h.center().y), Align2::RIGHT_CENTER, "настройки Bluetooth \u{E76C}", FontId::proportional(11.0), mix(DIM, accent(), hov));
+        p.text(pos2(h.left() + 4.0, h.center().y), Align2::LEFT_CENTER, "\u{E702}  Устройства", semi(12.5), dim());
+        p.text(pos2(h.right() - 4.0, h.center().y), Align2::RIGHT_CENTER, "настройки Bluetooth \u{E76C}", FontId::proportional(11.0), mix(dim(), accent(), hov));
         if hresp.clicked() {
             sys::open("ms-settings:bluetooth");
         }
         ui.add_space(4.0);
         if devices.is_empty() {
             let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
-            p.text(pos2(r.left() + 6.0, r.center().y), Align2::LEFT_CENTER, "Подключённых Bluetooth-устройств нет", FontId::proportional(12.0), DIM);
+            p.text(pos2(r.left() + 6.0, r.center().y), Align2::LEFT_CENTER, "Подключённых Bluetooth-устройств нет", FontId::proportional(12.0), dim());
         }
         for d in devices.iter().take(4) {
             let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
-            glass_chip(&p, r, 15.0, 0.35);
+            glass_chip(&p, r, R_ROW, 0.35);
             p.text(pos2(r.left() + 18.0, r.center().y), Align2::CENTER_CENTER, pult::device_glyph(&d.name), FontId::proportional(14.0), accent());
             let name: String = d.name.chars().take(34).collect();
-            p.text(pos2(r.left() + 38.0, r.center().y), Align2::LEFT_CENTER, name, FontId::proportional(12.5), FG);
+            p.text(pos2(r.left() + 38.0, r.center().y), Align2::LEFT_CENTER, name, FontId::proportional(12.5), fg());
             if let Some(pct) = d.battery {
                 let rgb = battery_rgb(pct, false);
                 let tone = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
@@ -5417,10 +5384,10 @@ impl App {
         let card = |k: usize| Rect::from_min_size(pos2(row.left() + k as f32 * (w + 8.0), row.top()), vec2(w, row.height()));
         // карточка замера: название и адрес, крупно последний пинг, внизу джиттер и потери
         let probe = |r: Rect, key: &str, title: &str, addr: String, vals: &[Option<u32>], st: Option<&game::Stats>, lim: &game::Limits, empty: Option<&str>| {
-            glass_chip(&p, r, 18.0, 0.55);
+            glass_chip(&p, r, R_CARD, 0.55);
             let clip = p.with_clip_rect(r.shrink(2.0));
-            clip.text(pos2(r.left() + 14.0, r.top() + 17.0), Align2::LEFT_CENTER, title, semi(12.5), FG);
-            clip.text(pos2(r.right() - 14.0, r.top() + 17.0), Align2::RIGHT_CENTER, addr, FontId::proportional(11.0), DIM);
+            clip.text(pos2(r.left() + 14.0, r.top() + 17.0), Align2::LEFT_CENTER, title, semi(12.5), fg());
+            clip.text(pos2(r.right() - 14.0, r.top() + 17.0), Align2::RIGHT_CENTER, addr, FontId::proportional(11.0), dim());
             let lvl = if empty.is_some() { None } else { st.filter(|s| s.sent >= 3).map(|s| game::level_of(s, lim)) };
             let c = tone(key, game::level_rgb(lvl));
             let last_ok = vals.iter().rev().flatten().next().copied();
@@ -5433,7 +5400,7 @@ impl App {
                 (None, Some(s)) if s.sent >= 3 => format!("нет ответа · потери {}", game::fmt_pct(s.loss_pct())),
                 _ => "замер раз в секунду".to_string(),
             };
-            clip.text(pos2(r.left() + 14.0, r.bottom() - 15.0), Align2::LEFT_CENTER, fit_text(&p, &foot, FontId::proportional(11.0), r.width() - 28.0), FontId::proportional(11.0), DIM);
+            clip.text(pos2(r.left() + 14.0, r.bottom() - 15.0), Align2::LEFT_CENTER, fit_text(&p, &foot, FontId::proportional(11.0), r.width() - 28.0), FontId::proportional(11.0), dim());
         };
         let target_ip = game::INET_TARGETS[target];
         probe(card(0), "inet", "\u{E774}  Интернет", target_ip.to_string(), &inet_v, inet.as_ref(), &game::INET, icmp_failed.then_some("пинг недоступен"));
@@ -5451,7 +5418,7 @@ impl App {
         ui.interact(card(1), id.with("game-gw"), Sense::hover()).on_hover_text("Пинг до роутера: первый узел по пути к 1.1.1.1 (с VPN — сервер VPN). Дома должно быть до 10 мс");
         {
             let r = card(2);
-            glass_chip(&p, r, 18.0, 0.55);
+            glass_chip(&p, r, R_CARD, 0.55);
             let shown = if icmp_failed { None } else { level };
             let c = tone("verdict", game::level_rgb(shown));
             // лёгкая заливка цветом уровня сверху вниз
@@ -5472,28 +5439,28 @@ impl App {
             };
             let clip = p.with_clip_rect(r.shrink(2.0));
             clip.text(pos2(r.left() + 16.0, r.top() + 23.0), Align2::LEFT_CENTER, word, semi(18.0), c);
-            clip.text(pos2(r.left() + 16.0, r.top() + 50.0), Align2::LEFT_CENTER, fit_text(&p, &l1, FontId::proportional(12.0), r.width() - 30.0), FontId::proportional(12.0), FG);
-            clip.text(pos2(r.left() + 16.0, r.top() + 68.0), Align2::LEFT_CENTER, fit_text(&p, &l2, FontId::proportional(11.0), r.width() - 30.0), FontId::proportional(11.0), DIM);
+            clip.text(pos2(r.left() + 16.0, r.top() + 50.0), Align2::LEFT_CENTER, fit_text(&p, &l1, FontId::proportional(12.0), r.width() - 30.0), FontId::proportional(12.0), fg());
+            clip.text(pos2(r.left() + 16.0, r.top() + 68.0), Align2::LEFT_CENTER, fit_text(&p, &l2, FontId::proportional(11.0), r.width() - 30.0), FontId::proportional(11.0), dim());
             ui.interact(r, id.with("game-verdict"), Sense::hover()).on_hover_text("Сравниваю пинг до роутера и до интернета. Плохо уже до роутера — дело дома: Wi‑Fi или кабель. До роутера быстро, а дальше медленно — у провайдера или канал забит загрузками");
         }
 
         // ── пинг за минуту: интернет синим с заливкой, роутер — тонкой линией, потери — красными точками
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), game::GRAPH_H), Sense::hover());
-        glass_chip(&p, r, 18.0, 0.45);
+        glass_chip(&p, r, R_CARD, 0.45);
         let hy = r.top() + 16.0;
-        let head = p.text(pos2(r.left() + 14.0, hy), Align2::LEFT_CENTER, "Пинг за минуту", semi(12.5), FG);
+        let head = p.text(pos2(r.left() + 14.0, hy), Align2::LEFT_CENTER, "Пинг за минуту", semi(12.5), fg());
         let small = FontId::proportional(11.0);
         let range = inet.filter(|s| s.ok() > 0).map(|s| format!("мин {} · сред {:.0} · макс {} мс", s.min, s.avg, s.max));
-        let range_w = range.as_ref().map_or(0.0, |t| p.layout_no_wrap(t.clone(), small.clone(), DIM).size().x);
-        let legend_w = p.layout_no_wrap("интернет".into(), small.clone(), DIM).size().x + p.layout_no_wrap("роутер".into(), small.clone(), DIM).size().x + 38.0;
+        let range_w = range.as_ref().map_or(0.0, |t| p.layout_no_wrap(t.clone(), small.clone(), dim()).size().x);
+        let legend_w = p.layout_no_wrap("интернет".into(), small.clone(), dim()).size().x + p.layout_no_wrap("роутер".into(), small.clone(), dim()).size().x + 38.0;
         // легенда по центру, а если тесно — сразу за заголовком
         let lx = (r.center().x - legend_w / 2.0).min(r.right() - 14.0 - range_w - 16.0 - legend_w).max(head.right() + 16.0);
         p.circle_filled(pos2(lx + 4.0, hy), 3.5, blue);
-        let t = p.text(pos2(lx + 12.0, hy), Align2::LEFT_CENTER, "интернет", small.clone(), DIM);
+        let t = p.text(pos2(lx + 12.0, hy), Align2::LEFT_CENTER, "интернет", small.clone(), dim());
         p.circle_filled(pos2(t.right() + 18.0, hy), 3.5, accent());
-        p.text(pos2(t.right() + 26.0, hy), Align2::LEFT_CENTER, "роутер", small.clone(), DIM);
+        p.text(pos2(t.right() + 26.0, hy), Align2::LEFT_CENTER, "роутер", small.clone(), dim());
         if let Some(t) = range {
-            p.text(pos2(r.right() - 14.0, hy), Align2::RIGHT_CENTER, t, small.clone(), DIM);
+            p.text(pos2(r.right() - 14.0, hy), Align2::RIGHT_CENTER, t, small.clone(), dim());
         }
         let plot = Rect::from_min_max(r.min + vec2(14.0, 30.0), r.max - vec2(14.0, 12.0));
         let top = inet_v.iter().chain(gw_v.iter()).flatten().max().copied().unwrap_or(0);
@@ -5507,7 +5474,7 @@ impl App {
             if (g as f32) < scale {
                 let y = y_of(g);
                 p.line_segment([pos2(plot.left(), y), pos2(plot.right() - 18.0, y)], Stroke::new(1.0_f32, rgba(255, 255, 255, 14)));
-                p.text(pos2(plot.right(), y), Align2::RIGHT_CENTER, g.to_string(), FontId::proportional(9.5), DIM);
+                p.text(pos2(plot.right(), y), Align2::RIGHT_CENTER, g.to_string(), FontId::proportional(9.5), dim());
             }
         }
         let (n, m) = (inet_v.len(), gw_v.len());
@@ -5546,18 +5513,18 @@ impl App {
                 }
             }
         } else {
-            p.text(plot.center(), Align2::CENTER_CENTER, if icmp_failed { "Пинг недоступен" } else { "Собираю данные…" }, FontId::proportional(12.0), DIM);
+            p.text(plot.center(), Align2::CENTER_CENTER, if icmp_failed { "Пинг недоступен" } else { "Собираю данные…" }, FontId::proportional(12.0), dim());
         }
 
         // ── что может мешать игре
         ui.add_space(2.0);
         let rows = if scanned { game::rows(&culprits, disk_free, disk_total) } else { Vec::new() };
         let (h, _) = ui.allocate_exact_size(vec2(ui.available_width(), game::LIST_HEAD_H), Sense::hover());
-        p.text(pos2(h.left() + 4.0, h.center().y), Align2::LEFT_CENTER, "\u{E7BA}  Что может мешать игре", semi(12.5), DIM);
+        p.text(pos2(h.left() + 4.0, h.center().y), Align2::LEFT_CENTER, "\u{E7BA}  Что может мешать игре", semi(12.5), dim());
         let mut right_x = h.right() - 4.0;
         if disk_total > 0.0 {
             let low = game::low_disk(disk_free, disk_total);
-            let t = p.text(pos2(right_x, h.center().y), Align2::RIGHT_CENTER, format!("Диск C: свободно {disk_free:.0} ГБ"), small.clone(), if low { orange } else { DIM });
+            let t = p.text(pos2(right_x, h.center().y), Align2::RIGHT_CENTER, format!("Диск C: свободно {disk_free:.0} ГБ"), small.clone(), if low { orange } else { dim() });
             right_x = t.left() - 14.0;
         }
         if rows.len() > game::MAX_ROWS {
@@ -5570,32 +5537,32 @@ impl App {
             let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), game::EMPTY_ROW_H), Sense::hover());
             if scanned {
                 let g = p.text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, "\u{E73E}", FontId::proportional(13.0), green);
-                p.text(pos2(g.right() + 8.0, r.center().y), Align2::LEFT_CENTER, "Ничего подозрительного не запущено", FontId::proportional(12.0), FG);
+                p.text(pos2(g.right() + 8.0, r.center().y), Align2::LEFT_CENTER, "Ничего подозрительного не запущено", FontId::proportional(12.0), fg());
             } else {
-                p.text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, "Проверяю, что запущено…", FontId::proportional(12.0), DIM);
+                p.text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, "Проверяю, что запущено…", FontId::proportional(12.0), dim());
             }
         }
         for (k, row) in rows.iter().take(game::MAX_ROWS).enumerate() {
             let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), game::ROW_H), Sense::hover());
-            glass_chip(&p, r, 14.0, 0.35);
+            glass_chip(&p, r, R_ROW, 0.35);
             p.text(pos2(r.left() + 18.0, r.center().y), Align2::CENTER_CENTER, row.glyph, FontId::proportional(15.0), if row.network { orange } else { accent() });
             let text_right = if row.open.is_some() { r.right() - 120.0 } else { r.right() - 14.0 };
             let x0 = r.left() + 38.0;
             let clip = p.with_clip_rect(Rect::from_min_max(pos2(r.left() + 30.0, r.top()), pos2(text_right, r.bottom())));
             let title = fit_text(&p, &row.title, semi(12.5), text_right - x0);
-            let t = clip.text(pos2(x0, r.top() + 12.5), Align2::LEFT_CENTER, title, semi(12.5), FG);
+            let t = clip.text(pos2(x0, r.top() + 12.5), Align2::LEFT_CENTER, title, semi(12.5), fg());
             if t.right() + 8.0 < text_right - 20.0 {
-                clip.text(pos2(t.right() + 8.0, r.top() + 13.0), Align2::LEFT_CENTER, fit_text(&p, &row.detail, FontId::proportional(11.0), text_right - t.right() - 8.0), FontId::proportional(11.0), DIM);
+                clip.text(pos2(t.right() + 8.0, r.top() + 13.0), Align2::LEFT_CENTER, fit_text(&p, &row.detail, FontId::proportional(11.0), text_right - t.right() - 8.0), FontId::proportional(11.0), dim());
             }
-            clip.text(pos2(x0, r.top() + 27.5), Align2::LEFT_CENTER, fit_text(&p, row.hint, FontId::proportional(10.5), text_right - x0), FontId::proportional(10.5), DIM);
+            clip.text(pos2(x0, r.top() + 27.5), Align2::LEFT_CENTER, fit_text(&p, row.hint, FontId::proportional(10.5), text_right - x0), FontId::proportional(10.5), dim());
             // полный текст — в подсказке над строкой
             ui.interact(Rect::from_min_max(r.min, pos2(text_right, r.bottom())), id.with(("game-row", k)), Sense::hover()).on_hover_text(format!("{} — {}\n{}", row.title, row.detail, row.hint));
             if let Some(o) = &row.open {
                 let b = Rect::from_min_size(pos2(r.right() - 8.0 - 104.0, r.center().y - 12.0), vec2(104.0, 24.0));
                 let resp = ui.interact(b, id.with(("game-open", k)), Sense::click()).on_hover_text(game::open_tip(o)).on_hover_cursor(egui::CursorIcon::PointingHand);
                 let hov = ctx.animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
-                glass_chip(&p, b, 12.0, 0.45 + 0.4 * hov);
-                p.text(b.center(), Align2::CENTER_CENTER, format!("{} \u{E8A7}", game::open_label(o)), semi(11.5), mix(DIM, FG, 0.55 + 0.45 * hov));
+                glass_chip(&p, b, R_ROW, 0.45 + 0.4 * hov);
+                p.text(b.center(), Align2::CENTER_CENTER, format!("{} \u{E8A7}", game::open_label(o)), semi(11.5), mix(dim(), fg(), 0.55 + 0.45 * hov));
                 if resp.clicked() {
                     go = Some(o.clone());
                 }
@@ -5644,7 +5611,7 @@ impl App {
         let x0 = r.left() + 58.0;
         let right = sp.left() - 16.0;
         if let Some((title, secs)) = &session {
-            glass_chip(&p, r, 18.0, 0.45);
+            glass_chip(&p, r, R_CARD, 0.45);
             let c = tone("session", game::level_rgb(level));
             // мягко пульсирующая точка: замер идёт
             let pulse = 0.5 + 0.5 * (anim_t(ctx.input(|i| i.time)) * 2.6).sin();
@@ -5652,11 +5619,11 @@ impl App {
             p.circle_filled(dot, 9.0 + 4.0 * pulse, rgba(c.r(), c.g(), c.b(), (26.0 + 30.0 * (1.0 - pulse)) as u8));
             p.circle_filled(dot, 5.0, c);
             let line = format!("Идёт игра: {title} · {}", pult::fmt_duration((*secs).min(u32::MAX as u64) as u32));
-            p.text(pos2(x0, r.top() + 21.0), Align2::LEFT_CENTER, fit_text(&p, &line, semi(12.5), right - x0), semi(12.5), FG);
-            p.text(pos2(x0, r.top() + 40.0), Align2::LEFT_CENTER, fit_text(&p, "замер идёт в фоне — сводка появится после игры", small.clone(), right - x0), small.clone(), DIM);
+            p.text(pos2(x0, r.top() + 21.0), Align2::LEFT_CENTER, fit_text(&p, &line, semi(12.5), right - x0), semi(12.5), fg());
+            p.text(pos2(x0, r.top() + 40.0), Align2::LEFT_CENTER, fit_text(&p, "замер идёт в фоне — сводка появится после игры", small.clone(), right - x0), small.clone(), dim());
             spark(sp, &inet_v, c);
         } else if let Some(s) = &last {
-            glass_chip(&p, r, 18.0, 0.45);
+            glass_chip(&p, r, R_CARD, 0.45);
             let rgb = game::level_rgb(s.level);
             let c = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
             icon_disc(&p, pos2(r.left() + 30.0, r.center().y), 16.0, rgb, [rgb[0] / 3 * 2, rgb[1] / 3 * 2, rgb[2] / 3 * 2], "\u{E7FC}", 14.0);
@@ -5664,19 +5631,19 @@ impl App {
                 Some(i) => format!("пинг {} · джиттер {:.0} · потери {}", i.median, i.jitter, game::fmt_pct(i.loss_pct())),
                 None => "пинг не измерен".to_string(),
             };
-            let nums_r = p.text(pos2(right, r.top() + 21.0), Align2::RIGHT_CENTER, &nums, semi(12.0), FG);
+            let nums_r = p.text(pos2(right, r.top() + 21.0), Align2::RIGHT_CENTER, &nums, semi(12.0), fg());
             let head = fit_text(&p, &format!("Последняя игра · {}", s.title), semi(12.5), (nums_r.left() - 16.0 - x0).max(40.0));
-            p.text(pos2(x0, r.top() + 21.0), Align2::LEFT_CENTER, head, semi(12.5), FG);
-            let when = p.text(pos2(x0, r.top() + 40.0), Align2::LEFT_CENTER, format!("в {} · {}", s.ended_at, pult::fmt_duration(s.secs.min(u32::MAX as u64) as u32)), small.clone(), DIM);
-            p.circle_filled(pos2(when.right() + 8.0, r.top() + 40.0), 1.5, DIM);
+            p.text(pos2(x0, r.top() + 21.0), Align2::LEFT_CENTER, head, semi(12.5), fg());
+            let when = p.text(pos2(x0, r.top() + 40.0), Align2::LEFT_CENTER, format!("в {} · {}", s.ended_at, pult::fmt_duration(s.secs.min(u32::MAX as u64) as u32)), small.clone(), dim());
+            p.circle_filled(pos2(when.right() + 8.0, r.top() + 40.0), 1.5, dim());
             let line = fit_text(&p, &game::summary_line(s), small.clone(), (right - when.right() - 16.0).max(20.0));
             p.text(pos2(when.right() + 16.0, r.top() + 40.0), Align2::LEFT_CENTER, line, small.clone(), c);
             spark(sp, &s.hist, c);
             let gw_line = s.gw.filter(|g| g.ok() > 0).map(|g| format!("\nдо роутера: пинг {} мс, потери {}", g.median, game::fmt_pct(g.loss_pct()))).unwrap_or_default();
             ui.interact(r, id.with("game-last"), Sense::hover()).on_hover_text(format!("{}{gw_line}\nскачков пинга: {}", game::summary_line(s), s.spikes));
         } else {
-            glass_chip(&p, r, 16.0, 0.25);
-            p.text(r.center(), Align2::CENTER_CENTER, "\u{E7FC}  Сыграйте — после игры здесь будет сводка: пинг, скачки и что мешало", FontId::proportional(12.0), DIM);
+            glass_chip(&p, r, R_CARD, 0.25);
+            p.text(r.center(), Align2::CENTER_CENTER, "\u{E7FC}  Сыграйте — после игры здесь будет сводка: пинг, скачки и что мешало", FontId::proportional(12.0), dim());
         }
 
         // кнопки открывают только постоянные адреса (диспетчер задач — полным путём) или проверенный путь найденной программы
@@ -5757,9 +5724,9 @@ impl App {
                 p.circle_filled(c, rad, Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), (lit * 225.0) as u8));
             }
             p.circle_stroke(c, rad, Stroke::new(1.0_f32, rgba(255, 255, 255, 34)));
-            p.text(c, Align2::CENTER_CENTER, *glyph, FontId::proportional(17.0), mix(FG, Color32::from_rgb(16, 14, 28), lit));
-            p.text(pos2(r.center().x, r.top() + 62.0), Align2::CENTER_CENTER, *title, semi(11.5), FG);
-            p.with_clip_rect(r).text(pos2(r.center().x, r.top() + 78.0), Align2::CENTER_CENTER, state, FontId::proportional(10.5), mix(DIM, tone, lit));
+            p.text(c, Align2::CENTER_CENTER, *glyph, FontId::proportional(17.0), mix(fg(), Color32::from_rgb(16, 14, 28), lit));
+            p.text(pos2(r.center().x, r.top() + 62.0), Align2::CENTER_CENTER, *title, semi(11.5), fg());
+            p.with_clip_rect(r).text(pos2(r.center().x, r.top() + 78.0), Align2::CENTER_CENTER, state, FontId::proportional(10.5), mix(dim(), tone, lit));
             if resp.clicked() {
                 act = id;
             }
@@ -5769,7 +5736,7 @@ impl App {
         ui.add_space(6.0);
         let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
         let cap = Rect::from_min_max(pos2(row.right() - 4.0 * 42.0 - 8.0, row.top()), row.max);
-        glass_chip(&p, cap, 20.0, 0.55);
+        glass_chip(&p, cap, R_CARD, 0.55);
         for (k, (id, glyph, name)) in [("lock", "\u{E72E}", "Блокировка"), ("sleep", "\u{E708}", "Сон"), ("restart", "\u{E777}", "Перезагрузка"), ("off", "\u{E7E8}", "Выключение")].into_iter().enumerate() {
             let hit = Rect::from_center_size(pos2(cap.left() + 25.0 + k as f32 * 42.0, cap.center().y), vec2(38.0, 34.0));
             let hot = armed == Some(id);
@@ -5781,7 +5748,7 @@ impl App {
             } else if hov > 0.0 {
                 p.circle_filled(hit.center(), 15.0, rgba(255, 255, 255, (34.0 * hov) as u8));
             }
-            p.text(hit.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(15.0), FG);
+            p.text(hit.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(15.0), fg());
             if resp.clicked() {
                 act = id;
             }
@@ -5789,7 +5756,7 @@ impl App {
         let mut folders = ui.new_child(
             egui::UiBuilder::new().max_rect(Rect::from_min_max(row.min, pos2(cap.left() - 10.0, row.bottom()))).layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
-        folders.label(RichText::new("Папки").color(DIM));
+        folders.label(RichText::new("Папки").color(dim()));
         let home = std::env::var("USERPROFILE").unwrap_or_default();
         for (name, dir) in [("Загрузки", "Downloads"), ("Документы", "Documents"), ("Рабочий стол", "Desktop"), ("Изображения", "Pictures")] {
             if jelly(&mut folders, name).clicked() {
@@ -5807,22 +5774,22 @@ impl App {
                 let resp = ui.interact(r, ui.id().with(("pt", key)), Sense::click());
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
                 let glow = ui.ctx().animate_bool_with_time(resp.id.with("lit"), lit, 0.16);
-                glass_chip(&p, r, 16.0, 0.4 + 0.5 * hov);
+                glass_chip(&p, r, R_CARD, 0.4 + 0.5 * hov);
                 if glow > 0.0 {
                     p.rect_filled(r.shrink(1.0), Rounding::same(15.0), Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), (70.0 * glow) as u8));
                 }
-                p.text(r.center(), Align2::CENTER_CENTER, label, semi(12.0), mix(mix(DIM, FG, hov), FG, glow));
+                p.text(r.center(), Align2::CENTER_CENTER, label, semi(12.0), mix(mix(dim(), fg(), hov), fg(), glow));
                 resp.clicked()
             };
-            p.text(pos2(row.left() + 4.0, row.center().y), Align2::LEFT_CENTER, "\u{E916}  Отложить", semi(12.5), DIM);
+            p.text(pos2(row.left() + 4.0, row.center().y), Align2::LEFT_CENTER, "\u{E916}  Отложить", semi(12.5), dim());
             let x0 = row.left() + 100.0;
             match self.power_timer {
                 Some((action, at, _)) => {
                     let left = at.saturating_duration_since(Instant::now()).as_secs();
                     let r = Rect::from_min_max(pos2(x0, row.top()), pos2(row.right() - 104.0, row.bottom()));
-                    glass_chip(&p, r, 16.0, 0.55);
+                    glass_chip(&p, r, R_CARD, 0.55);
                     p.rect_filled(r.shrink(1.0), Rounding::same(15.0), Color32::from_rgba_unmultiplied(moon.r(), moon.g(), moon.b(), 46));
-                    p.text(pos2(r.left() + 16.0, r.center().y), Align2::LEFT_CENTER, power_timer_label(action, left), semi(12.5), FG);
+                    p.text(pos2(r.left() + 16.0, r.center().y), Align2::LEFT_CENTER, power_timer_label(action, left), semi(12.5), fg());
                     if chip(ui, Rect::from_min_max(pos2(row.right() - 96.0, row.top()), row.max), "cancel", "Отменить", false, moon) {
                         self.power_timer = None;
                         self.notify("Отложенное действие отменено");
@@ -5968,12 +5935,12 @@ impl App {
                 ring(&p, c, 62.0, 8.0 + 2.0 * hot, v, tone);
                 let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * v;
                 p.circle_filled(c + vec2(a.cos(), a.sin()) * 62.0, 6.0 + 2.0 * hot, Color32::WHITE);
-                p.text(c - vec2(0.0, 6.0), Align2::CENTER_CENTER, format!("{:.0}", v * 100.0), light(34.0), if muted { DIM } else { FG });
-                p.text(c + vec2(0.0, 24.0), Align2::CENTER_CENTER, if muted { "без звука" } else { "громкость" }, FontId::proportional(11.5), if muted { red } else { DIM });
+                p.text(c - vec2(0.0, 6.0), Align2::CENTER_CENTER, format!("{:.0}", v * 100.0), light(34.0), if muted { dim() } else { fg() });
+                p.text(c + vec2(0.0, 24.0), Align2::CENTER_CENTER, if muted { "без звука" } else { "громкость" }, FontId::proportional(11.5), if muted { red } else { dim() });
             }
             None => {
-                ring(&p, c, 62.0, 8.0, 0.0, DIM);
-                p.text(c, Align2::CENTER_CENTER, "нет звука", FontId::proportional(12.0), DIM);
+                ring(&p, c, 62.0, 8.0, 0.0, dim());
+                p.text(c, Align2::CENTER_CENTER, "нет звука", FontId::proportional(12.0), dim());
             }
         }
         // ── микрофон под ручкой: строка без рамки
@@ -5984,13 +5951,13 @@ impl App {
             let (state, color) = match self.mic {
                 Some(true) => ("микрофон выключен", red),
                 Some(false) => ("микрофон включён", Color32::from_rgb(0x7B, 0xE0, 0x9A)),
-                None => ("микрофон не найден", DIM),
+                None => ("микрофон не найден", dim()),
             };
             if hov > 0.0 {
                 p.rect_filled(r, Rounding::same(14.0), rgba(255, 255, 255, (22.0 * hov) as u8));
             }
             p.text(pos2(r.left() + 18.0, r.center().y), Align2::CENTER_CENTER, "\u{E720}", FontId::proportional(14.0), color);
-            p.text(pos2(r.left() + 32.0, r.center().y), Align2::LEFT_CENTER, state, FontId::proportional(12.0), mix(DIM, FG, hov));
+            p.text(pos2(r.left() + 32.0, r.center().y), Align2::LEFT_CENTER, state, FontId::proportional(12.0), mix(dim(), fg(), hov));
             if resp.clicked() {
                 if let Some(m) = self.mic {
                     sys::set_mic_mute(!m);
@@ -6022,14 +5989,14 @@ impl App {
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered() && on, 0.12);
                 let lit = if k == 0 { self.quiet_prev.is_some() } else { current == Some(k - 1) && self.quiet_prev.is_none() };
                 let glow = ui.ctx().animate_bool_with_time(resp.id.with("lit"), lit, 0.18);
-                glass_chip(&p, r, 15.0, 0.4 + 0.5 * hov);
+                glass_chip(&p, r, R_ROW, 0.4 + 0.5 * hov);
                 let tone = if k == 0 { moon } else { accent() };
                 if glow > 0.0 {
                     p.rect_filled(r.shrink(1.0), Rounding::same(14.0), Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), (60.0 * glow) as u8));
                 }
-                let ink = if !on { DIM } else { mix(mix(DIM, FG, hov), FG, glow) };
+                let ink = if !on { dim() } else { mix(mix(dim(), fg(), hov), fg(), glow) };
                 if k == 0 {
-                    p.text(pos2(r.left() + 20.0, r.center().y), Align2::CENTER_CENTER, "\u{E708}", FontId::proportional(13.0), if on { moon } else { DIM });
+                    p.text(pos2(r.left() + 20.0, r.center().y), Align2::CENTER_CENTER, "\u{E708}", FontId::proportional(13.0), if on { moon } else { dim() });
                     p.text(pos2(r.left() + 36.0, r.center().y), Align2::LEFT_CENTER, if self.quiet_prev.is_some() { "Как было" } else { "Тихо" }, semi(12.0), ink);
                 } else {
                     p.text(r.center(), Align2::CENTER_CENTER, format!("{:.0}%", VOL_PRESETS[k - 1] * 100.0), semi(12.0), ink);
@@ -6087,7 +6054,7 @@ impl App {
                     Some(tex) => rounded_image(p, tex, icon_r, 0.0),
                     None => {
                         let letter: String = app.name.chars().take(1).collect();
-                        p.text(icon_r.center(), Align2::CENTER_CENTER, letter, semi(14.0), FG);
+                        p.text(icon_r.center(), Align2::CENTER_CENTER, letter, semi(14.0), fg());
                     }
                 }
                 if app.muted {
@@ -6097,8 +6064,8 @@ impl App {
                     mute = Some(i);
                 }
                 p.with_clip_rect(Rect::from_min_max(pos2(row.left() + 36.0, row.top()), pos2(row.left() + 166.0, row.bottom())))
-                    .text(pos2(row.left() + 36.0, row.center().y), Align2::LEFT_CENTER, &app.name, semi(12.5), if app.active { FG } else { DIM });
-                p.text(pos2(row.right() - 2.0, row.center().y), Align2::RIGHT_CENTER, format!("{:.0}%", app.level * 100.0), FontId::proportional(11.5), DIM);
+                    .text(pos2(row.left() + 36.0, row.center().y), Align2::LEFT_CENTER, &app.name, semi(12.5), if app.active { fg() } else { dim() });
+                p.text(pos2(row.right() - 2.0, row.center().y), Align2::RIGHT_CENTER, format!("{:.0}%", app.level * 100.0), FontId::proportional(11.5), dim());
                 let mut v = app.level;
                 let track = Rect::from_min_max(pos2(row.left() + 174.0, row.center().y - 6.0), pos2(row.right() - 44.0, row.center().y + 6.0));
                 let tone = if app.active { accent() } else { Color32::from_rgb(150, 150, 166) };
@@ -6136,7 +6103,7 @@ impl App {
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new(head).font(semi(16.5)));
                 if !sub.is_empty() {
-                    ui.label(RichText::new(sub).color(DIM));
+                    ui.label(RichText::new(sub).color(dim()));
                 }
                 if !city_set {
                     ui.add_space(6.0);
@@ -6158,14 +6125,14 @@ impl App {
                 let line = format!("Ощущается {} · влажность {:.0}% · ветер {:.1} м/с", weather::deg(w.feels), w.humidity, w.wind).replace('.', ",");
                 let room = ui.available_width() - if w.sunrise.is_empty() { 0.0 } else { 70.0 };
                 let line = elide(ui.painter(), &line, egui::TextStyle::Body.resolve(ui.style()), room);
-                ui.label(RichText::new(line).color(DIM));
+                ui.label(RichText::new(line).color(dim()));
             });
             if !w.sunrise.is_empty() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.vertical(|ui| {
                         ui.add_space(10.0);
-                        ui.label(RichText::new(format!("↑ {}", w.sunrise)).color(DIM).size(12.5)).on_hover_text("Восход");
-                        ui.label(RichText::new(format!("↓ {}", w.sunset)).color(DIM).size(12.5)).on_hover_text("Закат");
+                        ui.label(RichText::new(format!("↑ {}", w.sunrise)).color(dim()).size(12.5)).on_hover_text("Восход");
+                        ui.label(RichText::new(format!("↓ {}", w.sunset)).color(dim()).size(12.5)).on_hover_text("Закат");
                     });
                 });
             }
@@ -6188,13 +6155,13 @@ impl App {
                         weather::Tip::Wind => ("≋", Color32::from_rgb(0xC8, 0xD4, 0xE0)),
                     };
                     let font = FontId::proportional(12.5);
-                    let tw = ui.painter().layout_no_wrap(tip.clone(), font.clone(), FG).size().x;
+                    let tw = ui.painter().layout_no_wrap(tip.clone(), font.clone(), fg()).size().x;
                     let (r, _) = ui.allocate_exact_size(vec2(tw + 38.0, 26.0), Sense::hover());
                     let p = ui.painter();
                     p.rect_filled(r, Rounding::same(13.0), tint.gamma_multiply(0.16));
                     p.rect_stroke(r, Rounding::same(13.0), Stroke::new(1.0_f32, tint.gamma_multiply(0.45)));
                     p.text(pos2(r.left() + 16.0, r.center().y), Align2::CENTER_CENTER, glyph, FontId::proportional(13.0), tint);
-                    p.text(pos2(r.left() + 28.0, r.center().y), Align2::LEFT_CENTER, tip, font, FG);
+                    p.text(pos2(r.left() + 28.0, r.center().y), Align2::LEFT_CENTER, tip, font, fg());
                 }
             });
             ui.add_space(6.0);
@@ -6204,7 +6171,7 @@ impl App {
         if w.hours.len() >= 4 {
             let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 132.0), Sense::hover());
             let p = ui.painter().with_clip_rect(area);
-            glass_chip(&p, area, 16.0, 0.4);
+            glass_chip(&p, area, R_CARD, 0.4);
             let n = w.hours.len();
             let (lo, hi) = w.hours.iter().fold((f64::MAX, f64::MIN), |(lo, hi), h| (lo.min(h.temp), hi.max(h.temp)));
             let span = (hi - lo).max(2.0);
@@ -6246,9 +6213,9 @@ impl App {
                 // подписи — каждые три часа, чтобы не слипались
                 if i % 3 == 0 {
                     let now = i == 0;
-                    p.circle_filled(pos2(x, py(h.temp)), if now { 4.5 } else { 3.0 }, if now { FG } else { c });
-                    p.text(pos2(x, py(h.temp) - 9.0), Align2::CENTER_BOTTOM, weather::deg(h.temp), semi(12.5), FG);
-                    p.text(pos2(x, area.bottom() - 6.0), Align2::CENTER_BOTTOM, if now { "сейчас".to_string() } else { format!("{:02}:00", h.hour) }, FontId::proportional(11.0), if now { FG } else { DIM });
+                    p.circle_filled(pos2(x, py(h.temp)), if now { 4.5 } else { 3.0 }, if now { fg() } else { c });
+                    p.text(pos2(x, py(h.temp) - 9.0), Align2::CENTER_BOTTOM, weather::deg(h.temp), semi(12.5), fg());
+                    p.text(pos2(x, area.bottom() - 6.0), Align2::CENTER_BOTTOM, if now { "сейчас".to_string() } else { format!("{:02}:00", h.hour) }, FontId::proportional(11.0), if now { fg() } else { dim() });
                 }
             }
             if wet >= 15.0 {
@@ -6266,8 +6233,8 @@ impl App {
                 for (i, d) in w.days.iter().enumerate() {
                     let (r, _) = c[i].allocate_exact_size(vec2(c[i].available_width(), 74.0), Sense::hover());
                     let p = c[i].painter();
-                    glass_chip(p, r, 12.0, if i == 0 { 0.75 } else { 0.4 });
-                    p.text(r.left_top() + vec2(12.0, 9.0), Align2::LEFT_TOP, if i == 0 { "Сегодня" } else { d.label.as_str() }, semi(12.0), if i == 0 { FG } else { DIM });
+                    glass_chip(p, r, R_ROW, if i == 0 { 0.75 } else { 0.4 });
+                    p.text(r.left_top() + vec2(12.0, 9.0), Align2::LEFT_TOP, if i == 0 { "Сегодня" } else { d.label.as_str() }, semi(12.0), if i == 0 { fg() } else { dim() });
                     let tc = weather::tint(d.code);
                     let icon_c = Color32::from_rgb(tc[0], tc[1], tc[2]);
                     let ic = r.right_top() + vec2(-20.0, 17.0);
@@ -6275,8 +6242,8 @@ impl App {
                     p.text(ic, Align2::CENTER_CENTER, weather::describe(d.code).0, FontId::proportional(16.0), icon_c);
                     // ряд «мин ─── макс»
                     let y = r.bottom() - 17.0;
-                    let lo_g = p.text(pos2(r.left() + 12.0, y), Align2::LEFT_CENTER, weather::deg(d.min), FontId::proportional(12.0), DIM);
-                    let hi_g = p.text(pos2(r.right() - 12.0, y), Align2::RIGHT_CENTER, weather::deg(d.max), semi(12.5), FG);
+                    let lo_g = p.text(pos2(r.left() + 12.0, y), Align2::LEFT_CENTER, weather::deg(d.min), FontId::proportional(12.0), dim());
+                    let hi_g = p.text(pos2(r.right() - 12.0, y), Align2::RIGHT_CENTER, weather::deg(d.max), semi(12.5), fg());
                     let track = Rect::from_min_max(pos2(lo_g.right() + 7.0, y - 2.0), pos2(hi_g.left() - 7.0, y + 2.0));
                     if track.width() > 8.0 {
                         p.rect_filled(track, Rounding::same(2.0), rgba(255, 255, 255, 20));
@@ -6311,7 +6278,7 @@ impl App {
         ui.add_space(8.0);
         let (card, _) = ui.allocate_exact_size(vec2(ui.available_width(), 66.0), Sense::hover());
         let p = ui.painter().clone();
-        glass_chip(&p, card, 16.0, 0.45);
+        glass_chip(&p, card, R_CARD, 0.45);
         // время города (восход и закат даны в его поясе)
         let city = chrono::Utc::now().naive_utc() + chrono::Duration::seconds(w.utc_offset as i64);
         let date = if test_mode() {
@@ -6323,7 +6290,7 @@ impl App {
         let (illum, name, waxing, to_full) = moon_phase(moon_age(date));
         let mc = pos2(card.left() + 36.0, card.center().y);
         moon_disc(&p, mc, 19.0, illum, waxing);
-        p.text(pos2(card.left() + 68.0, card.top() + 15.0), Align2::LEFT_TOP, name, semi(13.0), FG);
+        p.text(pos2(card.left() + 68.0, card.top() + 15.0), Align2::LEFT_TOP, name, semi(13.0), fg());
         let sub = match to_full {
             0 => format!("освещена {:.0}% · сегодня полнолуние", illum * 100.0),
             // фаза уже называется «Полнолуние» — не повторяем слово: «следующее через 29 дней»
@@ -6334,12 +6301,12 @@ impl App {
                 count_ru(n as usize, ["день", "дня", "дней"])
             ),
         };
-        p.text(pos2(card.left() + 68.0, card.top() + 35.0), Align2::LEFT_TOP, sub, FontId::proportional(11.5), DIM);
+        p.text(pos2(card.left() + 68.0, card.top() + 35.0), Align2::LEFT_TOP, sub, FontId::proportional(11.5), dim());
         // ── солнце: дуга от восхода к закату и точка «сейчас»
         let hm = |s: &str| s.split_once(':').and_then(|(h, m)| Some(h.trim().parse::<f32>().ok()? + m.trim().parse::<f32>().ok()? / 60.0));
         let (Some(rise), Some(set)) = (hm(&w.sunrise), hm(&w.sunset)) else {
             // полярный день или ночь: времени восхода/заката нет
-            p.text(pos2(card.right() - 24.0, card.center().y), Align2::RIGHT_CENTER, "солнце сегодня не восходит или не заходит", FontId::proportional(11.5), DIM);
+            p.text(pos2(card.right() - 24.0, card.center().y), Align2::RIGHT_CENTER, "солнце сегодня не восходит или не заходит", FontId::proportional(11.5), dim());
             return;
         };
         let arc = Rect::from_min_max(pos2(card.center().x + 40.0, card.top() + 12.0), pos2(card.right() - 20.0, card.bottom() - 18.0));
@@ -6358,10 +6325,10 @@ impl App {
             p.circle_filled(sun, 9.0, rgba(255, 200, 90, 50));
             p.circle_filled(sun, 5.0, Color32::from_rgb(255, 204, 92));
         }
-        p.text(pos2(arc.left(), base + 9.0), Align2::CENTER_CENTER, &w.sunrise, FontId::proportional(10.5), DIM);
-        p.text(pos2(arc.right(), base + 9.0), Align2::CENTER_CENTER, &w.sunset, FontId::proportional(10.5), DIM);
+        p.text(pos2(arc.left(), base + 9.0), Align2::CENTER_CENTER, &w.sunrise, FontId::proportional(10.5), dim());
+        p.text(pos2(arc.right(), base + 9.0), Align2::CENTER_CENTER, &w.sunset, FontId::proportional(10.5), dim());
         let len = day_length(rise, set);
-        p.text(pos2(arc.center().x, base + 9.0), Align2::CENTER_CENTER, format!("день {} ч {} мин", len / 60, len % 60), FontId::proportional(11.0), FG);
+        p.text(pos2(arc.center().x, base + 9.0), Align2::CENTER_CENTER, format!("день {} ч {} мин", len / 60, len % 60), FontId::proportional(11.0), fg());
     }
 
     /// Инструменты → Таймер: циферблат с остатком, готовые отрезки, своё время и секундомер.
@@ -6396,7 +6363,7 @@ impl App {
             p.circle_filled(tip, 9.0, Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), 50));
             p.circle_filled(tip, 5.0, Color32::WHITE);
         }
-        p.text(c - vec2(0.0, 5.0), Align2::CENTER_CENTER, text, light(30.0), if live { FG } else { DIM });
+        p.text(c - vec2(0.0, 5.0), Align2::CENTER_CENTER, text, light(30.0), if live { fg() } else { dim() });
         let sub = match (live, self.focus) {
             _ if paused => "\u{E769} пауза".to_string(),
             (true, Some((true, _))) => "перерыв".to_string(),
@@ -6408,7 +6375,7 @@ impl App {
             }
             _ => "таймер".to_string(),
         };
-        p.text(c + vec2(0.0, 24.0), Align2::CENTER_CENTER, sub, FontId::proportional(11.5), DIM);
+        p.text(c + vec2(0.0, 24.0), Align2::CENTER_CENTER, sub, FontId::proportional(11.5), dim());
 
         let mut side = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(pos2(area.left() + 178.0, area.top() + 4.0), area.max)));
         let ui = &mut side;
@@ -6423,7 +6390,7 @@ impl App {
         });
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Своё время, мин").color(DIM));
+            ui.label(RichText::new("Своё время, мин").color(dim()));
             ui.add(egui::TextEdit::singleline(&mut self.timer_custom).margin(egui::Margin::symmetric(9.0, 7.0)).desired_width(60.0));
             if jelly(ui, "Старт").clicked() {
                 start = self.timer_custom.trim().replace(',', ".").parse::<f64>().ok();
@@ -6469,11 +6436,11 @@ impl App {
         }
         ui.add_space(6.0);
         let (card, _) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::hover());
-        glass_chip(ui.painter(), card, 14.0, 0.5);
+        glass_chip(ui.painter(), card, R_ROW, 0.5);
         let run = self.sw_acc + self.sw_start.map_or(Duration::ZERO, |t| t.elapsed());
         let secs = run.as_secs();
-        ui.painter().text(pos2(card.left() + 16.0, card.center().y), Align2::LEFT_CENTER, "Секундомер", FontId::proportional(13.0), DIM);
-        ui.painter().text(pos2(card.left() + 108.0, card.center().y), Align2::LEFT_CENTER, format!("{:02}:{:02}.{}", secs / 60, secs % 60, run.subsec_millis() / 100), semi(18.0), FG);
+        ui.painter().text(pos2(card.left() + 16.0, card.center().y), Align2::LEFT_CENTER, "Секундомер", FontId::proportional(13.0), dim());
+        ui.painter().text(pos2(card.left() + 108.0, card.center().y), Align2::LEFT_CENTER, format!("{:02}:{:02}.{}", secs / 60, secs % 60, run.subsec_millis() / 100), semi(18.0), fg());
         let mut buttons = ui.new_child(egui::UiBuilder::new().max_rect(card.shrink2(vec2(8.0, 7.0))).layout(egui::Layout::right_to_left(egui::Align::Center)));
         if jelly(&mut buttons, "Сброс").clicked() {
             self.sw_start = None;
@@ -6508,14 +6475,14 @@ impl App {
             let resp = ui.interact(r, ui.id().with(("world", i)), Sense::click()).on_hover_text("Правый щелчок — убрать город");
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
             let p = ui.painter();
-            glass_chip(p, r, 14.0, 0.4 + 0.4 * hov);
+            glass_chip(p, r, R_ROW, 0.4 + 0.4 * hov);
             // небо по местному часу города (восход и закат условно 7:00 и 19:00)
             let h = there.hour() as f32 + there.minute() as f32 / 60.0;
             let (top, low) = sky_colors(day_phase(h, 7.0, 19.0));
             gradient_rrect(p, r.shrink(1.0), 13.0, |q| mix_a(top, low, ((q.y - r.top()) / r.height()).clamp(0.0, 1.0)));
-            p.text(pos2(r.left() + 12.0, r.top() + 8.0), Align2::LEFT_TOP, city.show, semi(12.0), FG);
-            p.text(pos2(r.left() + 12.0, r.bottom() - 8.0), Align2::LEFT_BOTTOM, label, FontId::proportional(11.0), DIM);
-            p.text(pos2(r.right() - 12.0, r.center().y), Align2::RIGHT_CENTER, there.format("%H:%M").to_string(), light(20.0), FG);
+            p.text(pos2(r.left() + 12.0, r.top() + 8.0), Align2::LEFT_TOP, city.show, semi(12.0), fg());
+            p.text(pos2(r.left() + 12.0, r.bottom() - 8.0), Align2::LEFT_BOTTOM, label, FontId::proportional(11.0), dim());
+            p.text(pos2(r.right() - 12.0, r.center().y), Align2::RIGHT_CENTER, there.format("%H:%M").to_string(), light(20.0), fg());
             if resp.secondary_clicked() {
                 remove = Some(i);
             }
@@ -6530,7 +6497,7 @@ impl App {
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rest).layout(egui::Layout::left_to_right(egui::Align::Center)));
         match &mut self.world_edit {
             Some(text) => {
-                let r = child.add(egui::TextEdit::singleline(text).hint_text(RichText::new("Город, Enter").color(DIM)).margin(egui::Margin::symmetric(9.0, 7.0)).desired_width((rest.width() - 10.0).clamp(80.0, 170.0)));
+                let r = child.add(egui::TextEdit::singleline(text).hint_text(RichText::new("Город, Enter").color(dim())).margin(egui::Margin::symmetric(9.0, 7.0)).desired_width((rest.width() - 10.0).clamp(80.0, 170.0)));
                 if self.world_focus {
                     r.request_focus();
                     self.world_focus = false;
@@ -6576,20 +6543,20 @@ impl App {
         ui.add_space(8.0);
         let (card, _) = ui.allocate_exact_size(vec2(ui.available_width(), 78.0), Sense::hover());
         let p = ui.painter().clone();
-        glass_chip(&p, card, 16.0, 0.45);
+        glass_chip(&p, card, R_CARD, 0.45);
         let today = chrono::Local::now().date_naive();
         let week = week_minutes(&self.cfg.focus_log, today);
         let streak = focus_streak(&self.cfg.focus_log, today);
         let tone = Color32::from_rgb(0xFF, 0xB3, 0x40);
         let total: u32 = week.iter().sum();
         if total == 0 {
-            p.text(pos2(card.left() + 18.0, card.center().y - 9.0), Align2::LEFT_CENTER, "Неделя фокуса", semi(13.0), FG);
-            p.text(pos2(card.left() + 18.0, card.center().y + 11.0), Align2::LEFT_CENTER, "Запустите «Фокус 25/5» — здесь появится ваша неделя и серия дней", FontId::proportional(11.5), DIM);
+            p.text(pos2(card.left() + 18.0, card.center().y - 9.0), Align2::LEFT_CENTER, "Неделя фокуса", semi(13.0), fg());
+            p.text(pos2(card.left() + 18.0, card.center().y + 11.0), Align2::LEFT_CENTER, "Запустите «Фокус 25/5» — здесь появится ваша неделя и серия дней", FontId::proportional(11.5), dim());
             return;
         }
         // слева — итоги
-        p.text(pos2(card.left() + 18.0, card.top() + 16.0), Align2::LEFT_TOP, format!("Сегодня {}", fmt_minutes(week[6])), semi(13.5), FG);
-        p.text(pos2(card.left() + 18.0, card.top() + 38.0), Align2::LEFT_TOP, format!("за неделю {}", fmt_minutes(total)), FontId::proportional(11.5), DIM);
+        p.text(pos2(card.left() + 18.0, card.top() + 16.0), Align2::LEFT_TOP, format!("Сегодня {}", fmt_minutes(week[6])), semi(13.5), fg());
+        p.text(pos2(card.left() + 18.0, card.top() + 38.0), Align2::LEFT_TOP, format!("за неделю {}", fmt_minutes(total)), FontId::proportional(11.5), dim());
         if streak > 1 {
             p.text(pos2(card.left() + 18.0, card.top() + 54.0), Align2::LEFT_TOP, format!("\u{E945} серия {} {}", streak, count_ru(streak as usize, ["день", "дня", "дней"]).split_once(' ').map_or("", |s| s.1)), FontId::proportional(11.5), tone);
         }
@@ -6615,7 +6582,7 @@ impl App {
             }
             let hit = Rect::from_center_size(pos2(cx, area.center().y), vec2(step, area.height() + 20.0));
             ui.interact(hit, ui.id().with(("focus-day", i)), Sense::hover()).on_hover_text(format!("{} · {}", DAYS[day.weekday().num_days_from_monday() as usize], fmt_minutes(*m)));
-            p.text(pos2(cx, card.bottom() - 10.0), Align2::CENTER_CENTER, DAYS[day.weekday().num_days_from_monday() as usize], FontId::proportional(10.5), if is_today { FG } else { DIM });
+            p.text(pos2(cx, card.bottom() - 10.0), Align2::CENTER_CENTER, DAYS[day.weekday().num_days_from_monday() as usize], FontId::proportional(10.5), if is_today { fg() } else { dim() });
         }
     }
 
@@ -6630,7 +6597,7 @@ impl App {
             ui.add(
                 egui::TextEdit::singleline(&mut self.clip_query)
                     .margin(egui::Margin::symmetric(9.0, 7.0))
-                    .hint_text(RichText::new("Поиск по буферу. Щелчок по строке копирует её снова").color(DIM))
+                    .hint_text(RichText::new("Поиск по буферу. Щелчок по строке копирует её снова").color(dim()))
                     .desired_width(w),
             );
             if jelly(ui, "Очистить").on_hover_text("Убрать историю и снимки. Закреплённые записи останутся").clicked() {
@@ -6646,7 +6613,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(RichText::new("\u{E8AC}").size(12.0).color(accent()));
-                ui.label(RichText::new("Последнее:").color(DIM).size(11.5));
+                ui.label(RichText::new("Последнее:").color(dim()).size(11.5));
                 for (tx, name, tip) in ClipTx::ALL {
                     let out = clip_transform(tx, &last);
                     let same = out == last;
@@ -6684,11 +6651,11 @@ impl App {
                     let label = format!("{}×{}", im.w, im.h);
                     let lr = Rect::from_min_size(pos2(r.left() + 4.0, r.bottom() - 17.0), vec2(r.width() - 8.0, 14.0));
                     p.rect_filled(lr, Rounding::same(5.0), rgba(10, 10, 18, (170.0 * hov) as u8));
-                    p.text(lr.center(), Align2::CENTER_CENTER, label, FontId::proportional(10.0), FG.gamma_multiply(hov));
+                    p.text(lr.center(), Align2::CENTER_CENTER, label, FontId::proportional(10.0), fg().gamma_multiply(hov));
                     let xr = Rect::from_center_size(pos2(r.right() - 9.0, r.top() + 9.0), vec2(16.0, 16.0));
                     let xb = ui.interact(xr, ui.id().with(("clip-img-x", im.hash)), Sense::click());
                     p.circle_filled(xr.center(), 8.0, rgba(10, 10, 18, (200.0 * hov) as u8));
-                    p.text(xr.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(8.0), FG.gamma_multiply(hov));
+                    p.text(xr.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(8.0), fg().gamma_multiply(hov));
                     if xb.clicked() {
                         drop = Some(i);
                     }
@@ -6747,7 +6714,7 @@ impl App {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if rows.is_empty() {
                 ui.add_space(30.0);
-                ui.vertical_centered(|ui| ui.label(RichText::new("Ничего не найдено").color(DIM)));
+                ui.vertical_centered(|ui| ui.label(RichText::new("Ничего не найдено").color(dim())));
             }
             for (i, (pinned, c)) in rows.iter().enumerate() {
                 // из кэша: smart_hint проверяет пути на диске, а путь на отключённый сетевой диск
@@ -6756,10 +6723,10 @@ impl App {
                 let preview: String = c.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(110).collect();
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
-                glass_chip(ui.painter(), r, 11.0, 0.4 + 0.5 * hov);
+                glass_chip(ui.painter(), r, R_CTRL, 0.4 + 0.5 * hov);
                 let (glyph, color) = match &hint {
                     Some(h) => (h.glyph, Color32::from_rgb(h.color[0], h.color[1], h.color[2])),
-                    None => ("\u{E8C8}", DIM),
+                    None => ("\u{E8C8}", dim()),
                 };
                 ui.painter().text(pos2(r.left() + 20.0, r.center().y), Align2::CENTER_CENTER, glyph, FontId::proportional(14.0), color);
                 // справа: булавка и, если остров узнал содержимое, действие
@@ -6767,14 +6734,14 @@ impl App {
                 let pb = ui.interact(pr, ui.id().with(("clip-pin", i)), Sense::click()).on_hover_text(if *pinned { "Открепить" } else { "Закрепить: запись останется после перезапуска" });
                 let ph = ui.ctx().animate_bool_with_time(pb.id.with("hov"), pb.hovered(), 0.10);
                 if *pinned || ph > 0.0 {
-                    glass_chip(ui.painter(), pr, 9.0, 0.5 + 0.6 * ph);
+                    glass_chip(ui.painter(), pr, R_CTRL, 0.5 + 0.6 * ph);
                 }
-                ui.painter().text(pr.center(), Align2::CENTER_CENTER, if *pinned { "\u{E840}" } else { "\u{E718}" }, FontId::proportional(12.5), if *pinned { accent() } else if hov > 0.0 || ph > 0.0 { FG } else { mix(DIM, BG, 0.45) });
+                ui.painter().text(pr.center(), Align2::CENTER_CENTER, if *pinned { "\u{E840}" } else { "\u{E718}" }, FontId::proportional(12.5), if *pinned { accent() } else if hov > 0.0 || ph > 0.0 { fg() } else { mix(dim(), BG, 0.45) });
                 let act_w = if hint.is_some() { 158.0 } else { 0.0 };
                 let text_right = r.right() - 40.0 - if hint.is_some() { act_w + 6.0 } else { 0.0 };
                 ui.painter()
                     .with_clip_rect(Rect::from_min_max(pos2(r.left() + 38.0, r.top()), pos2(text_right, r.bottom())))
-                    .text(pos2(r.left() + 38.0, r.center().y), Align2::LEFT_CENTER, preview, FontId::proportional(13.0), FG);
+                    .text(pos2(r.left() + 38.0, r.center().y), Align2::LEFT_CENTER, preview, FontId::proportional(13.0), fg());
                 let mut used = false;
                 if pb.clicked() {
                     pin = Some((c.clone(), !*pinned));
@@ -6784,7 +6751,7 @@ impl App {
                     let br = Rect::from_min_max(pos2(r.right() - 40.0 - act_w, r.top() + 4.0), pos2(r.right() - 40.0, r.bottom() - 4.0));
                     let b = ui.interact(br, ui.id().with(("clip-act", i)), Sense::click());
                     let bh = ui.ctx().animate_bool_with_time(b.id.with("hov"), b.hovered(), 0.10);
-                    glass_chip(ui.painter(), br, 9.0, 0.6 + 0.6 * bh);
+                    glass_chip(ui.painter(), br, R_CTRL, 0.6 + 0.6 * bh);
                     ui.painter().with_clip_rect(br).text(br.center(), Align2::CENTER_CENTER, &h.label, semi(12.0), accent());
                     if b.clicked() {
                         act = Some(h.act);
@@ -6877,7 +6844,7 @@ impl App {
                 let color = Color32::from_rgb(c[0], c[1], c[2]);
                 let on = self.inbox_filter.as_deref() == Some(app.as_str());
                 let label = format!("{app} {n}");
-                let tw = ui.painter().layout_no_wrap(label.clone(), FontId::proportional(12.0), FG).size().x;
+                let tw = ui.painter().layout_no_wrap(label.clone(), FontId::proportional(12.0), fg()).size().x;
                 let (r, resp) = ui.allocate_exact_size(vec2(tw + 28.0, 24.0), Sense::click());
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
                 let t = ui.ctx().animate_bool_with_time(ui.id().with(("inbox-chip", k, app.as_str())), on, 0.15);
@@ -6886,7 +6853,7 @@ impl App {
                 p.rect_filled(r, Rounding::same(12.0), mix(rgba(255, 255, 255, (10.0 + 14.0 * hov) as u8), color.gamma_multiply(0.35), t));
                 p.rect_stroke(r, Rounding::same(12.0), Stroke::new(1.0_f32, mix(rgba(255, 255, 255, 22), color, t)));
                 p.circle_filled(pos2(r.left() + 12.0, r.center().y), 3.5, color);
-                p.text(pos2(r.left() + 20.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(12.0), mix(DIM, FG, t.max(hov)));
+                p.text(pos2(r.left() + 20.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(12.0), mix(dim(), fg(), t.max(hov)));
                 let tip = if on { "Показать все сообщения".to_string() } else { format!("Только {app}") };
                 if resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     toggle = Some(if on { None } else { Some(app.clone()) });
@@ -6913,7 +6880,7 @@ impl App {
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 6.0, 50.0), Sense::click());
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
                 let p = ui.painter();
-                glass_chip(p, r, 14.0, 0.4 + 0.5 * hov);
+                glass_chip(p, r, R_ROW, 0.4 + 0.5 * hov);
                 // цветная полоска слева — по мессенджеру
                 let c = Color32::from_rgb(it.color[0], it.color[1], it.color[2]);
                 let letter: String = it.title.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().collect()).unwrap_or_else(|| "·".into());
@@ -6921,23 +6888,23 @@ impl App {
                 icon_disc(p, pos2(r.left() + 27.0, r.center().y), 16.0, top, it.color, &letter, 14.0);
                 let x = r.left() + 54.0;
                 let when = ago_ru((now - it.at).num_minutes(), &it.at.format("%H:%M").to_string());
-                let when_w = p.layout_no_wrap(when.clone(), FontId::proportional(11.5), DIM).size().x;
+                let when_w = p.layout_no_wrap(when.clone(), FontId::proportional(11.5), dim()).size().x;
                 let close = Rect::from_center_size(pos2(r.right() - 20.0, r.center().y), vec2(26.0, 26.0));
                 let right = r.right() - 14.0 - if hov > 0.0 { 30.0 } else { 0.0 };
                 let clip = p.with_clip_rect(Rect::from_min_max(pos2(x, r.top()), pos2(right - when_w - 10.0, r.bottom())));
-                let head = clip.text(pos2(x, r.top() + 9.0), Align2::LEFT_TOP, &it.title, semi(13.0), FG);
-                clip.text(pos2(head.right() + 8.0, r.top() + 10.5), Align2::LEFT_TOP, &it.app, FontId::proportional(11.0), mix(c, DIM, 0.35));
+                let head = clip.text(pos2(x, r.top() + 9.0), Align2::LEFT_TOP, &it.title, semi(13.0), fg());
+                clip.text(pos2(head.right() + 8.0, r.top() + 10.5), Align2::LEFT_TOP, &it.app, FontId::proportional(11.0), mix(c, dim(), 0.35));
                 let body: String = it.body.split_whitespace().collect::<Vec<_>>().join(" ");
                 let body = if body.is_empty() { "без текста".to_string() } else { body };
                 p.with_clip_rect(Rect::from_min_max(pos2(x, r.top()), pos2(right, r.bottom())))
-                    .text(pos2(x, r.top() + 28.0), Align2::LEFT_TOP, body, FontId::proportional(12.5), DIM);
-                p.text(pos2(right, r.top() + 10.0), Align2::RIGHT_TOP, when, FontId::proportional(11.5), mix(DIM, BG, 0.25));
+                    .text(pos2(x, r.top() + 28.0), Align2::LEFT_TOP, body, FontId::proportional(12.5), dim());
+                p.text(pos2(right, r.top() + 10.0), Align2::RIGHT_TOP, when, FontId::proportional(11.5), mix(dim(), BG, 0.25));
                 let mut used = false;
                 if hov > 0.0 {
                     let b = ui.interact(close, ui.id().with(("inbox-x", i)), Sense::click()).on_hover_text("Убрать");
                     let bh = ui.ctx().animate_bool_with_time(b.id.with("hov"), b.hovered(), 0.10);
-                    glass_chip(ui.painter(), close, 9.0, (0.3 + 0.7 * bh) * hov);
-                    ui.painter().text(close.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(10.5), mix(DIM, FG, bh).gamma_multiply(hov));
+                    glass_chip(ui.painter(), close, R_CTRL, (0.3 + 0.7 * bh) * hov);
+                    ui.painter().text(close.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(10.5), mix(dim(), fg(), bh).gamma_multiply(hov));
                     if b.clicked() {
                         drop = Some(i);
                         used = true;
@@ -7041,7 +7008,7 @@ impl App {
         // слева миниатюра: вписана в рамку с сохранением пропорций
         let frame = Rect::from_min_size(row.min, vec2(330.0, row.height()));
         let p = ui.painter().clone();
-        glass_chip(&p, frame, 16.0, 0.4);
+        glass_chip(&p, frame, R_CARD, 0.4);
         let inner = frame.shrink(8.0);
         let k = (inner.width() / size.0 as f32).min(inner.height() / size.1 as f32);
         let img = Rect::from_center_size(inner.center(), vec2(size.0 as f32 * k, size.1 as f32 * k));
@@ -7077,15 +7044,15 @@ impl App {
         if self.shot_marks.is_empty() && draw.hovered() && self.shot_drag.is_none() {
             let tip = Rect::from_center_size(pos2(img.center().x, img.bottom() - 14.0), vec2(176.0, 20.0));
             p.rect_filled(tip, Rounding::same(10.0), Color32::from_rgba_unmultiplied(10, 10, 18, 190));
-            p.text(tip.center(), Align2::CENTER_CENTER, "Протяните, чтобы обвести", FontId::proportional(11.5), FG);
+            p.text(tip.center(), Align2::CENTER_CENTER, "Протяните, чтобы обвести", FontId::proportional(11.5), fg());
         }
 
         let x = frame.right() + 18.0;
-        p.text(pos2(x, row.top() + 4.0), Align2::LEFT_TOP, "Снимок сохранён", semi(17.0), FG);
+        p.text(pos2(x, row.top() + 4.0), Align2::LEFT_TOP, "Снимок сохранён", semi(17.0), fg());
         p.with_clip_rect(Rect::from_min_max(pos2(x, row.top()), row.max))
-            .text(pos2(x, row.top() + 30.0), Align2::LEFT_TOP, format!("{} × {} · уже в буфере обмена", size.0, size.1), FontId::proportional(12.5), DIM);
+            .text(pos2(x, row.top() + 30.0), Align2::LEFT_TOP, format!("{} × {} · уже в буфере обмена", size.0, size.1), FontId::proportional(12.5), dim());
         p.with_clip_rect(Rect::from_min_max(pos2(x, row.top()), row.max))
-            .text(pos2(x, row.top() + 48.0), Align2::LEFT_TOP, &name, FontId::proportional(12.0), mix(DIM, BG, 0.25));
+            .text(pos2(x, row.top() + 48.0), Align2::LEFT_TOP, &name, FontId::proportional(12.0), mix(dim(), BG, 0.25));
         let mut act = None;
         let mut side = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(pos2(x, row.top() + 74.0), row.max)));
         let marked = !self.shot_marks.is_empty();
@@ -7251,7 +7218,7 @@ impl App {
             ui.add(
                 egui::TextEdit::singleline(&mut self.note_query)
                     .margin(egui::Margin::symmetric(9.0, 7.0))
-                    .hint_text(RichText::new("Поиск").color(DIM))
+                    .hint_text(RichText::new("Поиск").color(dim()))
                     .desired_width(left.width() - 56.0),
             );
             add = jelly(ui, "+").on_hover_text("Новая заметка").clicked();
@@ -7269,17 +7236,17 @@ impl App {
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::click());
                 let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
                 let on = i == self.note_sel;
-                glass_chip(ui.painter(), r, 11.0, if on { 1.0 } else { 0.3 + 0.4 * hov });
+                glass_chip(ui.painter(), r, R_CTRL, if on { 1.0 } else { 0.3 + 0.4 * hov });
                 let p = ui.painter().with_clip_rect(r.shrink2(vec2(10.0, 0.0)));
                 let (done, total) = store::check_progress(n);
                 let p = if total > 0 {
-                    let badge = p.text(pos2(r.right() - 10.0, r.top() + 14.0), Align2::RIGHT_CENTER, format!("{done}/{total}"), FontId::proportional(11.0), if done == total { accent() } else { DIM });
+                    let badge = p.text(pos2(r.right() - 10.0, r.top() + 14.0), Align2::RIGHT_CENTER, format!("{done}/{total}"), FontId::proportional(11.0), if done == total { accent() } else { dim() });
                     p.with_clip_rect(Rect::from_min_max(r.min + vec2(10.0, 0.0), pos2(badge.left() - 6.0, r.bottom())))
                 } else {
                     p
                 };
-                p.text(pos2(r.left() + 12.0, r.top() + 14.0), Align2::LEFT_CENTER, title, semi(13.0), if on { accent() } else { FG });
-                p.text(pos2(r.left() + 12.0, r.top() + 31.0), Align2::LEFT_CENTER, if more.is_empty() { "без продолжения".to_string() } else { more }, FontId::proportional(11.5), DIM);
+                p.text(pos2(r.left() + 12.0, r.top() + 14.0), Align2::LEFT_CENTER, title, semi(13.0), if on { accent() } else { fg() });
+                p.text(pos2(r.left() + 12.0, r.top() + 31.0), Align2::LEFT_CENTER, if more.is_empty() { "без продолжения".to_string() } else { more }, FontId::proportional(11.5), dim());
                 if resp.clicked() {
                     pick = Some(i);
                 }
@@ -7287,7 +7254,7 @@ impl App {
             }
             if shown == 0 {
                 ui.add_space(20.0);
-                ui.vertical_centered(|ui| ui.label(RichText::new("Ничего не найдено").color(DIM)));
+                ui.vertical_centered(|ui| ui.label(RichText::new("Ничего не найдено").color(dim())));
             }
         });
 
@@ -7302,7 +7269,7 @@ impl App {
                 let (done, total) = (items.iter().filter(|c| c.done).count(), items.len());
                 let (br, _) = ui.allocate_exact_size(vec2(ui.available_width(), 4.0), Sense::hover());
                 let bar = Rect::from_min_size(br.min, vec2(br.width(), 3.0));
-                ui.painter().rect_filled(bar, 2.0, DIM.gamma_multiply(0.25));
+                ui.painter().rect_filled(bar, 2.0, dim().gamma_multiply(0.25));
                 let k = ui.ctx().animate_value_with_time(Id::new(("chk-bar", sel)), done as f32 / total as f32, 0.25);
                 ui.painter().rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * k, 3.0)), 2.0, accent());
                 ui.add_space(4.0);
@@ -7314,32 +7281,32 @@ impl App {
                     let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
                     let t = ui.ctx().animate_bool_with_time(Id::new(("chk", sel, c.line)), c.done, 0.18);
                     if hov > 0.0 {
-                        glass_chip(ui.painter(), r, 8.0, 0.35 * hov);
+                        glass_chip(ui.painter(), r, R_CTRL, 0.35 * hov);
                     }
                     let ctr = pos2(r.left() + 16.0, r.center().y);
-                    ui.painter().circle_stroke(ctr, 7.5, Stroke::new(1.5_f32, if c.done { accent() } else { DIM }));
+                    ui.painter().circle_stroke(ctr, 7.5, Stroke::new(1.5_f32, if c.done { accent() } else { dim() }));
                     if t > 0.0 {
                         ui.painter().circle_filled(ctr, 7.5 * t, accent());
                         let pts = vec![ctr + vec2(-3.5, 0.2), ctr + vec2(-1.0, 2.8), ctr + vec2(3.8, -2.6)];
                         ui.painter().add(egui::Shape::line(pts, Stroke::new(1.6_f32, Color32::WHITE.gamma_multiply(t))));
                     }
                     let label = if c.label.is_empty() { "пустой пункт" } else { c.label.as_str() };
-                    let g = ui.painter().with_clip_rect(r).text(pos2(r.left() + 32.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(13.0), if c.done { DIM } else { FG });
+                    let g = ui.painter().with_clip_rect(r).text(pos2(r.left() + 32.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(13.0), if c.done { dim() } else { fg() });
                     if t > 0.0 {
                         let y = g.center().y;
-                        ui.painter().with_clip_rect(r).line_segment([pos2(g.left(), y), pos2(g.left() + g.width() * t, y)], Stroke::new(1.0_f32, DIM));
+                        ui.painter().with_clip_rect(r).line_segment([pos2(g.left(), y), pos2(g.left() + g.width() * t, y)], Stroke::new(1.0_f32, dim()));
                     }
                     if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         toggle = Some(c.line);
                     }
                 }
                 });
-                ui.label(RichText::new(format!("Готово {done} из {total}")).color(DIM).size(11.0));
+                ui.label(RichText::new(format!("Готово {done} из {total}")).color(dim()).size(11.0));
                 ui.add_space(6.0);
             }
             let r = ui.add(
                 egui::TextEdit::multiline(&mut self.notes[sel])
-                    .hint_text(RichText::new("Первая строка станет названием. Заметки сохраняются сами").color(DIM))
+                    .hint_text(RichText::new("Первая строка станет названием. Заметки сохраняются сами").color(dim()))
                     .desired_width(f32::INFINITY)
                     .desired_rows(11)
                     .margin(egui::Margin::symmetric(10.0, 8.0)),
@@ -7351,7 +7318,7 @@ impl App {
         });
         ru.horizontal(|ui| {
             let n = self.notes[sel].chars().count();
-            ui.label(RichText::new(format!("{} из {} · {n} симв.", sel + 1, self.notes.len())).color(DIM).size(11.5));
+            ui.label(RichText::new(format!("{} из {} · {n} симв.", sel + 1, self.notes.len())).color(dim()).size(11.5));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // удалённую заметку 8 с можно вернуть той же кнопкой — один щелчок больше не теряет текст
                 del = ui.add_enabled(self.notes.len() > 1 || n > 0, egui::Button::new("Удалить")).clicked();
@@ -7430,7 +7397,7 @@ impl App {
     /// Настройки в две колонки: слева вид и данные, справа — поведение переключателями.
     fn ui_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let head = |ui: &mut egui::Ui, text: &str| {
-            ui.label(RichText::new(text).font(semi(11.5)).color(DIM));
+            ui.label(RichText::new(text).font(semi(11.5)).color(dim()));
         };
         let mut check_update = false;
         ui.columns(2, |c| {
@@ -7442,7 +7409,7 @@ impl App {
                 let cur = THEME.load(Ordering::Relaxed);
                 let mut hovered: Option<usize> = std::env::var("OSTROVOK_THEMEHOVER").ok().filter(|_| test_mode()).and_then(|v| v.parse().ok());
                 for (i, t) in THEMES.iter().enumerate() {
-                    let (r, resp) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
+                    let (r, resp) = ui.allocate_exact_size(vec2(27.0, 30.0), Sense::click());
                     if resp.hovered() {
                         hovered = Some(i);
                     }
@@ -7451,10 +7418,10 @@ impl App {
                     let col = Color32::from_rgb(t.accent[0], t.accent[1], t.accent[2]);
                     // кружок показывает и акцент, и оттенок стекла
                     let [gr, gg, gb] = glass_shade(t.glass);
-                    ui.painter().circle_filled(r.center(), 11.0 + hov, Color32::from_rgb(gr, gg, gb));
-                    ui.painter().circle_filled(r.center(), 7.0 + hov, col);
+                    ui.painter().circle_filled(r.center(), 10.0 + hov, Color32::from_rgb(gr, gg, gb));
+                    ui.painter().circle_filled(r.center(), 6.5 + hov, col);
                     if sel > 0.0 {
-                        ui.painter().circle_stroke(r.center(), 13.5, Stroke::new(1.6_f32, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (sel * 255.0) as u8)));
+                        ui.painter().circle_stroke(r.center(), 12.5, Stroke::new(1.6_f32, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (sel * 255.0) as u8)));
                     }
                     if resp.clicked() {
                         THEME.store(i, Ordering::Relaxed);
@@ -7463,11 +7430,11 @@ impl App {
                     }
                 }
                 // мини-пилюля: как остров будет выглядеть в теме под курсором (или в выбранной)
-                ui.add_space(6.0);
+                ui.add_space(2.0);
                 let idx = theme_preview_idx(hovered, cur);
                 let t = &THEMES[idx];
                 // ширина — под самое длинное название, чтобы пилюля не прыгала и не вылезала из колонки
-                let name_w = THEMES.iter().map(|t| ui.painter().layout_no_wrap(t.name.to_string(), semi(11.5), FG).size().x).fold(0.0, f32::max);
+                let name_w = THEMES.iter().map(|t| ui.painter().layout_no_wrap(t.name.to_string(), semi(11.5), fg()).size().x).fold(0.0, f32::max);
                 let (r, _) = ui.allocate_exact_size(vec2(theme_preview_w(name_w).min(ui.available_width()), 28.0), Sense::hover());
                 let fade = |key: &str, v: u8| ui.ctx().animate_value_with_time(ui.id().with(("tp", key)), v as f32, 0.18) as u8;
                 let [gr, gg, gb] = t.glass;
@@ -7487,11 +7454,11 @@ impl App {
                 ui.spacing_mut().item_spacing = vec2(5.0, 5.0);
                 for (i, name) in ["Глазки", "Робот", "Кот", "Призрак", "Слайм", "Лисёнок"].into_iter().enumerate() {
                     let on = self.cfg.character == i as u8;
-                    let width = ui.painter().layout_no_wrap(name.to_string(), semi(12.5), FG).size().x + 20.0;
+                    let width = ui.painter().layout_no_wrap(name.to_string(), semi(12.5), fg()).size().x + 20.0;
                     let (r, resp) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
                     let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.1);
-                    glass_chip(ui.painter(), r, 10.0, if on { 1.1 } else { 0.4 + 0.4 * hov });
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, name, semi(12.5), if on { accent() } else { FG });
+                    glass_chip(ui.painter(), r, R_CTRL, if on { 1.1 } else { 0.4 + 0.4 * hov });
+                    ui.painter().text(r.center(), Align2::CENTER_CENTER, name, semi(12.5), if on { accent() } else { fg() });
                     if resp.clicked() {
                         self.cfg.character = i as u8;
                         self.cfg.save();
@@ -7502,7 +7469,7 @@ impl App {
             ui.horizontal(|ui| {
                 head(ui, "ПРОЗРАЧНОСТЬ");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(format!("{}%", self.clearness())).size(11.5).color(DIM));
+                    ui.label(RichText::new(format!("{}%", self.clearness())).size(11.5).color(dim()));
                 });
             });
             {
@@ -7523,7 +7490,7 @@ impl App {
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut self.city_edit)
                         .margin(egui::Margin::symmetric(9.0, 7.0))
-                        .hint_text(RichText::new("Например, Казань").color(DIM))
+                        .hint_text(RichText::new("Например, Казань").color(dim()))
                         .desired_width(ui.available_width() - 134.0),
                 );
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -7539,7 +7506,7 @@ impl App {
                     egui::TextEdit::singleline(&mut self.key_edit)
                         .margin(egui::Margin::symmetric(9.0, 7.0))
                         .password(true)
-                        .hint_text(RichText::new(key_state).color(DIM))
+                        .hint_text(RichText::new(key_state).color(dim()))
                         .desired_width(ui.available_width() - 134.0),
                 );
                 if jelly(ui, "Сохранить").clicked() {
@@ -7551,10 +7518,10 @@ impl App {
             if !self.is_installed {
                 let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 62.0), Sense::hover());
                 let p = ui.painter();
-                glass_chip(p, r, 16.0, 0.7);
+                glass_chip(p, r, R_CARD, 0.7);
                 icon_disc(p, pos2(r.left() + 30.0, r.center().y), 17.0, [150, 200, 255], [70, 120, 230], "\u{E896}", 15.0);
-                p.text(pos2(r.left() + 58.0, r.top() + 14.0), Align2::LEFT_TOP, "Установить Островок", semi(13.5), FG);
-                p.text(pos2(r.left() + 58.0, r.top() + 34.0), Align2::LEFT_TOP, "ярлык в меню «Пуск»", FontId::proportional(11.5), DIM);
+                p.text(pos2(r.left() + 58.0, r.top() + 14.0), Align2::LEFT_TOP, "Установить Островок", semi(13.5), fg());
+                p.text(pos2(r.left() + 58.0, r.top() + 34.0), Align2::LEFT_TOP, "ярлык в меню «Пуск»", FontId::proportional(11.5), dim());
                 let b = Rect::from_min_max(pos2(r.right() - 104.0, r.top() + 15.0), pos2(r.right() - 12.0, r.bottom() - 15.0));
                 let resp = ui
                     .interact(b, ui.id().with("install"), Sense::click())
@@ -7585,7 +7552,7 @@ impl App {
                     store::save_notes(&self.notes);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                ui.label(RichText::new(format!("v{} · поиск: {}", env!("CARGO_PKG_VERSION"), self.hotkey_name)).color(DIM).size(11.5));
+                ui.label(RichText::new(format!("v{} · поиск: {}", env!("CARGO_PKG_VERSION"), self.hotkey_name)).color(dim()).size(11.5));
             });
 
             // ── справа: поведение
@@ -7622,10 +7589,10 @@ impl App {
                 if hov > 0.0 {
                     p.rect_filled(r.expand2(vec2(6.0, 0.0)), Rounding::same(9.0), rgba(255, 255, 255, (12.0 * hov) as u8));
                 }
-                p.text(pos2(r.left(), r.top() + 12.0), Align2::LEFT_CENTER, "Вернуть остров в центр", FontId::proportional(13.0), if moved { FG } else { DIM });
+                p.text(pos2(r.left(), r.top() + 12.0), Align2::LEFT_CENTER, "Вернуть остров в центр", FontId::proportional(13.0), if moved { fg() } else { dim() });
                 let hint = if moved { "или двойной щелчок по ручке острова" } else { "остров на месте; его можно перетащить мышью" };
                 let hint = elide(p, hint, FontId::proportional(11.0), r.width());
-                p.text(pos2(r.left(), r.top() + 29.0), Align2::LEFT_CENTER, hint, FontId::proportional(11.0), DIM);
+                p.text(pos2(r.left(), r.top() + 29.0), Align2::LEFT_CENTER, hint, FontId::proportional(11.0), dim());
                 if resp.clicked() {
                     self.spot_reset();
                 }
@@ -7829,14 +7796,14 @@ impl App {
                     ui.add_space(30.0);
                     ui.vertical_centered(|ui| {
                         ui.label(RichText::new("Не удалось встроить чат в панель").font(semi(16.5)));
-                        ui.label(RichText::new("Нужен системный компонент Microsoft Edge WebView2. Пока можно открыть чат кнопкой «В браузере».").color(DIM));
-                        ui.label(RichText::new(err.as_str()).color(DIM).size(11.5));
+                        ui.label(RichText::new("Нужен системный компонент Microsoft Edge WebView2. Пока можно открыть чат кнопкой «В браузере».").color(dim()));
+                        ui.label(RichText::new(err.as_str()).color(dim()).size(11.5));
                     });
                 }
                 None => {
                     self.web_slot = Some(slot);
                     if self.web.is_none() {
-                        ui.painter().text(slot.center(), Align2::CENTER_CENTER, "Загружаю чат…", FontId::proportional(13.5), DIM);
+                        ui.painter().text(slot.center(), Align2::CENTER_CENTER, "Загружаю чат…", FontId::proportional(13.5), dim());
                     }
                     ui.allocate_rect(slot, Sense::hover());
                 }
@@ -7847,25 +7814,25 @@ impl App {
         egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
             if self.ai_chat.is_empty() && !self.ai_busy {
                 ui.add_space(40.0);
-                ui.vertical_centered(|ui| ui.label(RichText::new("Спросите что угодно. Переписка хранится только до выхода.").color(DIM)));
+                ui.vertical_centered(|ui| ui.label(RichText::new("Спросите что угодно. Переписка хранится только до выхода.").color(dim())));
             }
             for (me, text) in &self.ai_chat {
                 if *me {
                     ui.label(RichText::new(text).color(accent()));
                 } else {
-                    ui.label(RichText::new(text).color(FG));
+                    ui.label(RichText::new(text).color(fg()));
                     ui.add_space(4.0);
                 }
             }
             if self.ai_busy {
-                ui.label(RichText::new("Думаю…").color(DIM));
+                ui.label(RichText::new("Думаю…").color(dim()));
             }
         });
         let mut send = false;
         let mut copy = false;
         ui.horizontal(|ui| {
             let w = (ui.available_width() - 250.0).max(120.0);
-            let r = ui.add(egui::TextEdit::singleline(&mut self.ai_input).margin(egui::Margin::symmetric(9.0, 7.0)).hint_text(RichText::new("Ваш вопрос").color(DIM)).desired_width(w));
+            let r = ui.add(egui::TextEdit::singleline(&mut self.ai_input).margin(egui::Margin::symmetric(9.0, 7.0)).hint_text(RichText::new("Ваш вопрос").color(dim())).desired_width(w));
             send = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             send |= ui.add_enabled(!self.ai_busy, egui::Button::new("Спросить")).clicked();
             copy = jelly(ui, "Копировать").clicked();
@@ -7960,7 +7927,7 @@ impl App {
             // выходные — мягким коралловым, чтобы неделя читалась с первого взгляда
             let weekend = Color32::from_rgb(0xFF, 0x9A, 0x8A);
             for (i, name) in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"].into_iter().enumerate() {
-                p.text(origin + vec2(cell.x * (i as f32 + 0.5), 10.0), Align2::CENTER_CENTER, name, FontId::proportional(11.5), if i >= 5 { mix(weekend, DIM, 0.25) } else { DIM });
+                p.text(origin + vec2(cell.x * (i as f32 + 0.5), 10.0), Align2::CENTER_CENTER, name, FontId::proportional(11.5), if i >= 5 { mix(weekend, dim(), 0.25) } else { dim() });
             }
             for day in 1..=days {
                 let Some(date) = NaiveDate::from_ymd_opt(year, month0 + 1, day) else { continue };
@@ -7985,11 +7952,11 @@ impl App {
                 let color = if is_today {
                     BG
                 } else if date < today {
-                    mix(if col >= 5 || fest { mix(weekend, DIM, 0.4) } else { DIM }, BG, 0.4)
+                    mix(if col >= 5 || fest { mix(weekend, dim(), 0.4) } else { dim() }, BG, 0.4)
                 } else if col >= 5 || fest {
                     weekend
                 } else {
-                    FG
+                    fg()
                 };
                 p.text(at, Align2::CENTER_CENTER, day.to_string(), semi(13.5), color);
                 // праздник — маленькая коралловая звёздочка справа сверху
@@ -8023,8 +7990,8 @@ impl App {
                 g if g > 0 => format!("через {g} дн."),
                 g => format!("{} дн. назад", -g),
             };
-            ui.label(RichText::new(format!("{} {}", sel.day(), OF_MONTH[sel.month0() as usize])).font(light(26.0)).color(FG));
-            ui.label(RichText::new(format!("{} · {when}", DAYS[sel.weekday().num_days_from_monday() as usize])).color(DIM));
+            ui.label(RichText::new(format!("{} {}", sel.day(), OF_MONTH[sel.month0() as usize])).font(light(26.0)).color(fg()));
+            ui.label(RichText::new(format!("{} · {when}", DAYS[sel.weekday().num_days_from_monday() as usize])).color(dim()));
             // праздник выбранного дня: строка коралловым, список дел на неё короче — страница не растёт
             let fest = ru_holiday(sel.month(), sel.day());
             if let Some(name) = fest {
@@ -8037,25 +8004,25 @@ impl App {
             let day_todos = todos_for_day(&self.cfg.todos, sel, today);
             egui::ScrollArea::vertical().max_height(if fest.is_some() { 150.0 } else { 172.0 }).auto_shrink([false, true]).show(ui, |ui| {
                 if mine.is_empty() && day_todos.is_empty() {
-                    ui.label(RichText::new(if sel < today { "В этот день дел не было." } else { "На этот день дел нет." }).color(DIM));
+                    ui.label(RichText::new(if sel < today { "В этот день дел не было." } else { "На этот день дел нет." }).color(dim()));
                 }
                 for (i, _, time, text, ts, orig) in mine {
                     let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
-                    glass_chip(ui.painter(), row, 10.0, 0.45);
+                    glass_chip(ui.painter(), row, R_CTRL, 0.45);
                     let p = ui.painter().with_clip_rect(row.shrink2(vec2(0.0, 0.0)));
                     p.text(pos2(row.left() + 12.0, row.center().y), Align2::LEFT_CENTER, time, semi(13.0), accent());
                     p.with_clip_rect(Rect::from_min_max(pos2(row.left() + 58.0, row.top()), pos2(row.right() - 34.0, row.bottom())))
-                        .text(pos2(row.left() + 58.0, row.center().y), Align2::LEFT_CENTER, text, FontId::proportional(13.0), FG);
+                        .text(pos2(row.left() + 58.0, row.center().y), Align2::LEFT_CENTER, text, FontId::proportional(13.0), fg());
                     let x = Rect::from_center_size(pos2(row.right() - 18.0, row.center().y), vec2(26.0, 26.0));
                     if *orig {
                         let resp = ui.interact(x, ui.id().with(("cal-del", *i, *ts)), Sense::click());
-                        ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(12.0), if resp.hovered() { FG } else { DIM });
+                        ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(12.0), if resp.hovered() { fg() } else { dim() });
                         if resp.clicked() {
                             remove = Some(*i);
                         }
                     } else {
                         ui.interact(x, ui.id().with(("cal-rep", *i, *ts)), Sense::hover()).on_hover_text("Повтор");
-                        ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E8EE}", FontId::proportional(12.0), DIM);
+                        ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E8EE}", FontId::proportional(12.0), dim());
                     }
                     ui.add_space(3.0);
                 }
@@ -8063,7 +8030,7 @@ impl App {
                 for &(k, late) in &day_todos {
                     let Some(t) = self.cfg.todos.get(k) else { continue };
                     let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
-                    glass_chip(ui.painter(), row, 10.0, if t.done { 0.25 } else { 0.45 });
+                    glass_chip(ui.painter(), row, R_CTRL, if t.done { 0.25 } else { 0.45 });
                     let check = Rect::from_center_size(pos2(row.left() + 18.0, row.center().y), vec2(24.0, 24.0));
                     let cresp = ui.interact(check, ui.id().with(("cal-todo", k)), Sense::click()).on_hover_text(if t.done { "Вернуть" } else { "Сделано" });
                     let p = ui.painter();
@@ -8071,21 +8038,21 @@ impl App {
                         p.circle_filled(check.center(), 7.5, accent());
                         p.text(check.center(), Align2::CENTER_CENTER, "\u{E73E}", FontId::proportional(9.0), BG);
                     } else {
-                        p.circle_stroke(check.center(), 7.5, Stroke::new(1.5_f32, if cresp.hovered() { accent() } else { DIM }));
+                        p.circle_stroke(check.center(), 7.5, Stroke::new(1.5_f32, if cresp.hovered() { accent() } else { dim() }));
                     }
                     let tx = row.left() + 34.0;
                     let text_w = (row.right() - 34.0 - tx - if late { 74.0 } else { 0.0 }).max(20.0);
                     let shown = elide(p, &t.text, FontId::proportional(13.0), text_w);
-                    let r = p.text(pos2(tx, row.center().y), Align2::LEFT_CENTER, &shown, FontId::proportional(13.0), if t.done { DIM } else { FG });
+                    let r = p.text(pos2(tx, row.center().y), Align2::LEFT_CENTER, &shown, FontId::proportional(13.0), if t.done { dim() } else { fg() });
                     if t.done {
-                        p.line_segment([pos2(r.left(), r.center().y), pos2(r.right(), r.center().y)], Stroke::new(1.0_f32, DIM));
+                        p.line_segment([pos2(r.left(), r.center().y), pos2(r.right(), r.center().y)], Stroke::new(1.0_f32, dim()));
                     }
                     if late {
                         p.text(pos2(row.right() - 36.0, row.center().y), Align2::RIGHT_CENTER, "просрочено", FontId::proportional(11.0), Color32::from_rgb(0xFF, 0x8A, 0x7A));
                     }
                     let x = Rect::from_center_size(pos2(row.right() - 18.0, row.center().y), vec2(26.0, 26.0));
                     let xresp = ui.interact(x, ui.id().with(("cal-todo-del", k)), Sense::click()).on_hover_text("Удалить дело");
-                    ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(12.0), if xresp.hovered() { FG } else { DIM });
+                    ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(12.0), if xresp.hovered() { fg() } else { dim() });
                     if cresp.clicked() {
                         toggle_todo = Some(k);
                     }
@@ -8102,7 +8069,7 @@ impl App {
                     let a = ui.add(
                         egui::TextEdit::singleline(&mut self.cal_text)
                             .margin(egui::Margin::symmetric(9.0, 7.0))
-                            .hint_text(RichText::new("18:30 созвон · купить хлеб · заметка …").color(DIM))
+                            .hint_text(RichText::new("18:30 созвон · купить хлеб · заметка …").color(dim()))
                             .desired_width(w),
                     );
                     let enter = a.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -8206,15 +8173,15 @@ impl App {
             };
             let resp = ui.interact(r, ui.id().with(("sys-card", k)), if target.is_some() { Sense::click() } else { Sense::hover() });
             let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered() && target.is_some(), 0.12);
-            glass_chip(ui.painter(), r, 18.0, 0.55 + 0.4 * hov);
+            glass_chip(ui.painter(), r, R_CARD, 0.55 + 0.4 * hov);
             let shown = ui.ctx().animate_value_with_time(ui.id().with(("sys", k)), frac.clamp(0.0, 1.0), 0.5);
             let c = pos2(r.center().x, r.top() + 46.0);
             let hot = alarm && shown > 0.9;
             ring(ui.painter(), c, 30.0, 6.0, shown, if hot { Color32::from_rgb(0xFF, 0x6B, 0x6B) } else { color });
-            ui.painter().text(c, Align2::CENTER_CENTER, value, semi(14.0), FG);
-            ui.painter().text(pos2(c.x, r.top() + 96.0), Align2::CENTER_CENTER, name, semi(12.5), FG);
+            ui.painter().text(c, Align2::CENTER_CENTER, value, semi(14.0), fg());
+            ui.painter().text(pos2(c.x, r.top() + 96.0), Align2::CENTER_CENTER, name, semi(12.5), fg());
             // диск почти полон — вместо «свободно …» подсказываем, что делать
-            let (detail, dc) = if hot && name == "Диск C:" { (format!("{detail} · освободить"), Color32::from_rgb(0xFF, 0x9A, 0x8A)) } else { (detail, DIM) };
+            let (detail, dc) = if hot && name == "Диск C:" { (format!("{detail} · освободить"), Color32::from_rgb(0xFF, 0x9A, 0x8A)) } else { (detail, dim()) };
             ui.painter().text(pos2(c.x, r.top() + 114.0), Align2::CENTER_CENTER, detail, FontId::proportional(11.5), dc);
             if let Some((cmd, tip)) = target {
                 if resp.on_hover_text(tip).clicked() {
@@ -8226,7 +8193,7 @@ impl App {
             }
         }
         if s.battery.is_some() {
-            ui.label(RichText::new(format!("Компьютер работает {d} д {h} ч {m} мин без перезагрузки")).color(DIM));
+            ui.label(RichText::new(format!("Компьютер работает {d} д {h} ч {m} мин без перезагрузки")).color(dim()));
         }
         ui.add_space(4.0);
 
@@ -8255,11 +8222,11 @@ impl App {
         let right = Rect::from_min_max(pos2(row.center().x + 4.0, row.top()), row.max);
 
         // ----- нагрузка во времени
-        glass_chip(&p, left, 18.0, 0.45);
-        p.text(left.min + vec2(14.0, 10.0), Align2::LEFT_TOP, "Нагрузка", semi(12.5), FG);
+        glass_chip(&p, left, R_CARD, 0.45);
+        p.text(left.min + vec2(14.0, 10.0), Align2::LEFT_TOP, "Нагрузка", semi(12.5), fg());
         let secs = self.load_hist.len() as f32 * 1.5;
         let span = if secs >= 90.0 { format!("за {:.0} мин", secs / 60.0) } else { format!("за {secs:.0} с") };
-        p.text(left.right_top() + vec2(-14.0, 11.0), Align2::RIGHT_TOP, span, FontId::proportional(11.0), DIM);
+        p.text(left.right_top() + vec2(-14.0, 11.0), Align2::RIGHT_TOP, span, FontId::proportional(11.0), dim());
         let plot = Rect::from_min_max(left.min + vec2(14.0, 34.0), left.max - vec2(14.0, 26.0));
         for k in 0..=2 {
             let y = plot.bottom() - plot.height() * k as f32 / 2.0;
@@ -8294,17 +8261,17 @@ impl App {
                 p.add(egui::Shape::line(pts, Stroke::new(1.8_f32, color)));
             }
         } else {
-            p.text(plot.center(), Align2::CENTER_CENTER, "Собираю данные…", FontId::proportional(12.0), DIM);
+            p.text(plot.center(), Align2::CENTER_CENTER, "Собираю данные…", FontId::proportional(12.0), dim());
         }
         let legend = pos2(left.left() + 14.0, left.bottom() - 13.0);
         p.circle_filled(legend + vec2(4.0, 0.0), 3.5, blue);
-        p.text(legend + vec2(13.0, 0.0), Align2::LEFT_CENTER, "процессор", FontId::proportional(11.0), DIM);
+        p.text(legend + vec2(13.0, 0.0), Align2::LEFT_CENTER, "процессор", FontId::proportional(11.0), dim());
         p.circle_filled(legend + vec2(92.0, 0.0), 3.5, accent());
-        p.text(legend + vec2(101.0, 0.0), Align2::LEFT_CENTER, "память", FontId::proportional(11.0), DIM);
+        p.text(legend + vec2(101.0, 0.0), Align2::LEFT_CENTER, "память", FontId::proportional(11.0), dim());
 
         // ----- кто занимает память
-        glass_chip(&p, right, 18.0, 0.45);
-        p.text(right.min + vec2(14.0, 10.0), Align2::LEFT_TOP, "Больше всего", semi(12.5), FG);
+        glass_chip(&p, right, R_CARD, 0.45);
+        p.text(right.min + vec2(14.0, 10.0), Align2::LEFT_TOP, "Больше всего", semi(12.5), fg());
         // переключатель «память · процессор»: пилюля с ползущей подсветкой
         let seg = Rect::from_min_size(pos2(right.right() - 14.0 - 150.0, right.top() + 8.0), vec2(150.0, 20.0));
         p.rect_filled(seg, Rounding::same(10.0), rgba(255, 255, 255, 14));
@@ -8315,7 +8282,7 @@ impl App {
             let r = Rect::from_min_size(seg.min + vec2(half * j as f32, 0.0), vec2(half, seg.height()));
             let resp = ui.interact(r, ui.id().with(("procs-seg", j)), Sense::click());
             let on = self.procs_by_cpu == by_cpu;
-            p.text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(11.0), if on { FG } else if resp.hovered() { FG.gamma_multiply(0.8) } else { DIM });
+            p.text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(11.0), if on { fg() } else if resp.hovered() { fg().gamma_multiply(0.8) } else { dim() });
             if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !on {
                 self.procs_by_cpu = by_cpu;
                 self.kill_arm = None;
@@ -8358,14 +8325,14 @@ impl App {
                 }
             }
             p.with_clip_rect(Rect::from_min_max(pos2(right.left() + 14.0, y - 10.0), pos2(right.left() + 124.0, y + 10.0)))
-                .text(pos2(right.left() + 14.0, y), Align2::LEFT_CENTER, name, FontId::proportional(12.5), FG);
+                .text(pos2(right.left() + 14.0, y), Align2::LEFT_CENTER, name, FontId::proportional(12.5), fg());
             let track = Rect::from_min_max(pos2(right.left() + 130.0, y - 2.5), pos2(right.right() - 74.0, y + 2.5));
             p.rect_filled(track, Rounding::same(2.5), rgba(255, 255, 255, 20));
             // красным — больше четверти всей памяти или больше половины процессора
             let fill = Rect::from_min_max(track.min, pos2(track.left() + track.width() * frac.clamp(0.03, 1.0), track.bottom()));
             p.rect_filled(fill, Rounding::same(2.5), if heavy { Color32::from_rgb(0xFF, 0x6B, 0x6B) } else { accent() });
             let red = Color32::from_rgb(0xFF, 0x8A, 0x80);
-            let (label, color) = if armed { ("ещё раз".to_string(), red) } else if hot { ("закрыть".to_string(), FG) } else { (size, if heavy { red } else { DIM }) };
+            let (label, color) = if armed { ("ещё раз".to_string(), red) } else if hot { ("закрыть".to_string(), fg()) } else { (size, if heavy { red } else { dim() }) };
             p.text(pos2(right.right() - 14.0, y), Align2::RIGHT_CENTER, label, semi(12.0), color);
         }
         if let Some(name) = kill {
@@ -8377,11 +8344,11 @@ impl App {
         // скорость сети — в правом нижнем углу графика нагрузки
         let speed = |v: f32| if v >= 1048576.0 { format!("{:.1} МБ/с", v / 1048576.0).replace('.', ",") } else { format!("{:.0} КБ/с", v / 1024.0) };
         let net_at = pos2(left.right() - 14.0, left.bottom() - 13.0);
-        let up = p.text(net_at, Align2::RIGHT_CENTER, format!("\u{E898} {}", speed(self.net.1)), FontId::proportional(11.0), DIM);
-        p.text(pos2(up.left() - 10.0, net_at.y), Align2::RIGHT_CENTER, format!("\u{E896} {}", speed(self.net.0)), FontId::proportional(11.0), FG);
+        let up = p.text(net_at, Align2::RIGHT_CENTER, format!("\u{E898} {}", speed(self.net.1)), FontId::proportional(11.0), dim());
+        p.text(pos2(up.left() - 10.0, net_at.y), Align2::RIGHT_CENTER, format!("\u{E896} {}", speed(self.net.0)), FontId::proportional(11.0), fg());
         if list.is_empty() {
             let msg = if self.procs_by_cpu && self.cpu_snap.lock().unwrap().is_some() { "Процессор свободен" } else { "Считаю…" };
-            p.text(right.center(), Align2::CENTER_CENTER, msg, FontId::proportional(12.0), DIM);
+            p.text(right.center(), Align2::CENTER_CENTER, msg, FontId::proportional(12.0), dim());
         }
     }
 
@@ -8393,7 +8360,7 @@ impl App {
                 ui.add_space(2.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.query)
-                        .hint_text(RichText::new("Программа, сайт, пример или команда").color(DIM))
+                        .hint_text(RichText::new("Программа, сайт, пример или команда").color(dim()))
                         .desired_width(f32::INFINITY)
                         .frame(false)
                         .font(FontId::proportional(17.0)),
@@ -8459,12 +8426,12 @@ impl App {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.label(RichText::new("\u{E81C}").size(12.0).color(DIM));
-                    ui.label(RichText::new("Недавнее").size(11.5).color(DIM));
+                    ui.label(RichText::new("\u{E81C}").size(12.0).color(dim()));
+                    ui.label(RichText::new("Недавнее").size(11.5).color(dim()));
                     let room = ui.available_width() - 30.0;
                     let mut used = 0.0;
                     for q in &self.cfg.recent {
-                        let w = ui.painter().layout_no_wrap(q.clone(), FontId::proportional(12.5), FG).size().x + 22.0;
+                        let w = ui.painter().layout_no_wrap(q.clone(), FontId::proportional(12.5), fg()).size().x + 22.0;
                         if used + w > room {
                             break; // не помещается — остальные не показываем, чтобы ряд не переносился
                         }
@@ -8474,7 +8441,7 @@ impl App {
                         let p = ui.painter();
                         p.rect_filled(r, Rounding::same(13.0), mix(rgba(255, 255, 255, 10), accent().gamma_multiply(0.25), hov));
                         p.rect_stroke(r, Rounding::same(13.0), Stroke::new(1.0_f32, mix(rgba(255, 255, 255, 26), accent(), hov)));
-                        p.text(r.center(), Align2::CENTER_CENTER, q, FontId::proportional(12.5), mix(DIM, FG, 0.6 + 0.4 * hov));
+                        p.text(r.center(), Align2::CENTER_CENTER, q, FontId::proportional(12.5), mix(dim(), fg(), 0.6 + 0.4 * hov));
                         if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             pick_recent = Some(q.clone());
                         }
@@ -8485,7 +8452,7 @@ impl App {
                         if hov > 0.0 {
                             ui.painter().circle_filled(r.center(), 11.0, rgba(255, 255, 255, (30.0 * hov) as u8));
                         }
-                        ui.painter().text(r.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(9.5), mix(DIM, FG, hov));
+                        ui.painter().text(r.center(), Align2::CENTER_CENTER, "\u{E711}", FontId::proportional(9.5), mix(dim(), fg(), hov));
                         if resp.on_hover_text("Забыть недавнее").clicked() {
                             forget = true;
                         }
@@ -8509,11 +8476,11 @@ impl App {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 for (glyph, text) in [("\u{E916}", "таймер 5"), ("\u{E823}", "напомни через 15 мин чай"), ("\u{E73E}", "дело купить хлеб"), ("\u{E787}", "до нового года")] {
                     let label = format!("{glyph}  {}", text.trim());
-                    let w = ui.painter().layout_no_wrap(label.clone(), FontId::proportional(12.5), FG).size().x + 20.0;
+                    let w = ui.painter().layout_no_wrap(label.clone(), FontId::proportional(12.5), fg()).size().x + 20.0;
                     let (r, resp) = ui.allocate_exact_size(vec2(w, 28.0), Sense::click());
                     let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.10);
-                    glass_chip(ui.painter(), r, 14.0, 0.4 + 0.5 * hov);
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.5), mix(DIM, FG, hov));
+                    glass_chip(ui.painter(), r, R_ROW, 0.4 + 0.5 * hov);
+                    ui.painter().text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.5), mix(dim(), fg(), hov));
                     if resp.clicked() {
                         pick = Some(text);
                     }
@@ -8563,8 +8530,8 @@ impl App {
                 }
             }
             let p = ui.painter().with_clip_rect(r);
-            p.text(pos2(r.right() - 12.0, r.center().y), Align2::RIGHT_CENTER, &it.sub, FontId::proportional(11.5), DIM);
-            p.text(pos2(r.left() + 44.0, r.center().y), Align2::LEFT_CENTER, &it.title, FontId::proportional(14.0), FG);
+            p.text(pos2(r.right() - 12.0, r.center().y), Align2::RIGHT_CENTER, &it.sub, FontId::proportional(11.5), dim());
+            p.text(pos2(r.left() + 44.0, r.center().y), Align2::LEFT_CENTER, &it.title, FontId::proportional(14.0), fg());
             if resp.clicked() {
                 run = Some(i);
             }
@@ -8783,7 +8750,7 @@ impl eframe::App for App {
         let target = match self.mode {
             Mode::Pill => match &self.toast {
                 Some(t) => {
-                    let w = |text: &str, font: FontId| ctx.fonts(|f| f.layout_no_wrap(text.to_string(), font, FG).size().x);
+                    let w = |text: &str, font: FontId| ctx.fonts(|f| f.layout_no_wrap(text.to_string(), font, fg()).size().x);
                     if t.compact {
                         vec2(if t.level.is_some() { 236.0 + if t.title.is_empty() { 0.0 } else { w(&t.title, semi(13.0)) + 10.0 } } else { (62.0 + w(&t.title, semi(13.5))).max(120.0) }, 40.0)
                     } else {
@@ -8946,7 +8913,7 @@ impl eframe::App for App {
             }
             for (kind, sv, text) in [(0u8, self.bub_timer.v, timer_text), (1u8, self.bub_call.v, call_text), (2u8, self.bub_clip.v, hint_text), (3u8, self.bub_dl.v, dl_text)] {
                 if sv > 0.02 {
-                    let w = 44.0 + ctx.fonts(|f| f.layout_no_wrap(text.clone(), semi(13.0), FG).size().x);
+                    let w = 44.0 + ctx.fonts(|f| f.layout_no_wrap(text.clone(), semi(13.0), fg()).size().x);
                     let r = Rect::from_min_size(pos2(edge - w + (w + 9.0) * sv.min(1.15), rect_v.center().y - 15.0), vec2(w, 30.0));
                     edge = r.right();
                     bubbles_v.push((r, sv, kind, text));
@@ -9174,7 +9141,7 @@ impl eframe::App for App {
             let radius = if self.mode == Mode::Pill { PILL_H / 2.0 } else { 22.0 }.min(rect.height() / 2.0);
             let to_cursor = d - (rect_v.center() - home);
             let light = if dist < 700.0 && to_cursor.length() > 1.0 { to_cursor.normalized() } else { vec2(-0.5, -0.86) };
-            let dim = 255;
+            let body_dim = 255;
             match self.fx.clone() {
                 Some(fx) => {
                     // форма: пилюля и капли рядом с ней; видеокарта сама срастит их
@@ -9232,7 +9199,7 @@ impl eframe::App for App {
                         rim: if self.mode == Mode::Pill { 0.07 } else { 0.20 },
                     };
                     let tex_id = self.lens_tex.as_ref().map(|t| t.id());
-                    let _ = (light, dim);
+                    let _ = (light, body_dim);
                     ui.painter().add(egui::PaintCallback {
                         rect: ui.max_rect(),
                         callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |info, painter| {
@@ -9242,7 +9209,7 @@ impl eframe::App for App {
                         })),
                     });
                 }
-                None => self.draw_glass(ui.painter(), rect, radius, light, dim),
+                None => self.draw_glass(ui.painter(), rect, radius, light, body_dim),
             }
 
             let look = vec2((d.x / 45.0).clamp(-2.6, 2.6), (d.y / 45.0).clamp(-2.2, 2.2));
@@ -9294,7 +9261,7 @@ impl eframe::App for App {
                                 Some(level) => {
                                     let mut x0 = rect.left() + 46.0;
                                     if !t.title.is_empty() {
-                                        x0 = p.text(pos2(x0 - 2.0, cy), Align2::LEFT_CENTER, &t.title, semi(13.0), FG).right() + 12.0;
+                                        x0 = p.text(pos2(x0 - 2.0, cy), Align2::LEFT_CENTER, &t.title, semi(13.0), fg()).right() + 12.0;
                                     }
                                     let track = Rect::from_min_max(pos2(x0, cy - 3.0), pos2(rect.right() - 54.0, cy + 3.0));
                                     p.rect_filled(track, Rounding::same(3.0), rgba(255, 255, 255, 34));
@@ -9302,10 +9269,10 @@ impl eframe::App for App {
                                     if shown > 0.005 {
                                         p.rect_filled(Rect::from_min_max(track.min, pos2(track.left() + (track.width() * shown).max(6.0), track.bottom())), Rounding::same(3.0), tone);
                                     }
-                                    p.text(pos2(rect.right() - 18.0, cy), Align2::RIGHT_CENTER, format!("{:.0}", level * 100.0), semi(13.5), FG);
+                                    p.text(pos2(rect.right() - 18.0, cy), Align2::RIGHT_CENTER, format!("{:.0}", level * 100.0), semi(13.5), fg());
                                 }
                                 None => {
-                                    p.text(pos2(rect.left() + 44.0, cy), Align2::LEFT_CENTER, &t.title, semi(13.5), FG);
+                                    p.text(pos2(rect.left() + 44.0, cy), Align2::LEFT_CENTER, &t.title, semi(13.5), fg());
                                 }
                             }
                         }
@@ -9320,9 +9287,9 @@ impl eframe::App for App {
                                 }
                             }
                             let lone = t.text.is_empty();
-                            p.text(pos2(rect.left() + 58.0, rect.center().y - if lone { 0.0 } else { 9.0 }), Align2::LEFT_CENTER, &t.title, semi(13.5), FG);
+                            p.text(pos2(rect.left() + 58.0, rect.center().y - if lone { 0.0 } else { 9.0 }), Align2::LEFT_CENTER, &t.title, semi(13.5), fg());
                             if !lone {
-                                p.text(pos2(rect.left() + 58.0, rect.center().y + 10.0), Align2::LEFT_CENTER, &t.text, FontId::proportional(12.0), DIM);
+                                p.text(pos2(rect.left() + 58.0, rect.center().y + 10.0), Align2::LEFT_CENTER, &t.text, FontId::proportional(12.0), dim());
                             }
                         }
                         None => {
@@ -9345,7 +9312,7 @@ impl eframe::App for App {
                         };
                         let fade = |c: Color32| rgba(c.r(), c.g(), c.b(), (a * 255.0) as u8);
                         ui.painter().text(pos2(r.left() + 18.0, r.center().y), Align2::CENTER_CENTER, glyph, FontId::proportional(14.0), fade(color));
-                        ui.painter().text(pos2(r.left() + 31.0, r.center().y), Align2::LEFT_CENTER, text, semi(13.0), fade(FG));
+                        ui.painter().text(pos2(r.left() + 31.0, r.center().y), Align2::LEFT_CENTER, text, semi(13.0), fade(fg()));
                         if *kind != 1 && ui.interact(*r, Id::new(("bubble", i)), Sense::click()).clicked() {
                             if *kind == 0 {
                                 open_timer = true;
@@ -10497,6 +10464,12 @@ mod game_pill_tests {
         assert_eq!(g("", 10, Some(5)), "Игра окончена · 1 мин · пинг 5");
     }
 }
+
+/// Три скругления на весь интерфейс (было двенадцать разных — от 8 до 20):
+/// карточки и плитки, ряды и строки списков, мелкие кнопки и чипы.
+const R_CARD: f32 = 16.0;
+const R_ROW: f32 = 12.0;
+const R_CTRL: f32 = 10.0;
 
 /// Кадр для переходов (раскрытие, наведение, перетаскивание): ≈120 в секунду.
 const FAST_FRAME: Duration = Duration::from_millis(8);
@@ -12020,7 +11993,7 @@ fn jelly(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
 }
 
 fn jelly_sized(ui: &mut egui::Ui, text: impl Into<String>, size: Option<Vec2>) -> egui::Response {
-    let galley = ui.painter().layout_no_wrap(text.into(), semi(13.0), FG);
+    let galley = ui.painter().layout_no_wrap(text.into(), semi(13.0), fg());
     let want = size.unwrap_or(galley.size() + vec2(26.0, 14.0));
     let (rect, resp) = ui.allocate_exact_size(want, Sense::click());
     let hover = ui.ctx().animate_bool_with_time(resp.id.with("hover"), resp.hovered(), 0.12);
@@ -12028,7 +12001,7 @@ fn jelly_sized(ui: &mut egui::Ui, text: impl Into<String>, size: Option<Vec2>) -
     if ui.is_rect_visible(rect) {
         let r = Rect::from_center_size(rect.center(), rect.size() * (1.0 - 0.03 * down));
         glass_chip(ui.painter(), r, 11.0f32.min(r.height() / 2.0), 0.55 + 0.45 * hover + 0.25 * down);
-        ui.painter().galley(r.center() - galley.size() / 2.0, galley, FG);
+        ui.painter().galley(r.center() - galley.size() / 2.0, galley, fg());
     }
     resp
 }
@@ -12117,6 +12090,18 @@ fn icon_disc(p: &egui::Painter, center: Pos2, radius: f32, top: [u8; 3], bottom:
 /// Маленькая стеклянная капсула — кнопка, карточка, выбранная вкладка. k — яркость (0…1.3).
 fn glass_chip(p: &egui::Painter, r: Rect, radius: f32, k: f32) {
     use egui::epaint::{Vertex, WHITE_UV};
+    // плоская тема: без стеклянного градиента и светлой обводки — едва заметная тёплая заливка,
+    // при наведении чуть светлее. Блоки отделяет воздух, а не коробки
+    if theme().flat {
+        // заливка пропорциональна k: невыбранная вкладка (k = 0) — без плашки, наведение и выбор заметны
+        let a = (0.065 * k).clamp(0.0, 0.10);
+        if a <= 0.002 {
+            return;
+        }
+        let c = theme().fg;
+        p.rect_filled(r, Rounding::same(radius), rgba(c[0], c[1], c[2], (a * 255.0) as u8));
+        return;
+    }
     const N: usize = 6;
     let white = |a: f32| rgba(255, 255, 255, (a.clamp(0.0, 1.0) * 255.0) as u8);
     let edge = contour(r, radius, 0.0, N);
@@ -12422,9 +12407,9 @@ fn ring(p: &egui::Painter, c: Pos2, r: f32, w: f32, frac: f32, color: Color32) {
 fn empty_at(p: &egui::Painter, center: Pos2, glyph: &str, title: &str, hint: &str) {
     let c = center - vec2(0.0, 26.0);
     p.circle_filled(c, 24.0, rgba(255, 255, 255, 16));
-    p.text(c, Align2::CENTER_CENTER, glyph, FontId::proportional(20.0), DIM);
-    p.text(c + vec2(0.0, 42.0), Align2::CENTER_CENTER, title, semi(14.0), FG);
-    p.text(c + vec2(0.0, 62.0), Align2::CENTER_CENTER, hint, FontId::proportional(12.0), DIM);
+    p.text(c, Align2::CENTER_CENTER, glyph, FontId::proportional(20.0), dim());
+    p.text(c + vec2(0.0, 42.0), Align2::CENTER_CENTER, title, semi(14.0), fg());
+    p.text(c + vec2(0.0, 62.0), Align2::CENTER_CENTER, hint, FontId::proportional(12.0), dim());
 }
 
 fn empty_state(ui: &mut egui::Ui, glyph: &str, title: &str, hint: &str) {
@@ -12481,7 +12466,7 @@ fn spectrum_mirror(p: &egui::Painter, area: Rect, bars: &[f32], color: Color32, 
 /// Строка настройки с переключателем справа; щёлкать можно по всей строке. Возвращает true, если переключили.
 /// Текст, укороченный многоточием до ширины `max_w` (в точках).
 fn elide(p: &egui::Painter, text: &str, font: FontId, max_w: f32) -> String {
-    let width = |s: &str| p.layout_no_wrap(s.to_string(), font.clone(), FG).size().x;
+    let width = |s: &str| p.layout_no_wrap(s.to_string(), font.clone(), fg()).size().x;
     if width(text) <= max_w {
         return text.to_string();
     }
@@ -12513,12 +12498,12 @@ fn switch_row(ui: &mut egui::Ui, on: &mut bool, title: &str, hint: &str) -> bool
     }
     let text = p.with_clip_rect(Rect::from_min_max(r.min, pos2(r.right() - 48.0, r.bottom())));
     if hint.is_empty() {
-        text.text(pos2(r.left(), r.center().y), Align2::LEFT_CENTER, title, FontId::proportional(13.0), FG);
+        text.text(pos2(r.left(), r.center().y), Align2::LEFT_CENTER, title, FontId::proportional(13.0), fg());
     } else {
-        text.text(pos2(r.left(), r.top() + 12.0), Align2::LEFT_CENTER, title, FontId::proportional(13.0), FG);
+        text.text(pos2(r.left(), r.top() + 12.0), Align2::LEFT_CENTER, title, FontId::proportional(13.0), fg());
         // длинная подсказка обрезается многоточием, а не краем переключателя
         let hint = elide(&text, hint, FontId::proportional(11.0), r.width() - 54.0);
-        text.text(pos2(r.left(), r.top() + 29.0), Align2::LEFT_CENTER, hint, FontId::proportional(11.0), DIM);
+        text.text(pos2(r.left(), r.top() + 29.0), Align2::LEFT_CENTER, hint, FontId::proportional(11.0), dim());
     }
     let track = Rect::from_min_size(pos2(r.right() - 38.0, r.center().y - 10.0), vec2(36.0, 20.0));
     let a = accent();
@@ -12589,11 +12574,11 @@ fn semi(size: f32) -> FontId {
 
 /// Строка в одну линию, обрезанная многоточием по ширине (короткая возвращается как есть).
 fn fit_text(p: &egui::Painter, text: &str, font: FontId, max_w: f32) -> String {
-    let g = p.layout_no_wrap(text.to_string(), font.clone(), FG);
+    let g = p.layout_no_wrap(text.to_string(), font.clone(), fg());
     if g.size().x <= max_w {
         return text.to_string();
     }
-    let ell = p.layout_no_wrap("…".to_string(), font, FG).size().x;
+    let ell = p.layout_no_wrap("…".to_string(), font, fg()).size().x;
     // в egui один символ — один глиф, поэтому число глифов равно числу символов
     let keep = g.rows.first().map_or(0, |row| row.glyphs.iter().take_while(|gl| gl.pos.x + gl.advance_width <= max_w - ell).count());
     let mut s: String = text.chars().take(keep).collect::<String>().trim_end().to_string();
@@ -12639,10 +12624,10 @@ fn setup_style(ctx: &egui::Context) {
     let mut v = egui::Visuals::dark();
     v.panel_fill = Color32::TRANSPARENT;
     v.window_fill = Color32::TRANSPARENT;
-    v.override_text_color = Some(FG);
+    v.override_text_color = Some(fg());
     v.extreme_bg_color = tint(14);
     v.selection.bg_fill = tint(46);
-    v.selection.stroke = Stroke::new(1.0_f32, FG);
+    v.selection.stroke = Stroke::new(1.0_f32, fg());
     for (w, alpha) in [
         (&mut v.widgets.inactive, 18),
         (&mut v.widgets.hovered, 40),

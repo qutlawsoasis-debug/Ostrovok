@@ -2,7 +2,7 @@
 
 use crate::ears::Heard;
 use crate::jarvis::{Ev, MODELS};
-use crate::{empty_state, glass_chip, jelly, semi, store, sys, weather, accent, App, Mode, Msg, Tab, DIM, FG};
+use crate::{empty_state, glass_chip, jelly, semi, store, sys, weather, accent, dim, fg, App, Mode, Msg, Tab};
 use eframe::egui::{self, vec2, Align2, Color32, FontId, RichText, Sense};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -429,11 +429,11 @@ impl App {
         let (done, all) = prog.bytes;
         let frac = if all > 0 { (done as f32 / all as f32).clamp(0.0, 1.0) } else { 0.0 };
         let mb = |b: u64| b / 1_048_576;
-        ui.label(RichText::new(format!("{}  ·  шаг {} из {}", prog.label, prog.step.0, prog.step.1)).color(FG));
+        ui.label(RichText::new(format!("{}  ·  шаг {} из {}", prog.label, prog.step.0, prog.step.1)).color(fg()));
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width().min(420.0), 8.0), Sense::hover());
         ui.painter().rect_filled(r, 4.0, Color32::from_white_alpha(22));
         ui.painter().rect_filled(egui::Rect::from_min_size(r.min, vec2(r.width() * frac.max(0.01), 8.0)), 4.0, accent());
-        ui.label(RichText::new(if all > 0 { format!("{} из {} МБ", mb(done), mb(all)) } else { format!("{} МБ", mb(done)) }).color(DIM).size(11.5));
+        ui.label(RichText::new(if all > 0 { format!("{} из {} МБ", mb(done), mb(all)) } else { format!("{} МБ", mb(done)) }).color(dim()).size(11.5));
     }
 
     fn jv_download(&mut self, model: &'static str, ctx: &egui::Context) {
@@ -446,16 +446,16 @@ impl App {
         let ctx = ui.ctx().clone();
         ui.add_space(14.0);
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new("Включить Джарвиса").font(semi(19.0)).color(FG));
+            ui.label(RichText::new("Включить Джарвиса").font(semi(19.0)).color(fg()));
             ui.add_space(2.0);
-            ui.label(RichText::new("Голосовой помощник, который работает на этом компьютере: без ключей, подписок и интернета.").color(DIM));
-            ui.label(RichText::new("Понимает просьбы своими словами и сам выполняет их: открывает программы, ставит таймеры, меняет громкость.").color(DIM));
+            ui.label(RichText::new("Голосовой помощник, который работает на этом компьютере: без ключей, подписок и интернета.").color(dim()));
+            ui.label(RichText::new("Понимает просьбы своими словами и сам выполняет их: открывает программы, ставит таймеры, меняет громкость.").color(dim()));
         });
         ui.add_space(12.0);
         if prog.running {
             ui.vertical_centered(|ui| Self::jv_progress(ui, prog));
             ui.add_space(6.0);
-            ui.vertical_centered(|ui| ui.label(RichText::new("Можно закрыть панель — загрузка продолжится.").color(DIM).size(11.5)));
+            ui.vertical_centered(|ui| ui.label(RichText::new("Можно закрыть панель — загрузка продолжится.").color(dim()).size(11.5)));
             return;
         }
         const CHOICES: [(&str, &str, &str); 3] = [
@@ -468,12 +468,12 @@ impl App {
             let on = self.jv_pick == id;
             glass_chip(ui.painter(), row, 11.0, if on { 0.9 } else if resp.hovered() { 0.6 } else { 0.35 });
             let p = ui.painter();
-            p.circle_stroke(row.left_center() + vec2(20.0, 0.0), 6.0, egui::Stroke::new(1.5, if on { accent() } else { DIM }));
+            p.circle_stroke(row.left_center() + vec2(20.0, 0.0), 6.0, egui::Stroke::new(1.5, if on { accent() } else { dim() }));
             if on {
                 p.circle_filled(row.left_center() + vec2(20.0, 0.0), 3.2, accent());
             }
-            p.text(row.left_center() + vec2(38.0, 0.0), Align2::LEFT_CENTER, name, semi(13.5), FG);
-            p.text(row.left_center() + vec2(190.0, 0.0), Align2::LEFT_CENTER, note, FontId::proportional(12.0), DIM);
+            p.text(row.left_center() + vec2(38.0, 0.0), Align2::LEFT_CENTER, name, semi(13.5), fg());
+            p.text(row.left_center() + vec2(190.0, 0.0), Align2::LEFT_CENTER, note, FontId::proportional(12.0), dim());
             if resp.clicked() {
                 self.jv_pick = id;
             }
@@ -489,7 +489,7 @@ impl App {
         ui.horizontal(|ui| {
             go = jelly(ui, if prog.error.is_some() { "Повторить".to_string() } else { format!("Скачать {size} и включить") }).clicked();
             settings = jelly(ui, "Настройки").clicked();
-            ui.label(RichText::new("Вместе с моделью ставятся распознавание речи и голос.").color(DIM).size(11.5));
+            ui.label(RichText::new("Вместе с моделью ставятся распознавание речи и голос.").color(dim()).size(11.5));
         });
         if go {
             self.jv_download(self.jv_pick, &ctx);
@@ -505,7 +505,7 @@ impl App {
         let prog = self.setup.progress();
         let mut back = false;
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Настройки Джарвиса").font(semi(16.0)).color(FG));
+            ui.label(RichText::new("Настройки Джарвиса").font(semi(16.0)).color(fg()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| back = jelly(ui, "Назад").clicked());
         });
         if back {
@@ -516,9 +516,9 @@ impl App {
         let field = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, secret: bool| -> bool {
             let mut ch = false;
             ui.horizontal(|ui| {
-                ui.add_sized([120.0, 20.0], egui::Label::new(RichText::new(label).color(DIM)));
+                ui.add_sized([120.0, 20.0], egui::Label::new(RichText::new(label).color(dim())));
                 ch = ui
-                    .add(egui::TextEdit::singleline(value).margin(egui::Margin::symmetric(9.0, 6.0)).password(secret).hint_text(RichText::new(hint).color(DIM)).desired_width(360.0))
+                    .add(egui::TextEdit::singleline(value).margin(egui::Margin::symmetric(9.0, 6.0)).password(secret).hint_text(RichText::new(hint).color(dim())).desired_width(360.0))
                     .changed();
             });
             ch
@@ -527,7 +527,7 @@ impl App {
             ui.label(RichText::new("Мозг на компьютере").font(semi(13.5)).color(accent()));
             for (id, name, size) in [("large", "Большая", "2,4 ГБ"), ("medium", "Средняя", "1 ГБ"), ("small", "Малая", "0,4 ГБ")] {
                 ui.horizontal(|ui| {
-                    ui.add_sized([120.0, 20.0], egui::Label::new(RichText::new(format!("{name} · {size}")).color(FG)));
+                    ui.add_sized([120.0, 20.0], egui::Label::new(RichText::new(format!("{name} · {size}")).color(fg())));
                     if self.jarvis.model_path(id).exists() {
                         ui.label(RichText::new("установлена").color(Color32::from_rgb(0x7B, 0xE0, 0x9A)));
                     } else if ui.add_enabled(!prog.running, egui::Button::new("Скачать")).clicked() {
@@ -544,7 +544,7 @@ impl App {
             ui.add_space(8.0);
 
             ui.label(RichText::new("Облачный мозг — необязательно").font(semi(13.5)).color(accent()));
-            ui.label(RichText::new("Сервер с протоколом чата OpenAI (например, https://api.groq.com/openai/v1). Вопросы и ответы уходят на него, память компьютера не занята; если сервер недоступен, думает локальная модель.").color(DIM).size(11.5));
+            ui.label(RichText::new("Сервер с протоколом чата OpenAI (например, https://api.groq.com/openai/v1). Вопросы и ответы уходят на него, память компьютера не занята; если сервер недоступен, думает локальная модель.").color(dim()).size(11.5));
             changed |= field(ui, "Адрес", &mut self.cfg.jarvis_url, "пусто — думать на компьютере", false);
             changed |= field(ui, "Ключ", &mut self.cfg.jarvis_key, "своему посреднику не нужен", true);
             changed |= field(ui, "Модель", &mut self.cfg.jarvis_remote_model, "имя модели на сервере", false);
@@ -557,14 +557,14 @@ impl App {
                 self.voice.hush();
                 changed = true;
             }
-            ui.label(RichText::new("Встроенный голос работает на компьютере. Свой голос Fish Audio — необязательно: тогда текст ответов уходит на api.fish.audio.").color(DIM).size(11.5));
+            ui.label(RichText::new("Встроенный голос работает на компьютере. Свой голос Fish Audio — необязательно: тогда текст ответов уходит на api.fish.audio.").color(dim()).size(11.5));
             changed |= field(ui, "Ключ Fish Audio", &mut self.cfg.fish_key, "пусто — встроенный голос", true);
             changed |= field(ui, "Номер голоса", &mut self.cfg.fish_voice, "идентификатор голоса", false);
             ui.add_space(8.0);
 
             ui.label(RichText::new("Слово «Джарвис»").font(semi(13.5)).color(accent()));
             changed |= ui.add_enabled(self.ears.ready(), egui::Checkbox::new(&mut self.cfg.jarvis_listen, "Слушать постоянно и откликаться на имя")).changed();
-            ui.label(RichText::new("Микрофон включён всё время. Речь распознаётся на этом компьютере; фразы без слова «Джарвис» сразу отбрасываются и нигде не сохраняются.").color(DIM).size(11.5));
+            ui.label(RichText::new("Микрофон включён всё время. Речь распознаётся на этом компьютере; фразы без слова «Джарвис» сразу отбрасываются и нигде не сохраняются.").color(dim()).size(11.5));
         });
         if changed {
             self.cfg.save();
@@ -615,7 +615,7 @@ impl App {
         };
         let mut flip_listen = false;
         ui.horizontal(|ui| {
-            ui.label(RichText::new(state).color(DIM).size(11.5));
+            ui.label(RichText::new(state).color(dim()).size(11.5));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 flip_listen = ui
                     .add_enabled(self.ears.ready(), egui::Button::new(if self.cfg.jarvis_listen { "Слово «Джарвис»: слушаю" } else { "Слово «Джарвис»: выкл" }))
@@ -651,7 +651,7 @@ impl App {
                         ui.label(RichText::new(text).color(accent()));
                     }
                     1 => {
-                        ui.label(RichText::new(text).color(FG));
+                        ui.label(RichText::new(text).color(fg()));
                     }
                     2 => {
                         ui.label(RichText::new(format!("→  {text}")).color(Color32::from_rgb(0x7B, 0xE0, 0x9A)).size(12.0));
@@ -662,20 +662,20 @@ impl App {
                 }
             }
             if self.jv_busy {
-                ui.label(RichText::new(&self.jv_status).color(DIM));
+                ui.label(RichText::new(&self.jv_status).color(dim()));
             }
             match self.jv_listen {
                 1 => {
                     // полоска громкости: видно, что микрофон вас слышит
                     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
                     let p = ui.painter();
-                    p.text(r.left_center(), Align2::LEFT_CENTER, "Слушаю…", FontId::proportional(13.0), DIM);
+                    p.text(r.left_center(), Align2::LEFT_CENTER, "Слушаю…", FontId::proportional(13.0), dim());
                     let bar = egui::Rect::from_min_size(r.left_center() + vec2(76.0, -3.0), vec2(220.0, 6.0));
                     p.rect_filled(bar, 3.0, Color32::from_white_alpha(22));
                     p.rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * self.jv_level.clamp(0.02, 1.0), 6.0)), 3.0, accent());
                 }
                 2 => {
-                    ui.label(RichText::new("Разбираю слова…").color(DIM));
+                    ui.label(RichText::new("Разбираю слова…").color(dim()));
                 }
                 _ => {}
             }
@@ -688,8 +688,8 @@ impl App {
             glass_chip(ui.painter(), row, 12.0, 0.7);
             let p = ui.painter().with_clip_rect(row.shrink(6.0));
             let mut lines = text.lines();
-            p.text(row.left_top() + vec2(14.0, 9.0), Align2::LEFT_TOP, lines.next().unwrap_or(""), semi(13.5), FG);
-            p.text(row.left_top() + vec2(14.0, 31.0), Align2::LEFT_TOP, lines.collect::<Vec<_>>().join(" "), FontId::monospace(11.5), DIM);
+            p.text(row.left_top() + vec2(14.0, 9.0), Align2::LEFT_TOP, lines.next().unwrap_or(""), semi(13.5), fg());
+            p.text(row.left_top() + vec2(14.0, 31.0), Align2::LEFT_TOP, lines.collect::<Vec<_>>().join(" "), FontId::monospace(11.5), dim());
             let mut btns = ui.new_child(egui::UiBuilder::new().max_rect(row.shrink2(vec2(10.0, 13.0))).layout(egui::Layout::right_to_left(egui::Align::Center)));
             if jelly(&mut btns, "Нет").clicked() {
                 answer = Some(false);
@@ -710,7 +710,7 @@ impl App {
             let r = ui.add(
                 egui::TextEdit::singleline(&mut self.jv_input)
                     .margin(egui::Margin::symmetric(9.0, 7.0))
-                    .hint_text(RichText::new("Скажите Джарвису, что сделать").color(DIM))
+                    .hint_text(RichText::new("Скажите Джарвису, что сделать").color(dim()))
                     .desired_width(w),
             );
             send = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
