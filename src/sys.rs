@@ -2259,3 +2259,110 @@ mod internet_live {
         assert_eq!(super::internet_ok(), Some(true), "на машине с интернетом должно быть Some(true)");
     }
 }
+
+/// Кто сейчас пишет микрофон и снимает камерой. Микрофон — по живым сессиям записи звука (нужен COM в
+/// потоке, Probe его включает) и журналу Windows «Конфиденциальность»; камера — только по журналу
+/// (реестр только читаем). У программы, которая прямо сейчас держит устройство, `LastUsedTimeStop` равен нулю.
+/// Обычные программы (`NonPackaged`) ещё сверяем со списком процессов: если программа упала, не
+/// отпустив микрофон, запись так и осталась бы «занят». Сам остров (голос Джарвиса) не считаем.
+pub fn devices_in_use() -> (Vec<String>, Vec<String>) {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    let base = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore";
+    let hk = RegKey::predef(HKEY_CURRENT_USER);
+    let mut running: Option<std::collections::HashSet<String>> = None;
+    // момент загрузки Windows в FILETIME (сотни наносекунд с 1601 года)
+    let boot_ft: u64 = {
+        let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64 / 100);
+        let up = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() } * 10_000;
+        (unix + 116_444_736_000_000_000).saturating_sub(up)
+    };
+    let mut scan = |cap: &str| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let Ok(root) = hk.open_subkey(format!(r"{base}\{cap}")) else { return out };
+        let mut check = |parent: &RegKey, name: &str| {
+            let Ok(k) = parent.open_subkey(name) else { return };
+            let start: u64 = k.get_value("LastUsedTimeStart").unwrap_or(0);
+            let stop: u64 = k.get_value("LastUsedTimeStop").unwrap_or(1);
+            // запись старше загрузки Windows — программа упала, не отпустив устройство, это не «сейчас»
+            if start == 0 || stop != 0 || start < boot_ft {
+                return;
+            }
+            let (show, exe) = consent_name(name);
+            if let Some(exe) = exe {
+                if exe == "ostrovok.exe" {
+                    return;
+                }
+                let live = running.get_or_insert_with(|| crate::game::snapshot().into_iter().map(|(_, n)| n.to_lowercase()).collect());
+                if !live.contains(&exe) {
+                    return;
+                }
+            }
+            if !show.is_empty() && !out.contains(&show) {
+                out.push(show);
+            }
+        };
+        for name in root.enum_keys().flatten().filter(|n| n != "NonPackaged") {
+            check(&root, &name);
+        }
+        if let Ok(np) = root.open_subkey("NonPackaged") {
+            for name in np.enum_keys().flatten() {
+                check(&np, &name);
+            }
+        }
+        out
+    };
+    // микрофон: журнал Windows отстаёт (Discord после обновления в новую папку туда не попадал), поэтому
+    // главное — живые сессии записи звука, как у определения звонка; журнал — в дополнение
+    let mut mic: Vec<String> = Vec::new();
+    for exe in crate::live::apps_recording() {
+        let show = pretty_name(&exe);
+        if exe != "ostrovok.exe" && !show.is_empty() && !mic.contains(&show) {
+            mic.push(show);
+        }
+    }
+    for show in scan("microphone") {
+        if !mic.iter().any(|m| m.eq_ignore_ascii_case(&show)) {
+            mic.push(show);
+        }
+    }
+    let cam = scan("webcam");
+    (mic, cam)
+}
+
+/// Имя записи журнала → (как показать, имя файла для сверки с процессами).
+/// «C:#Program Files#Discord#Discord.exe» → («Discord», «discord.exe»);
+/// «Microsoft.WindowsCamera_8wekyb3d8bbwe» → («WindowsCamera», нет).
+fn consent_name(key: &str) -> (String, Option<String>) {
+    if key.contains('#') {
+        let file = key.rsplit('#').next().unwrap_or(key);
+        (pretty_name(file), Some(file.to_lowercase()))
+    } else {
+        let family = key.split('_').next().unwrap_or(key);
+        let short = family.rsplit('.').next().unwrap_or(family);
+        (pretty_name(short), None)
+    }
+}
+
+#[cfg(test)]
+mod consent_tests {
+    use super::consent_name;
+
+    #[test]
+    fn names() {
+        assert_eq!(consent_name(r"C:#Users#NPC#AppData#Local#Discord#app-1.0.9269#Discord.exe"), ("Discord".into(), Some("discord.exe".into())));
+        assert_eq!(consent_name("D:#Steam#steamapps#common#Counter-Strike Global Offensive#game#bin#win64#cs2.exe"), ("Cs2".into(), Some("cs2.exe".into())));
+        assert_eq!(consent_name("Microsoft.WindowsCamera_8wekyb3d8bbwe"), ("WindowsCamera".into(), None));
+        assert_eq!(consent_name("windows.immersivecontrolpanel_cw5n1h2txyewy"), ("Immersivecontrolpanel".into(), None));
+    }
+}
+
+#[cfg(test)]
+mod in_use_live {
+    /// cargo test --release in_use_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn now() {
+        let _ = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
+        println!("{:?}", super::devices_in_use());
+    }
+}

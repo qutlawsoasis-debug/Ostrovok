@@ -18,6 +18,9 @@ pub struct Settings {
     /// день последней утренней сводки «ГГГГ-ММ-ДД» — показывается раз в день
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub brief_day: String,
+    /// раздачи игр, о которых уже сказали («steam:1222140»), — плашка о каждой только раз
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub free_seen: Vec<String>,
     /// города для мировых часов под календарём
     #[serde(default)]
     pub world: Vec<String>,

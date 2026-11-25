@@ -1177,7 +1177,7 @@ fn exited(h: &Owned) -> bool {
 }
 
 /// Все процессы: pid и имя файла (как есть).
-fn snapshot() -> Vec<(u32, String)> {
+pub fn snapshot() -> Vec<(u32, String)> {
     use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
     let mut out = Vec::new();
     let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else { return out };

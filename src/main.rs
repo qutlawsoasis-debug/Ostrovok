@@ -23,6 +23,7 @@ mod update;
 mod sys;
 mod voice;
 mod weather;
+mod free;
 
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Id, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1044,6 +1045,8 @@ enum Seg {
     Badge(usize, Color32),
     /// заряд кончается: процент и идёт ли зарядка
     Battery(u8, bool),
+    /// микрофон или камера заняты: точка, как на телефоне (true — камера, зелёная; иначе микрофон, оранжевая)
+    InUse(bool),
 }
 
 struct App {
@@ -1297,6 +1300,15 @@ struct App {
     hints_at: Option<Instant>,
     rain_told: Option<Instant>,
     /// фоновые опросы корзины и звуковых программ (см. Probe)
+    /// бесплатные игры (Steam первым, потом Epic) и их фоновый опрос: раз в 3 часа, после ошибки — через 10 минут
+    freebies: Vec<free::Game>,
+    free_probe: Probe<Result<Vec<free::Game>, String>>,
+    free_ok: bool,
+    /// плашка о новой раздаче в Steam ждёт, пока кончится игра: (заголовок, текст)
+    free_pending: Option<(String, String)>,
+    /// кто сейчас держит микрофон и камеру (журнал Windows), опрос раз в 2 секунды
+    in_use: (Vec<String>, Vec<String>),
+    in_use_probe: Probe<(Vec<String>, Vec<String>)>,
     bin_probe: Probe<(i64, i64)>,
     mixer_probe: Probe<Vec<sys::AppVol>>,
     /// только что удалённая заметка: текст, место, когда — её можно вернуть NOTE_UNDO
@@ -1674,6 +1686,12 @@ impl App {
             win_busy_at: Instant::now(),
             hint_cache: Default::default(),
             note_trash: None,
+            freebies: Vec::new(),
+            free_probe: Probe::new(),
+            free_ok: false,
+            free_pending: None,
+            in_use: Default::default(),
+            in_use_probe: Probe::new(),
             bin_probe: Probe::new(),
             frame_at: Instant::now(),
             last_game: None,
@@ -1835,6 +1853,18 @@ impl App {
                 }
             }
             app.cfg.world = world;
+        }
+        // для снимков точки «занято»: OSTROVOK_INUSE=mic | cam
+        if let Some(v) = std::env::var("OSTROVOK_INUSE").ok().filter(|_| test_mode()) {
+            app.in_use = if v == "cam" { (vec!["Discord".into()], vec!["Chrome".into()]) } else { (vec!["Discord".into()], Vec::new()) };
+        }
+        // для снимков раздач: OSTROVOK_FREE=1 — образец из Steam и Epic
+        if test_mode() && std::env::var_os("OSTROVOK_FREE").is_some() {
+            let ends = Some(chrono::Utc::now() + chrono::Duration::hours(50));
+            app.freebies = vec![
+                free::Game { store: free::Store::Steam, id: "steam:1222140".into(), title: "Detroit: Become Human".into(), url: "https://store.steampowered.com/app/1222140".into(), appid: Some(1222140), ends: None },
+                free::Game { store: free::Store::Epic, id: "epic:demo".into(), title: "Mark of the Deep".into(), url: "https://store.epicgames.com/ru/p/mark-of-the-deep-f7dc08".into(), appid: None, ends },
+            ];
         }
         // для снимков пилюли со значком непрочитанных: OSTROVOK_UNREAD=3
         if let Some(n) = std::env::var("OSTROVOK_UNREAD").ok().and_then(|v| v.parse::<usize>().ok()).filter(|_| test_mode()) {
@@ -2633,7 +2663,65 @@ impl App {
     }
 
     /// Фоновые дела: сообщения потоков, буфер обмена, таймер, погода, заметки.
+    /// Раздачи игр: опрос в фоне; новая раздача в Steam — разовая плашка (Epic раздаёт каждую неделю,
+    /// он только на главной, без плашек).
+    fn pump_free(&mut self, ctx: &egui::Context) {
+        // в проверочном запуске сеть не трогаем — образец даёт OSTROVOK_FREE
+        // плашка, отложенная на время игры (во время игры остров молчит), — когда игра кончилась
+        // и не поверх карточки «Островок обновлён» (первые 12 с) или напоминания
+        let reminder_up = self.toast.as_ref().is_some_and(|t| t.glyph == "\u{E823}" && t.until > Instant::now());
+        if !self.game_quiet && !reminder_up && ctx.input(|i| i.time) > 12.0 {
+            if let Some((title, text)) = self.free_pending.take() {
+                self.show_toast("\u{E7FC}", [0x66, 0xC0, 0xF4], &title, &text, 10, false);
+            }
+        }
+        if test_mode() {
+            return;
+        }
+        let every = Duration::from_secs(if self.free_ok { 3 * 3600 } else { 600 });
+        if quiet::allowed(quiet::Job::Weather, self.fs_now) {
+            self.free_probe.kick(every, ctx, free::fetch);
+        }
+        let Some(res) = self.free_probe.take() else { return };
+        let Ok(list) = res else {
+            self.free_ok = false;
+            return;
+        };
+        self.free_ok = true;
+        let fresh: Vec<free::Game> = list.iter().filter(|g| g.store == free::Store::Steam && !self.cfg.free_seen.contains(&g.id)).cloned().collect();
+        let mut changed = false;
+        for g in &list {
+            if !self.cfg.free_seen.contains(&g.id) {
+                self.cfg.free_seen.push(g.id.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            let n = self.cfg.free_seen.len();
+            if n > 60 {
+                self.cfg.free_seen.drain(..n - 60);
+            }
+            self.cfg.save();
+        }
+        if let Some(g) = fresh.first() {
+            let more = if fresh.len() > 1 { format!(" и ещё {}", fresh.len() - 1) } else { String::new() };
+            self.free_pending = Some(("В Steam раздают бесплатно".into(), format!("{}{more} — забрать на главной", g.title)));
+        }
+        self.freebies = list;
+    }
+
     fn pump(&mut self, ctx: &egui::Context, now: Instant) {
+        self.pump_free(ctx);
+        // образец для снимков (OSTROVOK_INUSE) опрос не перетирает
+        if !(test_mode() && std::env::var_os("OSTROVOK_INUSE").is_some()) {
+            self.in_use_probe.kick(quiet::poll_every(quiet::Src::Live, self.fs_now), ctx, sys::devices_in_use);
+        }
+        if let Some(v) = self.in_use_probe.take() {
+            if v != self.in_use {
+                self.in_use = v;
+                ctx.request_repaint();
+            }
+        }
         // последнее значение громкости уходит, даже если панель микшера закрыли сразу после перетаскивания
         if self.mix_push.1.is_some() && should_push(self.mix_push.0, now, !ctx.input(|i| i.pointer.any_down())) {
             if let Some((path, v)) = self.mix_push.1.take() {
@@ -3334,6 +3422,14 @@ impl App {
                 }
             }
         }
+        // крайней справа — точка «микрофон / камера заняты»
+        // (звонок в Discord уже виден своей капсулой — его одного точкой не дублируем)
+        let only_call = self.call_since.is_some() && self.fx.is_none() && self.in_use.0.iter().all(|a| a.to_lowercase().contains("discord"));
+        if !self.in_use.1.is_empty() {
+            v.push(Seg::InUse(true));
+        } else if !self.in_use.0.is_empty() && !only_call {
+            v.push(Seg::InUse(false));
+        }
         v
     }
 
@@ -3346,6 +3442,7 @@ impl App {
                 Seg::Track(t) => ctx.fonts(|f| f.layout_no_wrap(t.clone(), semi(13.0), fg()).size().x).clamp(96.0, 170.0),
                 Seg::Text(t, _) => ctx.fonts(|f| f.layout_no_wrap(t.clone(), semi(13.5), fg()).size().x),
                 Seg::Badge(n, _) => badge_w(ctx, *n),
+                Seg::InUse(_) => 8.0,
                 Seg::Battery(pct, _) => 25.0 + ctx.fonts(|f| f.layout_no_wrap(format!("{pct}%"), semi(12.5), fg()).size().x),
             } + 10.0;
         }
@@ -3634,6 +3731,20 @@ impl App {
                     p.rect_filled(Rect::from_min_max(r.min + vec2(4.0, 1.5), pos2(r.right() - 4.0, r.top() + 6.5)), Rounding::same(4.0), rgba(255, 255, 255, 34));
                     p.text(r.center() + vec2(0.0, 0.5), Align2::CENTER_CENTER, badge_text(*n), semi(11.5), Color32::WHITE);
                     x += w + 10.0;
+                }
+                Seg::InUse(cam) => {
+                    let col = if *cam { Color32::from_rgb(0x30, 0xD1, 0x58) } else { Color32::from_rgb(0xFF, 0x9F, 0x0A) };
+                    let c = pos2(x + 4.0, cy);
+                    p.circle_filled(c, 6.5, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 40));
+                    p.circle_filled(c, 3.8, col);
+                    let who = |v: &Vec<String>| v.join(", ");
+                    let tip = match (self.in_use.0.is_empty(), self.in_use.1.is_empty()) {
+                        (false, false) => format!("Камера: {}\nМикрофон: {}", who(&self.in_use.1), who(&self.in_use.0)),
+                        (true, false) => format!("Камера: {}", who(&self.in_use.1)),
+                        _ => format!("Микрофон: {}", who(&self.in_use.0)),
+                    };
+                    ui.interact(Rect::from_center_size(c, vec2(18.0, 22.0)), Id::new("pill-inuse"), Sense::hover()).on_hover_text(tip);
+                    x += 8.0 + 10.0;
                 }
                 Seg::Battery(pct, charging) => {
                     // корпус, носик и заливка по заряду; при зарядке — молния поверх. Всё неподвижно
@@ -4560,6 +4671,38 @@ impl App {
             if resp.clicked() {
                 open = Some(target);
             }
+        }
+        // справа — раздача: бесплатная игра в Steam (первой) или Epic, щелчок открывает магазин
+        let mut open_free: Option<String> = None;
+        let x0 = r.left() + 14.0 + items.len() as f32 * (w + 10.0);
+        if let Some(g) = self.freebies.first().filter(|_| r.right() - 14.0 - x0 >= 170.0) {
+            let b = Rect::from_min_max(pos2(x0, r.top() + 36.0), pos2(r.right() - 14.0, r.top() + 86.0));
+            let others: Vec<String> = self.freebies.iter().skip(1).map(|o| format!("{} — {}", o.title, o.store_name())).collect();
+            let tip = if others.is_empty() { format!("Забрать в {}: игра останется навсегда", g.store_name()) } else { format!("Забрать в {}. Ещё бесплатно: {}", g.store_name(), others.join(", ")) };
+            let resp = ui.interact(b, id.with("free"), Sense::click()).on_hover_text(tip);
+            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+            let tone = match g.store {
+                free::Store::Steam => Color32::from_rgb(0x66, 0xC0, 0xF4),
+                free::Store::Epic => Color32::from_rgb(0xE8, 0xE4, 0xDC),
+            };
+            glass_chip(p, b, R_ROW, 0.45 + 0.6 * hov);
+            p.rect_filled(b, Rounding::same(R_ROW), Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), (16.0 + 14.0 * hov) as u8));
+            let left = free::left_text(g.ends, chrono::Utc::now());
+            let more = if self.freebies.len() > 1 { format!(" · +{}", self.freebies.len() - 1) } else { String::new() };
+            let head = if left.is_empty() { format!("БЕСПЛАТНО · {}{more}", g.store_name()) } else { format!("БЕСПЛАТНО · {} · {left}{more}", g.store_name()) };
+            let inner = b.width() - 28.0;
+            p.text(pos2(b.left() + 14.0, b.top() + 15.0), Align2::LEFT_CENTER, elide(p, &head, semi(10.5), inner), semi(10.5), tone);
+            p.text(pos2(b.left() + 14.0, b.top() + 33.0), Align2::LEFT_CENTER, elide(p, &g.title, semi(15.0), inner), semi(15.0), fg());
+            if resp.clicked() {
+                open_free = Some(match (g.store.clone(), g.appid) {
+                    (free::Store::Steam, Some(id)) if steam => format!("steam://store/{id}"),
+                    _ => g.url.clone(),
+                });
+            }
+        }
+        if let Some(u) = open_free {
+            sys::open(&u);
+            self.mode = Mode::Pill;
         }
         if let Some(t) = open {
             sys::open(t);

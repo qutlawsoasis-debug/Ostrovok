@@ -119,7 +119,7 @@ fn read(n: &windows::UI::Notifications::UserNotification) -> Option<Notice> {
 }
 
 /// Имена программ (в нижнем регистре), которые прямо сейчас записывают звук с микрофона.
-fn apps_recording() -> Vec<String> {
+pub fn apps_recording() -> Vec<String> {
     let mut names = Vec::new();
     unsafe {
         let Ok(enumerator) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) else { return names };
