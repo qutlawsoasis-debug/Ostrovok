@@ -3255,7 +3255,7 @@ impl App {
             v.push(Seg::Text(text, Color32::from_rgb(0xFF, 0x8A, 0x7A)));
         }
         // итог последней игры — 10 минут после неё, если не играет музыка (иначе пилюля переполнится)
-        if let Some((text, c, _)) = self.last_game.as_ref().filter(|g| g.2.elapsed() < GAME_RECAP && !playing) {
+        if let Some((text, c, _)) = self.last_game.as_ref().filter(|g| g.2.elapsed() < GAME_RECAP_PILL && !playing) {
             v.push(Seg::Text(format!("\u{E7FC} {text}"), Color32::from_rgb(c[0], c[1], c[2])));
         }
         if self.inbox_unread > 0 {
@@ -10464,15 +10464,18 @@ const MATCH_ACCEPT: Duration = Duration::from_secs(20);
 
 /// Сколько итог последней игры висит в пилюле и «Сейчас».
 const GAME_RECAP: Duration = Duration::from_secs(10 * 60);
+/// В пилюле итог висит короче — 3 минуты: дальше он только мешает.
+const GAME_RECAP_PILL: Duration = Duration::from_secs(3 * 60);
 
 /// Короткий итог игры для пилюли: «CS2 · 2 ч 14 м · 28 мс» (без пинга — без хвоста).
 fn game_pill_text(title: &str, secs: u64, ping: Option<u32>) -> String {
     let (h, m) = (secs / 3600, secs % 3600 / 60);
-    let dur = if h > 0 { format!("{h} ч {m} м") } else { format!("{} м", m.max(1)) };
+    let dur = if h > 0 { format!("{h} ч {m} мин") } else { format!("{} мин", m.max(1)) };
     let name = short_label(if title.trim().is_empty() { "Игра" } else { title.trim() }, 14);
+    // с подписями: «CS2 · 22 м · 13 мс» без слов было непонятно, что это итог игры и пинг
     match ping {
-        Some(p) => format!("{name} · {dur} · {p} мс"),
-        None => format!("{name} · {dur}"),
+        Some(p) => format!("{name} окончена · {dur} · пинг {p}"),
+        None => format!("{name} окончена · {dur}"),
     }
 }
 
@@ -10481,9 +10484,9 @@ mod game_pill_tests {
     #[test]
     fn short_recap() {
         use super::game_pill_text as g;
-        assert_eq!(g("CS2", 2 * 3600 + 14 * 60 + 5, Some(28)), "CS2 · 2 ч 14 м · 28 мс");
-        assert_eq!(g("Counter-Strike 2", 40 * 60, None), "Counter-Strike… · 40 м");
-        assert_eq!(g("", 10, Some(5)), "Игра · 1 м · 5 мс");
+        assert_eq!(g("CS2", 2 * 3600 + 14 * 60 + 5, Some(28)), "CS2 окончена · 2 ч 14 мин · пинг 28");
+        assert_eq!(g("Counter-Strike 2", 40 * 60, None), "Counter-Strike… окончена · 40 мин");
+        assert_eq!(g("", 10, Some(5)), "Игра окончена · 1 мин · пинг 5");
     }
 }
 

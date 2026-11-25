@@ -2198,11 +2198,10 @@ pub fn set_click_through(hwnd: isize, pass: bool) {
         } else {
             ex &= !WS_EX_TRANSPARENT.0;
         }
-        if old & WS_EX_LAYERED.0 == 0 {
-            // слой без атрибутов Windows может не показать — непрозрачность 255, картинку даёт OpenGL
-            SetWindowLongW(h, GWL_EXSTYLE, ex as i32);
-            let _ = SetLayeredWindowAttributes(h, windows::Win32::Foundation::COLORREF(0), 255, LWA_ALPHA);
-        } else if ex != old {
+        // Только стиль, без SetLayeredWindowAttributes: LWA_ALPHA велит Windows считать окно целиком
+        // одинаково непрозрачным и забыть про прозрачность пикселей — на видеокартах Intel/AMD всё
+        // вокруг острова становилось чёрным прямоугольником. winit ставит LAYERED так же, без атрибутов.
+        if ex != old {
             SetWindowLongW(h, GWL_EXSTYLE, ex as i32);
         }
         // Окно перестало пропускать мышь, а курсор уже над ним и стоит: Windows не пришлёт движения,
