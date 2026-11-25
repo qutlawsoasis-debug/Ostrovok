@@ -2352,7 +2352,7 @@ impl App {
         }
         let low = q.to_lowercase();
 
-        if let Some(cmd) = parse_quick(&q, chrono::Local::now().naive_local()) {
+        if let Some(cmd) = parse_quick(&q, chrono::Local::now().naive_local()).filter(|_| SHOW_DAY) {
             let today = chrono::Local::now().date_naive();
             let title = match &cmd {
                 Quick::Todo(t) => format!("Добавить дело: {t}"),
@@ -3664,7 +3664,7 @@ impl App {
     }
 
     fn ui_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // Пять разделов вместо шести групп и двадцати вкладок. У «Сейчас» и «Инструментов» внутренние
+        // Четыре раздела вместо шести групп и двадцати вкладок. У «Сейчас» и «Инструментов» внутренние
         // страницы открываются из карточек и плиток, а в шапке тогда видно «‹ раздел · страница».
         // У «Дня» и «Системы» страницы — рядом текстом, как раньше. Первая страница группы — её корень.
         let current = nav_group(self.tab);
@@ -3704,7 +3704,7 @@ impl App {
             if bresp.clicked() {
                 go = Some(current_root);
             }
-            let page = pages.iter().find(|p| p.0 == self.tab).map_or("", |p| p.1);
+            let page = pages.iter().find(|p| p.0 == self.tab).map_or_else(|| hidden_page_name(self.tab), |p| p.1);
             let r = ui.painter().text(pos2(back.right() + 9.0, mid), Align2::LEFT_CENTER, NAV[current].1, semi(13.0), dim());
             ui.painter().text(pos2(r.right() + 6.0, mid), Align2::LEFT_CENTER, format!("·  {page}"), semi(13.5), fg());
         } else if tabs_row {
@@ -4489,8 +4489,87 @@ impl App {
         }
     }
 
+    /// Широкая карточка главной, когда ничего не играет — то, что нужно обычному дню за компом:
+    /// новые сообщения (Telegram, Discord…), итог последней игры, иначе быстрый запуск YouTube / Steam / Discord.
+    fn home_feed(&mut self, ui: &mut egui::Ui, p: &egui::Painter, r: Rect) {
+        let id = ui.id().with("home-feed");
+        let clip = p.with_clip_rect(r.shrink2(vec2(14.0, 0.0)));
+        let caption = |t: &str| clip.text(r.min + vec2(18.0, 12.0), Align2::LEFT_TOP, t, semi(11.0), mix(dim(), BG, 0.15));
+        // 1) новые сообщения — две последние строки
+        if self.inbox_unread > 0 && !self.inbox.is_empty() {
+            let resp = ui.interact(r, id, Sense::click()).on_hover_text("Открыть уведомления");
+            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+            glass_chip(p, r, R_CARD, 0.6 + 0.4 * hov);
+            caption(&format!("СООБЩЕНИЯ · {}", self.inbox_unread));
+            let now = chrono::Local::now();
+            for (i, m) in self.inbox.iter().take(self.inbox_unread.min(2)).enumerate() {
+                let y = r.top() + 42.0 + i as f32 * 24.0;
+                let c = Color32::from_rgb(m.color[0], m.color[1], m.color[2]);
+                clip.circle_filled(pos2(r.left() + 22.0, y), 4.0, c);
+                let ago = (now - m.at).num_minutes();
+                let when = if ago < 1 { "сейчас".to_string() } else if ago < 60 { format!("{ago} мин") } else { format!("{} ч", ago / 60) };
+                let wr = clip.text(pos2(r.right() - 18.0, y), Align2::RIGHT_CENTER, when, FontId::proportional(12.5), dim());
+                let head = clip.text(pos2(r.left() + 34.0, y), Align2::LEFT_CENTER, short_label(&m.title, 22), semi(14.5), fg());
+                let body = m.body.replace(['\n', '\r'], " ");
+                let room = wr.left() - 12.0 - (head.right() + 10.0);
+                if room > 30.0 {
+                    clip.text(pos2(head.right() + 10.0, y), Align2::LEFT_CENTER, elide(p, &body, FontId::proportional(14.0), room), FontId::proportional(14.0), dim());
+                }
+            }
+            if resp.clicked() {
+                self.tab = Tab::Inbox;
+            }
+            return;
+        }
+        // 2) итог последней игры
+        if let Some((text, c, _)) = self.last_game.clone().filter(|g| g.2.elapsed() < GAME_RECAP) {
+            let resp = ui.interact(r, id, Sense::click()).on_hover_text("Открыть «Игру»");
+            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+            glass_chip(p, r, R_CARD, 0.6 + 0.4 * hov);
+            caption("ПОСЛЕДНЯЯ ИГРА");
+            clip.text(r.min + vec2(18.0, 34.0), Align2::LEFT_TOP, &text, semi(19.0), Color32::from_rgb(c[0], c[1], c[2]));
+            clip.text(r.min + vec2(18.0, 64.0), Align2::LEFT_TOP, "пинг, потери и что мешало — на странице «Игра»", FontId::proportional(13.0), dim());
+            if resp.clicked() {
+                self.tab = Tab::Game;
+            }
+            return;
+        }
+        // 3) быстрый запуск: YouTube всегда, Steam и Discord — если установлены
+        glass_chip(p, r, R_CARD, 0.55);
+        caption("ЗАПУСТИТЬ");
+        // реестр спрашиваем один раз за запуск, а не каждый кадр
+        static HAVE: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+        let (steam, discord) = *HAVE.get_or_init(|| (sys::protocol_installed("steam"), sys::protocol_installed("discord")));
+        let mut items: Vec<(&str, &str, [u8; 3], &str)> = vec![("YouTube", "\u{E714}", [0xFF, 0x4E, 0x45], "https://www.youtube.com")];
+        if steam {
+            items.push(("Steam", "\u{E7FC}", [0x9A, 0xB8, 0xD8], "steam://open/main"));
+        }
+        if discord {
+            items.push(("Discord", "\u{E8BD}", [0x8E, 0x98, 0xFF], "discord://"));
+        }
+        let w = 128.0;
+        let mut open: Option<&str> = None;
+        for (i, (name, glyph, col, target)) in items.iter().enumerate() {
+            let b = Rect::from_min_size(pos2(r.left() + 14.0 + i as f32 * (w + 10.0), r.top() + 36.0), vec2(w, 50.0));
+            let resp = ui.interact(b, id.with(i), Sense::click()).on_hover_text(format!("Открыть {name}"));
+            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+            glass_chip(p, b, R_ROW, 0.3 + 0.7 * hov);
+            let tone = Color32::from_rgb(col[0], col[1], col[2]);
+            p.text(pos2(b.left() + 22.0, b.center().y), Align2::CENTER_CENTER, *glyph, FontId::proportional(18.0), mix(mix(tone, fg(), 0.3), tone, hov));
+            p.text(pos2(b.left() + 42.0, b.center().y), Align2::LEFT_CENTER, *name, semi(15.0), fg());
+            if resp.clicked() {
+                open = Some(target);
+            }
+        }
+        if let Some(t) = open {
+            sys::open(t);
+            self.mode = Mode::Pill;
+        }
+    }
+
     /// Карточка «Дальше» на главной: ближайшие напоминания до конца завтрашнего дня и незакрытые дела
     /// (сначала со сроком сегодня или просроченные). Щелчок открывает «День».
+    #[allow(dead_code)] // «Дальше» с делами — вернётся вместе с SHOW_DAY
     fn home_agenda(&mut self, ui: &mut egui::Ui, p: &egui::Painter, r: Rect) {
         let resp = ui.interact(r, ui.id().with("home-agenda"), Sense::click()).on_hover_text("Открыть «День»");
         let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
@@ -4520,24 +4599,13 @@ impl App {
     /// Живая карточка главной (вместо колец процессора и памяти): идущий таймер, новое сообщение или
     /// дела на сегодня. Ничего такого нет — возвращает false, и на её месте остаются кольца.
     fn home_live(&mut self, ui: &mut egui::Ui, p: &egui::Painter, r: Rect) -> bool {
-        let key = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
-        let today = self.cfg.todos.iter().filter(|t| !t.done && t.due.as_deref().is_some_and(|d| d <= key.as_str())).count();
         let (glyph, color, title, sub, go): (&str, Color32, String, String, Tab) = if let Some(end) = self.timer_end {
             let what = if self.focus.is_some_and(|f| f.0) { "Перерыв" } else if self.focus.is_some() { "Фокус" } else { "Таймер" };
             ("\u{E916}", Color32::from_rgb(0xFF, 0xB3, 0x40), format!("{what} · {}", fmt_left(end)), "открыть таймер".into(), Tab::Timer)
         } else if self.timer_paused.is_some() {
             ("\u{E769}", Color32::from_rgb(0xFF, 0xB3, 0x40), "Таймер на паузе".into(), "открыть таймер".into(), Tab::Timer)
-        } else if let Some((text, c, _)) = self.last_game.clone().filter(|g| g.2.elapsed() < GAME_RECAP) {
-            ("\u{E7FC}", Color32::from_rgb(c[0], c[1], c[2]), text, "итог игры · пинг, потери и что мешало".into(), Tab::Game)
-        } else if let Some(m) = self.inbox.first().filter(|_| self.inbox_unread > 0) {
-            let c = Color32::from_rgb(m.color[0], m.color[1], m.color[2]);
-            let more = if self.inbox_unread > 1 { format!(" · ещё {}", self.inbox_unread - 1) } else { String::new() };
-            // переносы строк в тексте сообщения налезали бы на соседнюю строку карточки
-            ("\u{E8BD}", c, format!("{} · {}{more}", m.title, m.app), m.body.replace(['\n', '\r'], " "), Tab::Inbox)
-        } else if today > 0 {
-            let first = self.cfg.todos.iter().find(|t| !t.done && t.due.as_deref().is_some_and(|d| d <= key.as_str())).map_or(String::new(), |t| t.text.clone());
-            ("\u{E73E}", accent(), format!("На сегодня: {}", count_word(today, "дело", "дела", "дел")), first, Tab::Todo)
         } else {
+            // сообщения и итог игры показывает широкая карточка (home_feed); дела спрятаны вместе с «Днём»
             return false;
         };
         let resp = ui.interact(r, ui.id().with("home-live"), Sense::click());
@@ -4573,15 +4641,9 @@ impl App {
             const DAYS: [&str; 7] = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"];
             const MONTHS: [&str; 12] = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
             let t = chrono::Local::now();
-            let time_r = Rect::from_min_size(hero.min, vec2(hero.width() * 0.55, hero.height()));
-            let resp = ui.interact(time_r, ui.id().with("home-now"), Sense::click()).on_hover_text("Открыть «День»");
-            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
             p.text(hero.min + vec2(2.0, -6.0), Align2::LEFT_TOP, t.format("%H:%M").to_string(), light(52.0), fg());
             let date = format!("{}, {} {}", DAYS[t.weekday().num_days_from_monday() as usize], t.day(), MONTHS[t.month0() as usize]);
-            p.text(hero.min + vec2(4.0, 60.0), Align2::LEFT_TOP, date, FontId::proportional(14.0), mix(dim(), fg(), 0.35 + 0.5 * hov));
-            if resp.clicked() {
-                self.tab = Tab::Calendar;
-            }
+            p.text(hero.min + vec2(4.0, 60.0), Align2::LEFT_TOP, date, FontId::proportional(14.0), mix(dim(), fg(), 0.35));
             // погода справа, тем же языком: крупная цифра, под ней одна строка
             let wr = Rect::from_min_max(pos2(hero.right() - 240.0, hero.top()), hero.max);
             let wresp = ui.interact(wr, ui.id().with("home-weather"), Sense::click());
@@ -4620,7 +4682,7 @@ impl App {
         // Просто звук (голос в Discord, игра) плеер не включает: раньше карточка показывала пустую
         // нотку или «Играет звук», а «Дальше» было полезнее. Плеер стабилен — мигать нечему.
         if self.media_now.is_none() {
-            self.home_agenda(ui, &p, music_r);
+            self.home_feed(ui, &p, music_r);
         } else {
         glass_chip(&p, music_r, R_CARD, 0.6);
         let art = Rect::from_min_size(music_r.min + vec2(12.0, 12.0), vec2(76.0, 76.0));
@@ -4767,13 +4829,15 @@ impl App {
         // ── быстрые действия одной ровной строкой
         // QR-код и пипетка живут в «Инструментах» (раньше были и тут — двойной ряд одного и того же);
         // в конце ряда — «Все»: переход к остальным инструментам
+        // под обычный день за компом: снимки, звук, игра, монитор, поиск. Распознавание текста,
+        // «чистый текст» и напоминания убраны — это инструменты для работы, а не для YouTube и игр
         const ACTIONS: [(&str, &str, &str, [u8; 3]); 6] = [
-            ("region", "\u{E7A8}", "Область", [0x5A, 0xAB, 0xFF]),
+            ("region", "\u{E7A8}", "Снимок области", [0x5A, 0xAB, 0xFF]),
             ("full", "\u{E740}", "Весь экран", [0x9B, 0x99, 0xFF]),
-            ("ocr", "\u{E8D2}", "Текст с экрана", [0xFF, 0xB3, 0x40]),
-            ("cleantext", "\u{E75C}", "Чистый текст", [0x6F, 0xDB, 0xFF]),
-            ("remind", "\u{E823}", "Напомнить", [0xFF, 0x8B, 0x61]),
-            ("command", "\u{E756}", "Команда", [0xB8, 0xB8, 0xC4]),
+            ("mixer", "\u{E767}", "Звук программ", [0x6F, 0xDB, 0xFF]),
+            ("game", "\u{E7FC}", "Игра: пинг и сеть", [0x7B, 0xE0, 0x9A]),
+            ("monitor", "\u{E9D9}", "Монитор: что грузит ПК", [0xFF, 0xB3, 0x40]),
+            ("command", "\u{E721}", "Поиск и запуск программ", [0xB8, 0xB8, 0xC4]),
         ];
         let mut act = "";
         let (mut hide, mut restore) = (None, false);
@@ -4781,8 +4845,8 @@ impl App {
         let shown = visible_actions(&ids, &self.cfg.hidden_actions);
         let has_hidden = shown.len() < ACTIONS.len();
         let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::hover());
-        // +1 — место под «Все»
-        let step = row.width() / (shown.len() + has_hidden as usize + 1) as f32;
+
+        let step = row.width() / (shown.len() + has_hidden as usize) as f32;
         for (slot, &i) in shown.iter().enumerate() {
             let (id, glyph, label, col) = &ACTIONS[i];
             let r = Rect::from_min_size(pos2(row.left() + step * slot as f32, row.top()), vec2(step, row.height()));
@@ -4794,8 +4858,10 @@ impl App {
                 "qr" => "QR-код из текста или ссылки в буфере",
                 "picker" => "Цвет точки под курсором, через 3 секунды",
                 "cleantext" => "Убрать оформление у текста в буфере",
-                "remind" => "Добавить напоминание",
-                _ => "Строка поиска и команд",
+                "mixer" => "Громкость каждой программы отдельно",
+                "game" => "Пинг до интернета и роутера, что мешает играть",
+                "monitor" => "Процессор, память и программы, которые грузят компьютер",
+                _ => "Найти и запустить программу, посчитать, перевести",
             }));
             if resp.secondary_clicked() {
                 hide = Some(*id);
@@ -4821,21 +4887,6 @@ impl App {
             p.text(at, Align2::CENTER_CENTER, "\u{E710}", FontId::proportional(14.0), mix(dim(), fg(), hov));
             restore = resp.clicked();
         }
-        let all;
-        {
-            // «Все» — к остальным инструментам (QR, пипетка, заметки, полка…)
-            let slot = shown.len() + has_hidden as usize;
-            let r = Rect::from_min_size(pos2(row.left() + step * slot as f32, row.top()), vec2(step, row.height()));
-            let resp = ui.interact(r, ui.id().with("act-all"), Sense::click()).on_hover_text("Все инструменты: QR-код, пипетка, заметки, полка…");
-            let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
-            let at = pos2(r.center().x, r.center().y - 1.5 * hov);
-            p.circle_filled(at, 18.0 + 1.5 * hov, rgba(255, 255, 255, (22.0 + 26.0 * hov) as u8));
-            p.text(at, Align2::CENTER_CENTER, "\u{E712}", FontId::proportional(16.0), mix(dim(), fg(), 0.4 + 0.6 * hov));
-            all = resp.clicked();
-        }
-        if all {
-            self.tab = Tab::Tools;
-        }
         if let Some(id) = hide {
             let next = hide_action(&ids, &self.cfg.hidden_actions, id);
             if next.len() == self.cfg.hidden_actions.len() {
@@ -4855,8 +4906,13 @@ impl App {
             }
             self.cfg.save();
         }
-        if !act.is_empty() {
-            self.run_action(act, ctx);
+        match act {
+            "" => {}
+            // переходы на страницы — не действия run_action
+            "mixer" => self.tab = Tab::Sound,
+            "game" => self.tab = Tab::Game,
+            "monitor" => self.tab = Tab::System,
+            _ => self.run_action(act, ctx),
         }
 
         // любимые приложения с их настоящими значками: щелчок запускает, правый щелчок убирает
@@ -4946,7 +5002,10 @@ impl App {
             }
         }
 
-        // ── лента дня: сутки полосой, «сейчас» и сегодняшние напоминания точками
+        // ── лента дня: сутки полосой, «сейчас» и сегодняшние напоминания точками (только с напоминаниями)
+        if !SHOW_DAY {
+            return;
+        }
         ui.add_space(6.0);
         let (strip, sresp) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::click());
         let now = chrono::Local::now();
@@ -6957,7 +7016,7 @@ impl App {
         // когда карточку всё равно не покажут (игра в окне, висит карточка напоминания) — отложим на минуту
         let weather_wait = self.cfg.lat.is_some() && self.weather.is_none() && local.hour() < 11;
         let busy = self.game_quiet || self.toast.as_ref().is_some_and(|t| t.glyph == "\u{E823}" && t.until > Instant::now());
-        if (6..12).contains(&local.hour()) && self.cfg.brief_day != today && !weather_wait && !busy {
+        if SHOW_DAY && (6..12).contains(&local.hour()) && self.cfg.brief_day != today && !weather_wait && !busy {
             let hours = self.weather.as_ref().map(|w| w.hours.clone()).unwrap_or_default();
             if let Some(text) = morning_brief(&self.cfg.reminders, &self.cfg.todos, &hours, local, city_hour) {
                 self.show_toast("\u{E706}", [0xFF, 0xC8, 0x5A], "Доброе утро", &text, 10, false);
@@ -7510,20 +7569,28 @@ impl App {
                 }
             });
             ui.add_space(2.0);
-            head(ui, "КЛЮЧ CLAUDE API ДЛЯ ИИ");
-            let key_state = if self.api_key().is_empty() { "не задан" } else { "задан" };
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.key_edit)
-                        .margin(egui::Margin::symmetric(9.0, 7.0))
-                        .password(true)
-                        .hint_text(RichText::new(key_state).color(dim()))
-                        .desired_width(ui.available_width() - 134.0),
-                );
-                if jelly(ui, "Сохранить").clicked() {
-                    self.save_key();
+            if SHOW_DAY {
+                head(ui, "КЛЮЧ CLAUDE API ДЛЯ ИИ");
+                let key_state = if self.api_key().is_empty() { "не задан" } else { "задан" };
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.key_edit)
+                            .margin(egui::Margin::symmetric(9.0, 7.0))
+                            .password(true)
+                            .hint_text(RichText::new(key_state).color(dim()))
+                            .desired_width(ui.available_width() - 134.0),
+                    );
+                    if jelly(ui, "Сохранить").clicked() {
+                        self.save_key();
+                    }
+                });
+            } else if !self.cfg.reminders.is_empty() {
+                // старые напоминания продолжают срабатывать — оставляем дорогу к ним, пока они есть
+                let n = self.cfg.reminders.len();
+                if jelly(ui, &format!("Мои напоминания · {n}")).on_hover_text("Изменить или удалить сохранённые напоминания").clicked() {
+                    self.tab = Tab::Remind;
                 }
-            });
+            }
             ui.add_space(8.0);
             // ── установка: карточка, пока остров запущен не из своей папки
             if !self.is_installed {
@@ -10172,41 +10239,54 @@ fn icon_limit(remote: bool) -> Duration {
     }
 }
 
+/// Инструменты «для ботаников» — дела, заметки, напоминания, утренняя сводка, ключ ИИ. Остров для тех,
+/// кто включил комп поиграть и посмотреть ютуб, поэтому всё это спрятано; код живой, вернуть — `true`.
+const SHOW_DAY: bool = false;
+
+/// Название спрятанной страницы для шапки «‹ раздел · страница»: в NAV их нет, но открыть можно
+/// (таймер из поиска, полка перетаскиванием файла, чат ИИ, напоминания из настроек).
+fn hidden_page_name(t: Tab) -> &'static str {
+    match t {
+        Tab::Timer => "Таймер",
+        Tab::Ai => "ИИ",
+        Tab::Shelf => "Полка",
+        Tab::Jarvis => "Джарвис",
+        Tab::Qr => "QR-код",
+        Tab::Notes => "Заметки",
+        Tab::Calendar => "Календарь",
+        Tab::Remind => "Напоминания",
+        Tab::Todo => "Дела",
+        Tab::Tools => "Инструменты",
+        _ => "",
+    }
+}
+
 /// Разделы панели: значок, название, страницы (первая — главная раздела) и показывать ли страницы
 /// рядом текстом (иначе они открываются из карточек и плиток, а в шапке — «‹ раздел · страница»).
 #[allow(clippy::type_complexity)]
-const NAV: [(&str, &str, &[(Tab, &str)], bool); 5] = [
-    ("\u{E80F}", "Сейчас", &[(Tab::Home, "Сейчас"), (Tab::Music, "Музыка"), (Tab::Weather, "Погода")], false),
-    ("\u{E787}", "День", &[(Tab::Calendar, "Календарь"), (Tab::Remind, "Напоминания"), (Tab::Todo, "Дела")], true),
+const NAV: [(&str, &str, &[(Tab, &str)], bool); 4] = [
     (
-        "\u{E90F}",
-        "Инструменты",
-        &[
-            (Tab::Tools, "Инструменты"),
-            (Tab::Timer, "Таймер"),
-            (Tab::Clip, "Буфер"),
-            (Tab::Notes, "Заметки"),
-            (Tab::Shelf, "Полка"),
-            (Tab::Qr, "QR-код"),
-            (Tab::Inbox, "Уведомления"),
-            (Tab::Shot, "Снимок"),
-            (Tab::Ai, "ИИ"),
-            (Tab::Jarvis, "Джарвис"),
-        ],
+        "\u{E80F}",
+        "Сейчас",
+        &[(Tab::Home, "Сейчас"), (Tab::Music, "Музыка"), (Tab::Weather, "Погода"), (Tab::Inbox, "Уведомления"), (Tab::Shot, "Снимок"), (Tab::Clip, "Буфер")],
         false,
     ),
-    ("\u{E7F4}", "Система", &[(Tab::Pult, "Пульт"), (Tab::Control, "Управление"), (Tab::Sound, "Звук"), (Tab::System, "Монитор"), (Tab::Game, "Игра")], true),
+    // игровые функции — то, чего нет у других островков: пинг, «матч найден», итог игры
+    ("\u{E7FC}", "Игра", &[(Tab::Game, "Игра")], false),
+    ("\u{E7F4}", "Система", &[(Tab::Pult, "Пульт"), (Tab::Sound, "Звук"), (Tab::System, "Монитор"), (Tab::Control, "Управление")], true),
     ("\u{E713}", "Настройки", &[(Tab::Settings, "Настройки")], false),
 ];
 
 /// Номер раздела NAV, в котором лежит страница. Полный match: новую страницу компилятор не даст забыть.
+/// Спрятанные страницы для «органайзера» (календарь, дела, напоминания, заметки, таймер, QR, полка,
+/// ИИ, Джарвис) в разделах не показываются — их код на месте, но попасть туда из панели нельзя.
 fn nav_group(t: Tab) -> usize {
     match t {
-        Tab::Home | Tab::Music | Tab::Weather => 0,
-        Tab::Calendar | Tab::Remind | Tab::Todo => 1,
-        Tab::Tools | Tab::Timer | Tab::Clip | Tab::Notes | Tab::Shelf | Tab::Qr | Tab::Inbox | Tab::Shot | Tab::Ai | Tab::Jarvis => 2,
-        Tab::Pult | Tab::Control | Tab::Sound | Tab::System | Tab::Game => 3,
-        Tab::Settings => 4,
+        Tab::Home | Tab::Music | Tab::Weather | Tab::Inbox | Tab::Shot | Tab::Clip => 0,
+        Tab::Game => 1,
+        Tab::Pult | Tab::Control | Tab::Sound | Tab::System => 2,
+        Tab::Settings => 3,
+        Tab::Calendar | Tab::Remind | Tab::Todo | Tab::Tools | Tab::Timer | Tab::Notes | Tab::Shelf | Tab::Qr | Tab::Ai | Tab::Jarvis => 0,
     }
 }
 

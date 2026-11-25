@@ -1201,6 +1201,13 @@ pub fn set_light_theme(light: bool) {
     });
 }
 
+/// Зарегистрирована ли ссылка вида `steam://` (то есть установлена ли программа) — чтобы не предлагать
+/// то, чего нет: открытие незнакомой ссылки Windows встречает окном «найти приложение».
+pub fn protocol_installed(scheme: &str) -> bool {
+    use winreg::{enums::HKEY_CLASSES_ROOT, RegKey};
+    RegKey::predef(HKEY_CLASSES_ROOT).open_subkey(format!(r"{scheme}\shell\open\command")).is_ok()
+}
+
 /// Есть ли интернет — по мнению самой Windows (тот же источник, что значок сети на панели задач).
 /// None — Windows не ответила (тогда тревогу не поднимаем).
 pub fn internet_ok() -> Option<bool> {
