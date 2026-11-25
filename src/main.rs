@@ -8957,7 +8957,27 @@ impl eframe::App for App {
         let d = cursor.map(|c| c - home).unwrap_or(vec2(9999.0, 9999.0));
         let dist = d.length();
 
+        // проверка раскрытия без мыши: OSTROVOK_OPEN_AT=2.5 — тестовая копия сама раскроется через 2,5 с
+        if test_mode() && self.mode == Mode::Pill {
+            if let Some(at) = std::env::var("OSTROVOK_OPEN_AT").ok().and_then(|v| v.parse::<f64>().ok()) {
+                let t = ctx.input(|i| i.time);
+                if t > at && t < at + 0.5 {
+                    self.mode = Mode::Panel;
+                    self.sticky = true;
+                }
+            }
+        }
         if self.mode != self.mode_seen {
+            // раскрытие — строго по центру: наклон к курсору (до 4 точек) раньше доезжал пружиной уже
+            // у открытой панели, и она «прыгала» вбок; капли справа (звонок, таймер…) не втягиваются
+            // в панель кривым бугром, а исчезают сразу
+            if self.mode != Mode::Pill {
+                for s in [&mut self.lean_s, &mut self.reach, &mut self.bub_timer, &mut self.bub_call, &mut self.bub_clip, &mut self.bub_dl] {
+                    s.v = 0.0;
+                    s.vel = 0.0;
+                    s.target = 0.0;
+                }
+            }
             self.mode_seen = self.mode;
             self.mode_at = now;
             self.ripple = (self.ripple + 3.0).min(7.0);
@@ -9207,6 +9227,15 @@ impl eframe::App for App {
             want[1] = 0;
         }
         let hwnd = hwnd_of(frame);
+        // для проверки «окно не ездит»: тестовая копия пишет каждое перемещение окна
+        if test_mode() && self.win_last != Some(want) {
+            if let Some(path) = std::env::var_os("OSTROVOK_WIN_LOG") {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(f, "{} {} {} {} {}", self.mode == Mode::Panel, want[0], want[1], want[2], want[3]);
+                }
+            }
+        }
         if self.win_last != Some(want) {
             match hwnd {
                 Some(hwnd) => {
