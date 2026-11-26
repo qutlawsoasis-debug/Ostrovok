@@ -988,7 +988,7 @@ pub fn reveal(path: &std::path::Path) {
 }
 
 /// Куда указывает ярлык .lnk (пусто у ярлыков без пути, например у некоторых магазинных программ).
-fn lnk_target(path: &str) -> Option<String> {
+pub(crate) fn lnk_target(path: &str) -> Option<String> {
     use windows::core::Interface;
     use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, STGM_READ};
     use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
