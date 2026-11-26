@@ -1134,6 +1134,8 @@ struct App {
     compat_win: bool,
     /// последняя форма окна в режиме совместимости — регион меняем только когда она изменилась
     shape_last: Vec<[i32; 5]>,
+    /// сколько ждать следующий кадр, если ввода не было (см. начало update)
+    pace: Duration,
     // капли, отпочковавшиеся от пилюли: таймер и звонок
     bub_timer: Spr,
     bub_call: Spr,
@@ -1590,6 +1592,7 @@ impl App {
             fx,
             compat_win: false,
             shape_last: Vec::new(),
+            pace: MIN_FRAME_GAP,
             gpu,
             bub_timer: Spr::new(0.0, 230.0, 17.0, 0.004),
             bub_call: Spr::new(0.0, 230.0, 17.0, 0.004),
@@ -8813,8 +8816,14 @@ impl eframe::App for App {
         // общий предел кадров (вертикальная синхронизация выключена): egui и потоки просят перерисовку
         // «сразу», и без предела анимация наведения крутила бы тысячи кадров в секунду
         let since = now.duration_since(self.frame_at);
-        if since < MIN_FRAME_GAP {
-            std::thread::sleep(MIN_FRAME_GAP - since);
+        // egui на каждый запрос перерисовки рисует ещё один «досчитывающий» кадр, и украшения,
+        // заказанные 30 раз в секунду, шли 60 раз (панель — до 100): вдвое больше работы процессора.
+        // Кадр без ввода (мышь, клавиши, файлы) ждёт срока, который назначил прошлый кадр (self.pace);
+        // с вводом — только общий предел, отклик не страдает.
+        let quiet_frame = ctx.input(|i| i.events.is_empty() && i.raw.dropped_files.is_empty() && i.raw.hovered_files.is_empty());
+        let gap = if quiet_frame { self.pace.max(MIN_FRAME_GAP) } else { MIN_FRAME_GAP };
+        if since < gap {
+            std::thread::sleep(gap - since);
         }
         let now = Instant::now();
         // шаг времени — по настоящим часам: при редких кадрах (украшения, 30 Гц) egui подставляет
@@ -8822,6 +8831,10 @@ impl eframe::App for App {
         let dt = frame_dt(now.duration_since(self.frame_at).as_secs_f32());
         self.frame_at = now;
         let time = ctx.input(|i| i.time);
+        // замер для оптимизации: OSTROVOK_PROF=файл — тестовая копия раз в секунду пишет число кадров
+        if test_mode() {
+            prof_frame(now);
+        }
         // предупреждение о повреждённых настройках — один раз при старте
         let warn = store::LOAD_WARN.lock().ok().and_then(|mut w| w.take());
         if let Some(w) = warn {
@@ -9753,6 +9766,30 @@ impl eframe::App for App {
         // постоянные украшения (капли, свечение под музыку) остаются под ограничением
         let interacting = !self.hidden && (over || transition || self.mode != Mode::Pill || self.drag.is_some() || self.shot.is_some());
         let mut after = quiet::repaint_after(self.fs_now, interacting, want);
+        // срок для следующего кадра без ввода: переходы (FAST_FRAME) — без ожидания, остальное — по want,
+        // но не дольше 50 мс (сообщения потоков — новая песня, загрузка — не ждут дольше)
+        // кадр сразу после ввода тоже без ожидания: щелчок мог начать переход (раскрытие, смена
+        // вкладки), а want посчитан ещё до интерфейса и об этом не знает
+        self.pace = if want <= FAST_FRAME || !quiet_frame { MIN_FRAME_GAP } else { want.min(Duration::from_millis(50)) };
+        if test_mode() {
+            let why = format!(
+                "want={}ms anim={animating} shape={shape_anim} moving={moving} reach={} lean={} jelly={} toast={} mode_t={mode_t:.2} bub={}",
+                want.as_millis(),
+                !self.reach.settled() || self.reach.v > 0.01,
+                !self.lean_s.settled(),
+                !self.jelly.settled(),
+                self.toast.is_some(),
+                !(self.bub_timer.settled() && self.bub_call.settled() && self.bub_clip.settled() && self.bub_dl.settled())
+            );
+            let causes: Vec<String> = ctx.repaint_causes().iter().map(|c| c.to_string()).collect();
+            if let Ok(mut w) = PROF_WHY.lock() {
+                if !causes.is_empty() {
+                    *w = format!("{why} | causes: {}", causes.join(", "));
+                } else if !w.contains("causes") {
+                    *w = why;
+                }
+            }
+        }
         if self.fs_now && !self.hidden && cursor.is_some_and(|c| (c - rect_v.center()).length() < 200.0) {
             // остров виден поверх игры и курсор рядом: замечаем наведение до клика (иначе клик уйдёт в игру)
             after = after.min(Duration::from_millis(100));
@@ -10493,6 +10530,28 @@ fn icon_limit(remote: bool) -> Duration {
 /// Инструменты «для ботаников» — дела, заметки, напоминания, утренняя сводка, ключ ИИ. Остров для тех,
 /// кто включил комп поиграть и посмотреть ютуб, поэтому всё это спрятано; код живой, вернуть — `true`.
 const SHOW_DAY: bool = false;
+
+/// Почему выбрана такая частота кадров (последний кадр) — для замеров тестовой копией.
+static PROF_WHY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Счётчик кадров для замеров (только тестовая копия с OSTROVOK_PROF): раз в секунду дописывает
+/// в файл «кадров за секунду».
+fn prof_frame(now: Instant) {
+    static PATH: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+    static STATE: std::sync::Mutex<Option<(Instant, u32)>> = std::sync::Mutex::new(None);
+    let Some(path) = PATH.get_or_init(|| std::env::var_os("OSTROVOK_PROF")) else { return };
+    let Ok(mut st) = STATE.lock() else { return };
+    let (since, n) = st.get_or_insert((now, 0));
+    *n += 1;
+    if now.duration_since(*since) >= Duration::from_secs(1) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let why = PROF_WHY.lock().map(|w| w.clone()).unwrap_or_default();
+            let _ = writeln!(f, "{n} {why}");
+        }
+        *st = Some((now, 0));
+    }
+}
 
 /// Включать ли режим совместимости окна. Выбор в настройках важнее; без выбора — по видеокарте:
 /// на NVIDIA прозрачное окно со стилем LAYERED работает, на AMD/Intel и программной отрисовке
