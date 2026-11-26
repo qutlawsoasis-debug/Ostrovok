@@ -13,32 +13,6 @@ fn start_menu_link() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join(r"Microsoft\Windows\Start Menu\Programs").join("Островок.lnk"))
 }
 
-/// Ярлык в папке «Автозагрузка» — второй, независимый от реестра путь автозапуска. У пользователя и
-/// его друзей Проводник при входе молча пропускал запись острова в разделе Run (журнал Shell-Core: Discord
-/// и Roblox из того же раздела стартуют, острова в списке нет вовсе), причину по журналам не найти.
-/// Папку «Автозагрузка» Windows обрабатывает отдельно; если сработают оба пути, вторая копия выйдет
-/// сама (единственный экземпляр).
-fn startup_link() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join(r"Microsoft\Windows\Start Menu\Programs\Startup").join("Ostrovok.lnk"))
-}
-
-/// Ставит (target = Some) или убирает (None) ярлык автозапуска. Ярлык пишется только если его нет или
-/// задан новый путь (`force`) — не трогаем папку «Автозагрузка» на каждом запуске.
-pub fn set_startup_link(target: Option<&Path>, force: bool) {
-    let Some(link) = startup_link() else { return };
-    match target {
-        Some(t) => {
-            // нет ярлыка или он ведёт на удалённый файл (lnk_target даёт None) — пишем заново
-            if force || crate::sys::lnk_target(&link.to_string_lossy()).is_none() {
-                let _ = shortcut(t, &link);
-            }
-        }
-        None => {
-            let _ = std::fs::remove_file(&link);
-        }
-    }
-}
-
 /// Пути Windows сравниваются без учёта регистра и косых черт.
 pub fn same_dir(a: &Path, b: &Path) -> bool {
     let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();

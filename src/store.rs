@@ -963,9 +963,6 @@ pub fn set_autostart_path(exe: &std::path::Path) {
     if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE) {
         let _ = key.set_value(RUN_NAME, &run_value(&exe));
     }
-    if test_free() {
-        crate::install::set_startup_link(Some(exe), true);
-    }
 }
 
 /// Восстанавливает автозапуск, если его ждут (галочка не снята), а записи в реестре нет или она
@@ -976,14 +973,6 @@ pub fn heal_autostart(wanted: bool) -> bool {
     if !wanted || !test_free() {
         return false;
     }
-    // второй путь — ярлык в «Автозагрузке»: ставим, если его нет (раздел Run Проводник иногда пропускает)
-    // Выключил человек автозапуск в диспетчере задач («Автозагрузка») — его выбор, ярлыком не обходим
-    let installed = crate::install::home().map(|h| h.join("Ostrovok.exe")).filter(|p| p.exists());
-    if !startup_disabled_by_user() {
-        if let Some(t) = installed.as_ref().cloned().or_else(|| std::env::current_exe().ok()) {
-            crate::install::set_startup_link(Some(&t), false);
-        }
-    }
     let have = RegKey::predef(HKEY_CURRENT_USER).open_subkey(RUN_KEY).and_then(|k| k.get_value::<String, _>(RUN_NAME)).ok();
     // Чужую рабочую запись не трогаем: установленная копия могла перенести автозапуск на себя, и
     // запущенный скачанный файл не должен забирать его обратно. Чиним только пропавшую запись
@@ -992,19 +981,10 @@ pub fn heal_autostart(wanted: bool) -> bool {
         return false;
     }
     // цель — установленная копия, если она есть, иначе этот файл
+    let installed = crate::install::home().map(|h| h.join("Ostrovok.exe")).filter(|p| p.exists());
     let Some(target) = installed.or_else(|| std::env::current_exe().ok()) else { return false };
     set_autostart_path(&target);
     true
-}
-
-/// Выключен ли остров в «Автозагрузке» диспетчера задач: там значение «Ostrovok» в StartupApproved\Run,
-/// у выключенного нечётный первый байт (02 — включено, 03 — выключено).
-fn startup_disabled_by_user() -> bool {
-    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
-    RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run")
-        .and_then(|k| k.get_raw_value(RUN_NAME))
-        .is_ok_and(|v| v.bytes.first().is_some_and(|b| b & 1 == 1))
 }
 
 /// Нужно ли чинить автозапуск: записи нет или файл, на который она ведёт, не существует.
@@ -1044,14 +1024,8 @@ pub fn set_autostart(on: bool) {
     if on {
         if let Ok(exe) = std::env::current_exe() {
             let _ = key.set_value(RUN_NAME, &run_value(&exe));
-            if test_free() {
-                crate::install::set_startup_link(Some(&exe), true);
-            }
         }
     } else {
         let _ = key.delete_value(RUN_NAME);
-        if test_free() {
-            crate::install::set_startup_link(None, false);
-        }
     }
 }
