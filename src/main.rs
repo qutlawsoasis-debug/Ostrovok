@@ -1129,6 +1129,11 @@ struct App {
     sticky: bool,
     /// корпус на видеокарте; None — видеокарта не справилась, рисуем по-старому
     fx: Option<Arc<fx::Fx>>,
+    /// производитель видеокарты (GL_VENDOR) и включён ли режим совместимости окна (см. compat_window)
+    gpu: String,
+    compat_win: bool,
+    /// последняя форма окна в режиме совместимости — регион меняем только когда она изменилась
+    shape_last: Vec<[i32; 5]>,
     // капли, отпочковавшиеся от пилюли: таймер и звонок
     bub_timer: Spr,
     bub_call: Spr,
@@ -1481,6 +1486,11 @@ impl App {
         }
         let (lens_tx, lens_rx) = glass::spawn(ctx.clone());
         let fx = cc.gl.as_ref().and_then(|gl| fx::Fx::new(gl)).map(Arc::new);
+        // видеокарта: на AMD/Intel прозрачное окно со стилем LAYERED рисуется с чёрным фоном
+        let gpu = cc.gl.as_ref().map(|gl| {
+            use eframe::glow::HasContext;
+            unsafe { gl.get_parameter_string(eframe::glow::VENDOR) }
+        }).unwrap_or_default();
         let mut cfg = store::Settings::load();
         // автозапуск: если его не выключали галочкой, а записи в реестре нет (антивирус стёр) или она
         // ведёт на старый файл — восстанавливаем, иначе остров молча перестаёт стартовать с Windows
@@ -1578,6 +1588,9 @@ impl App {
             vel: Vec2::ZERO,
             sticky: false,
             fx,
+            compat_win: false,
+            shape_last: Vec::new(),
+            gpu,
             bub_timer: Spr::new(0.0, 230.0, 17.0, 0.004),
             bub_call: Spr::new(0.0, 230.0, 17.0, 0.004),
             bub_clip: Spr::new(0.0, 230.0, 17.0, 0.004),
@@ -7801,6 +7814,13 @@ impl App {
             if switch_row(ui, &mut self.cfg.capture_visible, "Виден на записи экрана", "стекло перестанет размывать фон; в звонке Discord виден и так") {
                 self.cfg.save();
             }
+            // чёрный фон вокруг острова (AMD/Intel): окно обрезается по форме острова
+            let mut compat = self.compat_win;
+            let hint = if self.cfg.compat_win.is_none() { "включается сам на видеокартах AMD и Intel" } else { "выбрано вручную" };
+            if switch_row(ui, &mut compat, "Совместимость: чёрный фон вокруг", hint) {
+                self.cfg.compat_win = Some(compat);
+                self.cfg.save();
+            }
             {
                 // «Вернуть остров в центр»: строка-кнопка, видна, когда остров сдвинут
                 let moved = self.spot.is_some();
@@ -9256,7 +9276,25 @@ impl eframe::App for App {
             self.win_last = Some(want);
         }
         let pass = !over || invisible;
-        if self.passthrough != Some(pass) {
+        // режим совместимости: без LAYERED, мышь пропускает обрезка окна по форме (ниже, после origin)
+        let compat = compat_window(self.cfg.compat_win, &self.gpu);
+        if compat != self.compat_win {
+            self.compat_win = compat;
+            if let Some(hwnd) = hwnd {
+                if compat {
+                    sys::clear_click_through(hwnd);
+                } else {
+                    sys::set_window_shape(hwnd, &[]);
+                    self.shape_last.clear();
+                }
+            }
+            self.passthrough = None;
+        }
+        if compat {
+            // стиль не трогаем (мышь пропускает обрезка), но состояние помним — от него зависит запас
+            // «над островом» (reach_out), иначе у края наведение дрожало бы
+            self.passthrough = Some(pass);
+        } else if self.passthrough != Some(pass) {
             match hwnd {
                 Some(hwnd) => sys::set_click_through(hwnd, pass),
                 None => ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(pass)),
@@ -9338,14 +9376,50 @@ impl eframe::App for App {
         let layout = layout_v.translate(-origin.to_vec2());
         self.pill_rect = rect;
         self.bubbles = bubbles_v.into_iter().map(|(r, sv, kind, text)| (r.translate(-origin.to_vec2()), sv, kind, text)).collect();
+        // режим совместимости: окно обрезано по корпусу острова и каплям (в пикселях окна).
+        // Пока идёт анимация, форма только растёт (новые части добавляются к старым) — регион не
+        // меняется каждый кадр; точная форма ставится после WIN_SHRINK_AFTER покоя, как размер окна.
+        if self.compat_win && !invisible {
+            if let Some(hwnd) = hwnd {
+                let px = |v: f32| (v * ppp).round() as i32;
+                let radius = if self.mode == Mode::Pill { rect.height() / 2.0 } else { 22.0f32.min(rect.height() / 2.0) };
+                let mut shape = vec![[px(rect.left() - 1.0), px(rect.top() - 1.0), px(rect.right() + 1.0), px(rect.bottom() + 1.0), px(radius + 1.0)]];
+                for (r, ..) in &self.bubbles {
+                    shape.push([px(r.left() - 1.0), px(r.top() - 1.0), px(r.right() + 1.0), px(r.bottom() + 1.0), px(r.height() / 2.0 + 1.0)]);
+                }
+                let busy = animating || now.duration_since(self.win_busy_at) < WIN_SHRINK_AFTER;
+                let inside = |p: &[i32; 5], q: &[i32; 5]| q[0] <= p[0] && q[1] <= p[1] && q[2] >= p[2] && q[3] >= p[3];
+                let next = if busy && !self.shape_last.is_empty() {
+                    let mut grown = self.shape_last.clone();
+                    for p in shape {
+                        if !grown.iter().any(|q| inside(&p, q)) {
+                            grown.push(p);
+                        }
+                    }
+                    grown
+                } else {
+                    shape
+                };
+                if next != self.shape_last {
+                    sys::set_window_shape(hwnd, &next);
+                    self.shape_last = next;
+                }
+                if busy {
+                    ctx.request_repaint_after(WIN_SHRINK_AFTER);
+                }
+            }
+        }
         let cursor_win = cursor.map(|c| c - origin.to_vec2());
         let playing_now = self.media_now.as_ref().is_some_and(|m| m.playing);
+        // в режиме совместимости корпус не тянется к курсору, не идёт рябью и не капает: эти изгибы
+        // выходят за обрезку окна и срезались бы рваным краем
+        let flat = self.compat_win;
         self.warp = Warp {
-            reach: self.reach.v,
+            reach: if flat { 0.0 } else { self.reach.v },
             cursor: self.reach_cursor - origin.to_vec2(),
-            ripple: self.ripple,
+            ripple: if flat { 0.0 } else { self.ripple },
             phase: self.ripple_phase,
-            drip: if dripping { 1.6 } else { 0.0 },
+            drip: if dripping && !flat { 1.6 } else { 0.0 },
             drip_phase: self.drip_phase,
         };
         self.lens_draw = match (self.excluded, self.lens_cap) {
@@ -10419,6 +10493,29 @@ fn icon_limit(remote: bool) -> Duration {
 /// Инструменты «для ботаников» — дела, заметки, напоминания, утренняя сводка, ключ ИИ. Остров для тех,
 /// кто включил комп поиграть и посмотреть ютуб, поэтому всё это спрятано; код живой, вернуть — `true`.
 const SHOW_DAY: bool = false;
+
+/// Включать ли режим совместимости окна. Выбор в настройках важнее; без выбора — по видеокарте:
+/// на NVIDIA прозрачное окно со стилем LAYERED работает, на AMD/Intel и программной отрисовке
+/// вместо прозрачности чёрный фон. OSTROVOK_COMPAT=1/0 — для проверки.
+fn compat_window(choice: Option<bool>, gpu: &str) -> bool {
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| std::env::var("OSTROVOK_COMPAT").ok().map(|v| v == "1"));
+    env.or(choice).unwrap_or_else(|| !gpu.to_lowercase().contains("nvidia"))
+}
+
+#[cfg(test)]
+mod compat_tests {
+    #[test]
+    fn by_gpu_unless_chosen() {
+        use super::compat_window as c;
+        assert!(!c(None, "NVIDIA Corporation"));
+        assert!(c(None, "ATI Technologies Inc."));
+        assert!(c(None, "Intel"));
+        assert!(c(None, ""));
+        assert!(!c(Some(false), "ATI Technologies Inc."));
+        assert!(c(Some(true), "NVIDIA Corporation"));
+    }
+}
 
 /// Название спрятанной страницы для шапки «‹ раздел · страница»: в NAV их нет, но открыть можно
 /// (таймер из поиска, полка перетаскиванием файла, чат ИИ, напоминания из настроек).

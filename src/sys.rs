@@ -2366,3 +2366,41 @@ mod in_use_live {
         println!("{:?}", super::devices_in_use());
     }
 }
+
+/// Режим совместимости окна (видеокарты AMD/Intel): снимает WS_EX_LAYERED и WS_EX_TRANSPARENT.
+/// Прозрачное OpenGL-окно со стилем LAYERED на этих драйверах рисуется с чёрным фоном вместо прозрачного.
+pub fn clear_click_through(hwnd: isize) {
+    unsafe {
+        let h = HWND(hwnd as *mut core::ffi::c_void);
+        let old = GetWindowLongW(h, GWL_EXSTYLE) as u32;
+        let ex = old & !(WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0);
+        if ex != old {
+            SetWindowLongW(h, GWL_EXSTYLE, ex as i32);
+        }
+    }
+}
+
+/// Обрезает окно по форме острова: скруглённые прямоугольники [лево, верх, право, низ, радиус] в пикселях
+/// окна. Вне формы окно не рисуется (чёрному фону негде появиться) и не ловит мышь — она уходит окнам
+/// под ним, как при «пропускании мыши». Пустой список — снять обрезку.
+pub fn set_window_shape(hwnd: isize, parts: &[[i32; 5]]) {
+    unsafe {
+        let h = HWND(hwnd as *mut core::ffi::c_void);
+        if parts.is_empty() {
+            SetWindowRgn(h, HRGN::default(), true);
+            return;
+        }
+        let mk = |p: &[i32; 5]| CreateRoundRectRgn(p[0], p[1], p[2] + 1, p[3] + 1, p[4] * 2, p[4] * 2);
+        let all = mk(&parts[0]);
+        for p in &parts[1..] {
+            let r = mk(p);
+            CombineRgn(all, all, r, RGN_OR);
+            let _ = DeleteObject(r);
+        }
+        // после SetWindowRgn регион принадлежит системе — удалять его нельзя (только если не принят).
+        // Без перерисовки: egui и так рисует следующий кадр, лишняя перерисовка давала мигание края
+        if SetWindowRgn(h, all, false) == 0 {
+            let _ = DeleteObject(all);
+        }
+    }
+}

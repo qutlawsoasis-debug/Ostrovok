@@ -57,6 +57,9 @@ pub struct Settings {
     /// остров виден на демонстрации и записи экрана (тогда стекло непрозрачное)
     #[serde(default)]
     pub capture_visible: bool,
+    /// режим совместимости окна (чёрный фон вокруг острова на AMD/Intel): None — по видеокарте
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat_win: Option<bool>,
     /// куда пользователь перетащил остров: по монитору, последний — первым
     #[serde(default)]
     pub spots: Vec<Spot>,
